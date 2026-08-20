@@ -16,11 +16,21 @@ GRIP 1.0 models contact as a penalty force — a stiff spring-damper with a
 Coulomb friction cone. That formulation keeps the force constraint exact
 and softens the kinematic one, so a box resting on a slope must be
 *slipping* in order to generate the friction that holds it up. It creeps,
-forever, at `mg·sinα / b_slip` — about **1.7 cm/s** on a 20° ramp, which
-is a quarter of a body length every second.
+forever, at `mg·sinα / (2·b_slip)` — **4.7 cm in five seconds** on a 20°
+ramp, about a sixth of a box width, on a slope where rigid physics says
+it must not move at all.
 
 GRIP 2.0 will replace that with a velocity-level NCP solve, where the
 same box sticks exactly.
+
+![measured drift on slopes below the friction angle](figures/drift.png)
+
+Measured, in [`experiments/drift.py`](experiments/drift.py). The right
+panel is a second finding that fell out of checking the first: the closed
+form is exact to five figures below about 19°, and a lower bound above it,
+because friction's moment arm tilts the box enough to redistribute normal
+force between the corners until the lightly loaded one saturates on its
+cone.
 
 So the task is built around a slope shallower than the friction angle,
 where rigid physics says a released box must **never move**. Penalty
@@ -53,12 +63,17 @@ question, which is whether the error changes learned behaviour.
 
 ## Status
 
-**Nothing built yet.** The spec is written; the code is not.
+| | |
+|---|---|
+| Drift measurement | **done** — `experiments/drift.py`, the plot above |
+| MPPI / CEM planner | not started |
+| SHAC | not started |
+| NCP half of every comparison | waiting on GRIP 2.0 |
 
-First milestone is the one that needs no policy and no training: place a
-box on a 20° tilted half-plane, roll out five seconds of zero controls,
-and plot displacement against time. If it drifts 8.4 cm, half the headline
-result exists.
+The first milestone needed no policy and no training, which is why it came
+first: place a box on a tilted half-plane, roll out five seconds of zero
+controls, and measure. Half the headline result now exists; the other half
+is the same plot with a solve in place of a spring.
 
 ## Setup
 
@@ -82,7 +97,12 @@ after touching its `src/`.
 ## Layout
 
 ```
-docs/    task definition and experiment design
+slope_control/   the ramp scene, shared by every experiment
+experiments/     one script per artifact, each runnable on its own
+figures/         their output, committed so the results are visible here
+docs/            task definition and experiment design
 ```
 
-Everything else is still to come.
+Policies, planners and training loops will join `slope_control/`. None of
+it goes into GRIP — that repository holds physics and derivatives, and
+this one holds everything that decides what to do with them.

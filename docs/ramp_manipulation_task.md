@@ -37,18 +37,35 @@ So a box resting on a slope must be **slipping** in order to generate the
 friction that holds it up. It creeps, forever, at
 
 ```
-creep = mg·sin α / b_slip
+creep = mg·sin α / (2·b_slip)
 ```
 
-With GRIP's demo constants (`m = 1`, `b_slip = 200`) at a 20° ramp:
+The 2 is the number of contact points. A box resting on a face touches at
+both bottom corners, each carrying its own friction, so the pair together
+supply `2·b_slip·s`. An earlier draft of this document omitted that factor
+and predicted twice the real drift.
+
+With GRIP's demo constants (`m = 1`, `b_slip = 200`) at a 20° ramp the
+closed form gives 0.84 cm/s and simulation measures **0.95 cm/s**:
 
 ```
-creep = 9.81 · sin(20°) / 200 ≈ 1.68 cm/s
+5 s of hold  →  4.7 cm of drift, about a sixth of a box width
 ```
 
-Over a 2.5-second hold that is **4.2 cm** — about 14% of a box width. Over
-five seconds, 8.4 cm. This is not an artifact you have to zoom in to see;
-it is the whole picture sliding.
+Not an artifact you have to zoom in to see — the whole picture slides.
+
+**The closed form is exact only while both corners stick.** It matches to
+five figures from 5° to 18°, then departs sharply: 13% low at 20°, 48% low
+at 26°. Friction acts at the contact points, 0.15 m below the centre of
+mass, so it tilts the box by about a milliradian; the tilt redistributes
+normal force between the corners by `k·w·δθ`, and the lightly loaded
+uphill corner saturates on its own cone bound `μλ`. The downhill corner
+then makes up the shortfall and creeps faster than an even split would.
+Both corners saturating *is* the friction angle, where the box slides
+freely and none of this applies.
+
+So: exact below ~19°, a lower bound above it. Measured in
+`experiments/drift.py`, whose right-hand panel is that crossover.
 
 Under an NCP solve the same box sticks exactly. Zero drift, indefinitely.
 
@@ -303,7 +320,7 @@ training configuration.**
 Ordered by how much interpretation each one needs. The first needs none.
 
 1. **The physics plot.** Box released on the ramp, no policy, no RL.
-   Displacement against time: penalty drifts 8.4 cm in 5 s, NCP sits at
+   Displacement against time: penalty drifts 4.7 cm in 5 s, NCP sits at
    zero, and Coulomb's law says zero. Three lines, one of them analytic.
    *This carries the correctness claim on its own.*
 2. **MPPI on both** — the task is solvable; here is what good looks like.
@@ -379,7 +396,7 @@ the policy spends most of its time.
 
 1. **Now, against GRIP 1.0 as it stands.** Place a box on a 20° tilted
    `HalfPlane`, `rollout_system` for five seconds with zero controls, plot
-   `ξ` against time. If it drifts 8.4 cm, half of artifact (1) is done —
+   `ξ` against time. It drifts 4.7 cm; half of artifact (1) is done —
    before joints, before the API, before any of it.
 2. Minimal task: box alone on the ramp, wrench applied directly to the box,
    no pusher. De-risks the reward, the observation space and the training
