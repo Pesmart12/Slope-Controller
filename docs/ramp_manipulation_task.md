@@ -1,27 +1,25 @@
-# Ramp manipulation — a contact-formulation comparison task
+# Ramp manipulation — task definition
 
 A task definition for a repository that links **GRIP** and calls it. Nothing
 here belongs in GRIP itself: the reward, the policy, the planner and the
 training loop are all task definitions, and GRIP's rule is that a task
 belongs to whoever is posing it.
 
-The purpose of this task is narrow and should stay narrow. It exists to make
-the difference between **penalty contact** (GRIP 1.0) and an **NCP contact
-solve with IFT gradients** (GRIP 2.0) *load-bearing* for a learned policy —
-so that the comparison produces a signal instead of two indistinguishable
-reward curves.
-
-It is deliberately **not** experimentally rigorous. It is a demonstration
-with an honest caveat attached, not a study.
+The plan: build the whole stack against **penalty contact** (GRIP 1.0), take
+measurements, then rerun it against the **NCP solve** (GRIP 2.0) and put the
+two sets of numbers side by side. One task, no seed sweeps, no claim that any
+of it generalizes — a build with measurements attached. What the comparison
+shows is for the numbers to say.
 
 ---
 
-## Why this task, and not a generic pusher
+## Why a ramp
 
 A contact-rich task is not automatically a task where the *contact model*
-matters. If contact is incidental, both formulations produce the same policy
-and the comparison shows nothing. This task is built around the one place
-penalty contact fails **structurally** rather than by a small margin.
+matters. If contact is incidental, the formulation barely shows up in the
+result. A ramp below the friction angle is the opposite case: it is the one
+place penalty contact fails **structurally** rather than by a small margin,
+and the size of that failure is a number you can write down in advance.
 
 ### The mechanism: friction creep
 
@@ -76,7 +74,8 @@ below it.** Below the friction angle, rigid physics says a released box holds
 its position for all time — a closed-form fact, not a modelling opinion.
 Above it, both formulations slide and the task measures nothing.
 
-Nominal `α = 20°`. That inequality is the entire experiment.
+Nominal `α = 20°`. Everything else here is built on top of that
+inequality holding.
 
 ### Why not penetration
 
@@ -169,14 +168,17 @@ the target.
 r_t = −w_pos·(ξ_box − ξ*)²  −  w_ctrl·‖u_t‖²
 ```
 
-Both terms matter. The control cost is **not** boilerplate:
+Both terms matter. The control cost is **not** boilerplate: without it,
+"keep pressing forever" costs nothing and is a perfectly good strategy under
+either contact model. With it, holding position has a price, and how a policy
+chooses to pay that price is the thing worth watching.
 
-> The control cost is what makes the two optimal strategies genuinely
-> different. Without it, "keep pressing forever" is free, and both
-> formulations converge on it.
+Under penalty the box is always sliding, so holding it needs continuous force.
+Under a solve it sticks, and force after arrival buys nothing. Same reward
+function, two different bills.
 
 The gradient GRIP needs is a quadratic in position chained through
-`∂ξ/∂q_box = (cos α, sin α, 0)` — exactly the seed shape `adjoint_system`
+`∂ξ/∂q_box = (cos α, sin α, 0)` — exactly the seed shape `adjoint_batch`
 already accepts. No new GRIP surface is required.
 
 ---
@@ -220,72 +222,51 @@ relaxation `κ` the solver exposes.
 
 ---
 
-## The crux: two different optimal strategies
+## Measurements
 
-This is the reason the task exists, and it is worth stating explicitly.
+Every policy is scored in **NCP**, wherever it trained — not because a solve
+is a perfect reference, but because it is the more accurate of the two, and
+scoring in the sloppier one inverts the reading. A poor score there looks
+like the accurate simulator produced a worse policy.
 
-**Under penalty**, the box is always sliding downhill. The only way to hold
-position is to keep the pusher pressed against it indefinitely. The optimal
-policy is *press and never let go*, and it pays the control cost forever
-because there is no alternative.
-
-**Under NCP**, static friction holds. The optimal policy is *place the box,
-then retreat* — pushing after arrival is pure control cost with no benefit.
-
-These are not two parameter settings of one strategy. They are different
-strategies, and the control cost term is what separates them.
-
----
-
-## Evaluation protocol
-
-**NCP is ground truth. Every policy is scored in NCP, regardless of where it
-trained.**
-
-This direction is not optional. Scoring a policy in the *less* accurate
-simulator inverts the intuitive reading — a failure there looks like the
-accurate simulator produced a worse policy, and undoing that impression
-costs an explanation you should not have to give.
-
-| trained in | scored in | expected |
+| trained in | scored in | |
 |---|---|---|
-| NCP | NCP | works |
-| penalty | NCP | **degrades** |
+| penalty | penalty | sanity check — did training work at all |
+| NCP | NCP | the same, on the other side |
+| penalty | NCP | the interesting cell |
 
-### The predicted failure
+Per cell, recorded: final distance to target, how that distance evolves
+across the hold window, total control effort, and whether the box stays on
+the ramp.
 
-The penalty-trained policy has learned a feedback law tuned against a
-constant phantom drag — in its world, letting go always means losing ground.
-Dropped into NCP, it reaches the target, the box *sticks*, and the policy
-keeps pushing because it has never once observed a box that stays put. The
-box walks past the target and off the top of the ramp.
+Training and evaluating in the same simulator is an advantage, so the two
+matched cells are partly self-fulfilling. Worth saying alongside the numbers
+rather than waiting to be asked.
 
-Integrator windup against a disturbance that was an artifact. One sentence
-to explain, and it points the right way.
+### What to instrument for
 
-### Secondary mechanism
+Two mechanisms are plausible enough to measure deliberately, without assuming
+either turns up:
 
-Penalty absorbs impacts over many timesteps, so aggressive approach speeds
-are free. NCP resolves them at once, so the same approach tips or scatters
-the box. Expect this to show up as the penalty-trained policy being too
-violent on contact.
+**A feedback law tuned against constant drag.** Under penalty, letting go
+always means losing ground. The same law in NCP, where the box sticks, has no
+reason to stop pushing on arrival — so log position across the hold window,
+and whether the box leaves the top of the ramp.
 
-### The honest caveat, stated before anyone asks
+**Approach speed.** Penalty absorbs impacts over many timesteps, so a fast
+approach is cheap. A solve resolves them at once. Log contact velocity at
+first touch, and whether the box tips.
 
-Training and evaluating in the same simulator is inherently an advantage, so
-NCP-on-NCP winning is partly self-fulfilling. This is not treated as cheating
-in the sim-to-real literature, because the question is not whether NCP is
-self-consistent — it is **how much you lose by training in the cheap
-approximation**. Say this yourself rather than being asked.
+Instrument both. Report whichever shows up.
 
 ---
 
 ## Learning algorithms
 
-**PPO is deliberately excluded.** It never touches GRIP's gradients, it is
-the arm most likely to look identical across formulations, and the sample
-budget is brutal — at `dt = 5e-4`, one simulated second is 2000 integration
-steps.
+**PPO is skipped.** It never touches GRIP's gradients, which are the thing
+GRIP uniquely provides, and the sample budget is brutal — at `dt = 5e-4`,
+one simulated second is 2000 integration steps. Not a judgement about PPO;
+it is just not what this project is for.
 
 ### MPPI / CEM — the zeroth-order control
 
@@ -297,11 +278,10 @@ simulators.
 Its job is to remove ambiguity. If SHAC struggles, this is what tells you
 whether the problem is the gradients or the task.
 
-### SHAC — the headline
+### SHAC — the one that uses the gradients
 
 Short-horizon actor-critic with a learned value function, consuming analytic
-gradients through the dynamics. It maps directly onto GRIP's existing
-`adjoint_system`:
+gradients through the dynamics. It maps directly onto `adjoint_batch`:
 
 - roll out a window of `W = 32` control steps
 - seed `dl_dZ[t]` with `∂r_t/∂Z_t` at every step
@@ -315,50 +295,46 @@ training configuration.**
 
 ---
 
-## Artifacts this produces
+## What this produces
 
-Ordered by how much interpretation each one needs. The first needs none.
-
-1. **The physics plot.** Box released on the ramp, no policy, no RL.
+1. **The drift plot.** Box released on the ramp, no policy, no RL.
    Displacement against time: penalty drifts 4.7 cm in 5 s, NCP sits at
-   zero, and Coulomb's law says zero. Three lines, one of them analytic.
-   *This carries the correctness claim on its own.*
-2. **MPPI on both** — the task is solvable; here is what good looks like.
-3. **SHAC on both** — the headline learning result.
-4. **The cross-eval matrix**, every cell scored in NCP.
-5. **The video** — penalty-trained policy overshooting off the ramp in
-   accurate physics.
+   zero, and Coulomb's law says zero. **Done** — `experiments/drift.py`.
+2. **MPPI on both** — what good behaviour looks like, without a training
+   loop in the way.
+3. **SHAC on both** — the learned result.
+4. **The cross-eval table.**
+5. **A video** of whichever cell turns out to be the interesting one.
 
-Keeping (1) separate from (3) is the point. The claim *"2.0 is more
-physically correct"* rests on closed-form ground truth and needs no
-statistics. The RL results then answer a different and complementary
-question — *"does that error change what a policy learns?"* — and are free
-to be modest without undermining the headline.
+(1) is a measurement against a closed form and stands on its own whatever
+the rest do. The rest are the build, and they are allowed to be modest.
 
 ---
 
 ## GRIP interface
 
-The current C++ surface is pre-API and **will change** at GRIP's step 11
-(public API and Python bindings), which is also where a batched
-multi-scene entry point should land. Treat the calls below as the shape, not
-the contract.
+GRIP 1.0 shipped, so this is the installed Python surface rather than a
+sketch of one. State is `(environments, bodies, 6)`, controls are
+`(steps, environments, bodies, 3)`.
 
-```cpp
-// Forward: H controls in, H+1 system states out.
-trajectory = rollout_system(initial, params, shapes, plane, penalty, controls, dt);
-
-// Backward: caller supplies ∂ℓ/∂Z and ∂ℓ/∂U seeds, receives total derivatives.
-gradients = adjoint_system(trajectory, params, shapes, plane, penalty, dl_dZ, dl_dU, dt);
-// gradients.dJ_dZ0     6B
-// gradients.dJ_dU[t]   3B per step
+```python
+trajectory = grip.rollout_batch(scenes, initial, controls, substeps)
+dJ_dZ0, dJ_dU = grip.adjoint_batch(scenes, trajectory, controls, substeps, dl_dZ, dl_dU)
 ```
 
 GRIP never sees the reward. This repository computes `∂r/∂Z` and `∂r/∂U`,
 hands them over as seeds, and gets total derivatives back.
 
-The only GRIP-side convenience worth requesting is a tilted-plane
-constructor; everything else this task needs already exists.
+`substeps` is what decouples control rate from integration rate, so one call
+advances a whole control step and the same 100 Hz policy runs on both
+formulations.
+
+Every environment in a batch carries its own `Scene`, so ramp angle, masses
+and contact parameters randomize across a batch for free — only the body
+count has to match. That is what makes the randomization above cheap.
+
+2.0 is expected to change the contact model behind these calls rather than
+the calls themselves.
 
 ---
 
@@ -394,10 +370,9 @@ the policy spends most of its time.
 
 ## Build order
 
-1. **Now, against GRIP 1.0 as it stands.** Place a box on a 20° tilted
-   `HalfPlane`, `rollout_system` for five seconds with zero controls, plot
-   `ξ` against time. It drifts 4.7 cm; half of artifact (1) is done —
-   before joints, before the API, before any of it.
+1. **Done.** Place a box on a 20° tilted `HalfPlane`, roll out five seconds
+   of zero controls, plot `ξ` against time. It drifts 4.7 cm —
+   `experiments/drift.py`.
 2. Minimal task: box alone on the ramp, wrench applied directly to the box,
    no pusher. De-risks the reward, the observation space and the training
    loop with two objects and one contact set.

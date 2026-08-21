@@ -6,8 +6,7 @@ says it must not move at all -- a closed-form fact about rigid bodies,
 not a modelling opinion -- so the measured drift is exactly the error the
 contact formulation introduces.
 
-This is the comparison the whole 1.0-vs-2.0 story rests on, and it is
-worth keeping apart from anything learned. A reward curve needs caveats;
+Worth keeping apart from anything learned. A reward curve needs caveats;
 "the box slid 4.7 cm when the physics says 0" does not.
 
 The right panel is a second finding that came out of checking the first.

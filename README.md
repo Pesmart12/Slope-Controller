@@ -9,8 +9,12 @@ repository that poses tasks and solves them.
 
 ## What it is for
 
-One experiment, built to be legible rather than rigorous: **does the
-choice of contact formulation change what a policy learns?**
+Build an RL control stack on GRIP 1.0's penalty contact and measure what
+it does. Then rebuild it on 2.0's NCP solve and measure again. Put the two
+sets of numbers side by side and describe what changed.
+
+The task is a box pushed up a ramp and held there, on a slope below the
+friction angle — where rigid physics says a released box never moves.
 
 GRIP 1.0 models contact as a penalty force — a stiff spring-damper with a
 Coulomb friction cone. That formulation keeps the force constraint exact
@@ -32,14 +36,12 @@ because friction's moment arm tilts the box enough to redistribute normal
 force between the corners until the lightly loaded one saturates on its
 cone.
 
-So the task is built around a slope shallower than the friction angle,
-where rigid physics says a released box must **never move**. Penalty
-violates that by a visible margin; a solve satisfies it exactly. A policy
-trained against the sloppy version learns to fight a disturbance that is
-an artefact — and then walks its target off the ramp when the disturbance
-disappears.
+That is the physics half, and it needed no policy to produce. The other
+half is what a learned controller does with it — whether one trained
+against a phantom drag still behaves when the drag disappears. That is for
+the measurements to answer, not for this README.
 
-Full task definition, scene numbers, reward and evaluation protocol:
+Full task definition, scene numbers, reward and what gets measured:
 [`docs/ramp_manipulation_task.md`](docs/ramp_manipulation_task.md).
 
 ## Approach
@@ -49,17 +51,16 @@ Full task definition, scene numbers, reward and evaluation protocol:
 | Task | push a box up a ramp to a target and hold it |
 | Zeroth-order | MPPI / CEM — a planner, not a learner. Confirms the task is solvable and shows what good looks like. |
 | First-order | SHAC, consuming GRIP's analytic gradients through `adjoint_batch` |
-| Ground truth | NCP. **Every policy is scored there**, whichever simulator it trained in. |
+| Scoring | NCP, whichever simulator a policy trained in — the more accurate of the two. |
 
-PPO is deliberately excluded: it never touches the simulator's gradients,
-which is the thing GRIP uniquely provides, and it is the arm most likely
-to look identical across formulations.
+PPO is skipped: it never touches the simulator's gradients, which are the
+thing GRIP uniquely provides, and the sample budget at `dt = 5e-4` is
+brutal.
 
-The headline claim — that a solve is more physically correct — rests on a
-closed-form comparison rather than on any learning curve. A box on a slope
-below the friction angle must not move; that is Coulomb's law, not a
-modelling opinion. The RL results answer a separate and more interesting
-question, which is whether the error changes learned behaviour.
+The drift measurement stands on its own — a box on a slope below the
+friction angle must not move, and that is Coulomb's law rather than a
+modelling opinion. Everything after it is a build, and the comparison at
+the end reports whatever the numbers turn out to say.
 
 ## Status
 
@@ -72,8 +73,8 @@ question, which is whether the error changes learned behaviour.
 
 The first milestone needed no policy and no training, which is why it came
 first: place a box on a tilted half-plane, roll out five seconds of zero
-controls, and measure. Half the headline result now exists; the other half
-is the same plot with a solve in place of a spring.
+controls, and measure. The other half of that plot is the same figure with
+a solve in place of a spring.
 
 ## Setup
 

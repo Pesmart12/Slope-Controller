@@ -23,8 +23,8 @@ import numpy as np
 import grip
 
 # Below the friction angle atan(mu), where rigid physics says a released
-# box holds its position for all time. That inequality is the whole
-# experiment: penalty contact violates it visibly, an NCP solve does not.
+# box holds its position for all time. Penalty contact violates that
+# visibly; an NCP solve does not. Every angle used here stays below it.
 DEFAULT_RAMP_ANGLE = math.radians(20.0)
 
 # GRIP's demo constants, so these numbers describe a configuration that is
