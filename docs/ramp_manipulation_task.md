@@ -375,7 +375,7 @@ the policy spends most of its time.
    `experiments/drift.py`.
 2. Minimal task: box alone on the ramp, wrench applied directly to the box,
    no pusher. De-risks the reward, the observation space and the training
-   loop with two objects and one contact set.
+   loop with one object and one contact set.
 3. Add the pusher. Body-body contact and friction join the critical path,
    and it starts looking like manipulation rather than a physics test.
 4. MPPI on penalty. Confirms solvability.

@@ -123,7 +123,7 @@ are `(steps, environments, bodies, 3)` as a wrench at the centre of mass.
 `rollout_batch` returns `(steps + 1, ...)` — one state per control step plus
 the initial one.
 
-Three things follow, and they shape most of the code here:
+Four things follow, and they shape most of the code here:
 
 - **GRIP never sees the reward.** This repository computes `∂r/∂Z` and
   `∂r/∂U` and hands them over as seeds, and gets total derivatives back. A
@@ -135,6 +135,10 @@ Three things follow, and they shape most of the code here:
 - **Every environment carries its own `Scene`.** Ramp angle, masses and
   contact parameters randomize across a batch for free; only the body count
   has to match. That is what makes the task's per-episode ramp angle cheap.
+- **`rollout_batch` hands back a view of the simulator's own buffer**, not a
+  copy — its own docstring says so. One rollout at a time is fine, which is
+  why `drift.py` never noticed. A training loop that keeps trajectories
+  across iterations has to copy. `step_batch` returns a fresh array instead.
 
 2.0 is expected to change the contact model behind these calls rather than
 the calls themselves.
