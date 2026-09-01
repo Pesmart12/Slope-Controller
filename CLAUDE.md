@@ -77,6 +77,11 @@ Six source files. The repository is small and should stay legible.
 | `tests/check_closed_loop.py` | why SHAC needs a per-step adjoint sweep and not one call per window |
 | `docs/ramp_manipulation_task.md` | the task definition; the authority on scene numbers, reward and episode structure |
 
+`slope_control/task.py` carries two variants, `BOX_ONLY` and `TWO_PUSHERS`,
+which differ in body count, which body is scored, which are actuated, and
+the force limits. Everything else — reward, seeds, observation frame,
+settle — is shared, and every check runs both.
+
 The one **result** so far, reproducible by `python experiments/drift.py`:
 
 ```
@@ -114,11 +119,12 @@ so a session knows where it is.
    question it was there for. It keeps one job in reserve — if trajopt
    ever fails, gradient-free is what separates "bad reward" from "correct
    but unusable gradients."
-4. **Next.** Add the pushers — **two**, not one. A convex pusher only
-   pushes, and its direction is fixed by which side it starts on, so one
-   pusher makes overshoot unrecoverable (5–8 s of creep to undo 5 cm under
-   penalty, never under NCP, against a 4 s episode).
-5. SHAC on penalty. Completes the 1.0 column.
+4. **Done.** Two pushers, box between them, box unactuated. Trajopt
+   solves it to 0.2–1.2 cm — so the manipulation task is worth training
+   on. Every check now runs both variants; the adjoint holds through
+   body-body contact at 2e-5 relative.
+5. **Next.** SHAC on penalty. Completes the 1.0 column. Use the per-step
+   adjoint sweep from `check_closed_loop.py`, not one call per window.
 6. Wait for GRIP 2.0, rerun the column, fill in the cross-eval table.
 
 Steps 2–5 need nothing from GRIP that does not already exist. **Do not build
@@ -292,10 +298,18 @@ check did not catch that and could not have — a correct gradient on an
 impossible objective is still correct. When something is checked and still
 doesn't work, suspect the task before the machinery.
 
-**Step 4 is next** — add the pushers, **two** of them, per the task doc's
-"Why two pushers and not one". The 3° contact-face angle is already in the
-geometry there, along with the centroid and inertia corrections the trim
-forces.
+**Step 5, SHAC, is next.** Everything it needs exists: a solvable task, a
+verified closed-loop gradient, and a baseline to be measured against.
+
+One finding from step 4 that will bite SHAC directly: **gradients cannot
+discover a contact that does not exist.** From a zero initialization the
+two-pusher case does not converge slowly — the driving pusher's action
+stays at exactly 0.00 N forever, because with no contact
+`d(box position)/d(pusher action)` is identically zero, and the 2 kg
+pusher creeps downhill faster than the 1 kg box so the gap only opens.
+`check_trajopt.warm_start` fixes it by starting every actuated body at its
+own holding force. A policy initialized near zero output faces the same
+flat region.
 
 Three things left open on purpose, so they aren't mistaken for oversights:
 

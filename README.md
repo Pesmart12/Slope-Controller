@@ -69,7 +69,7 @@ the end reports whatever the numbers turn out to say.
 | Drift measurement | **done** — `experiments/drift.py`, the plot above |
 | Ramp task, reward and gradient path | **done** — `slope_control/task.py`, `tests/check_task.py` |
 | Trajectory-optimization baseline | **done** — `tests/check_trajopt.py`, 1.4 cm to target |
-| Pushers | not started |
+| Two-pusher manipulation task | **done** — solved by trajopt to 0.2–1.2 cm |
 | SHAC | not started |
 | NCP half of every comparison | waiting on GRIP 2.0 |
 

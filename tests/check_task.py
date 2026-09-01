@@ -54,7 +54,7 @@ def check_flat_ground():
     state = ramp.resting_state([0.7], [0.0])
     assert np.allclose(ramp.along_ramp(state, [0.0]), [[0.7]])
     assert np.allclose(state[0, 0, 1], 0.5 * ramp.BOX_SIDE)
-    assert np.allclose(task.to_wrench(np.array([[1.3, -0.4]]), [0.0])[0, 0], [1.3, -0.4, 0.0])
+    assert np.allclose(task.to_wrench(np.array([[[1.3, -0.4]]]), [0.0])[0, 0], [1.3, -0.4, 0.0])
 
     # And the physical version: on flat ground there is nothing to creep towards.
     scene = ramp.make_scene(ramp_angle=0.0)
@@ -112,29 +112,35 @@ def check_settle_window():
 
 
 def check_reward_seeds():
-    """The seeds must differentiate the reward that sits next to them."""
-    rng = np.random.default_rng(0)
-    n_envs, steps = 3, 5
-    angles = rng.uniform(*task.RAMP_ANGLE_RANGE, size=n_envs)
-    targets = rng.uniform(-0.5, 0.5, size=n_envs)
-    states = rng.normal(size=(steps + 1, n_envs, 1, 6))
-    controls = rng.normal(size=(steps, n_envs, 1, 3))
+    """The seeds must differentiate the reward that sits next to them.
 
-    dl_dZ, dl_dU = task.reward_seeds(states, controls, angles, targets)
-    worst = 0.0
-    for array, analytic in [(states, dl_dZ), (controls, dl_dU)]:
-        for index in np.ndindex(array.shape):
-            saved, h = array[index], 1e-6
-            array[index] = saved + h
-            plus = task.reward(states, controls, angles, targets).sum()
-            array[index] = saved - h
-            minus = task.reward(states, controls, angles, targets).sum()
-            array[index] = saved
-            worst = max(worst, abs((plus - minus) / (2.0 * h) - analytic[index]))
+    Run for both variants, because the two-pusher reward scores a
+    different body than it actuates -- so a seed written against the wrong
+    index is a mistake the box-only case structurally cannot make.
+    """
+    for name, variant in [("box only ", task.BOX_ONLY), ("2 pushers", task.TWO_PUSHERS)]:
+        rng = np.random.default_rng(0)
+        n_envs, steps = 3, 5
+        angles = rng.uniform(*task.RAMP_ANGLE_RANGE, size=n_envs)
+        targets = rng.uniform(-0.5, 0.5, size=n_envs)
+        states = rng.normal(size=(steps + 1, n_envs, variant.bodies, 6))
+        controls = rng.normal(size=(steps, n_envs, variant.bodies, 3))
 
-    scale = max(np.abs(dl_dZ).max(), np.abs(dl_dU).max())
-    print(f"  {states.size + controls.size} partials finite-differenced: worst error {worst:.2e} against scale {scale:.2e}")
-    assert worst < 1e-6 * scale, worst
+        dl_dZ, dl_dU = task.reward_seeds(states, controls, angles, targets, variant)
+        worst = 0.0
+        for array, analytic in [(states, dl_dZ), (controls, dl_dU)]:
+            for index in np.ndindex(array.shape):
+                saved, h = array[index], 1e-6
+                array[index] = saved + h
+                plus = task.reward(states, controls, angles, targets, variant).sum()
+                array[index] = saved - h
+                minus = task.reward(states, controls, angles, targets, variant).sum()
+                array[index] = saved
+                worst = max(worst, abs((plus - minus) / (2.0 * h) - analytic[index]))
+
+        scale = max(np.abs(dl_dZ).max(), np.abs(dl_dU).max())
+        print(f"  {name}: {states.size + controls.size:>4} partials finite-differenced, worst error {worst:.2e} against scale {scale:.2e}")
+        assert worst < 1e-6 * scale, (name, worst)
 
 
 def check_adjoint():
@@ -143,27 +149,43 @@ def check_adjoint():
     The seeds passing on their own does not mean the chain is right: the
     index offset between states and controls, and the direction of the
     projection, both live here rather than in the reward.
+
+    Run for both variants. With two pushers the box is unactuated, so the
+    whole path from a control to the scored position runs through a
+    body-body contact -- a longer chain than the box-only case exercises,
+    and the one the manipulation task actually depends on.
     """
+    for name, variant in [("box only ", task.BOX_ONLY), ("2 pushers", task.TWO_PUSHERS)]:
+        worst = probe_adjoint(variant)
+        print(f"  {name}: {variant.bodies} bodies, worst relative error {worst:.2e}")
+        assert worst < 1e-4, (name, worst)
+
+
+def probe_adjoint(variant):
+    """Finite-difference a handful of dJ_dU entries for one variant."""
     rng = np.random.default_rng(1)
     n_envs, steps, probes = 2, 12, 10
     angles = rng.uniform(*task.RAMP_ANGLE_RANGE, size=n_envs)
-    scenes = ramp.make_scenes(angles)
+    bodies = task.bodies_for(variant)
+    scenes = ramp.make_scenes(angles, bodies=bodies)
     substeps = task.substeps_for(scenes[0])
 
-    state = task.settle(scenes, ramp.resting_state([0.1, 0.3], angles), substeps)
-    targets = ramp.along_ramp(state, angles)[:, 0] + np.array([0.5, -0.5])
-    # Well inside MAX_FORCE, so the clip is not what is under test here.
-    wrenches = task.to_wrench(rng.uniform(-1.5, 1.5, size=(steps, n_envs, 2)), angles)
+    start = np.array([0.1, 0.3])
+    positions = start[:, None] if variant.bodies == 1 else task.placement(start, np.zeros((n_envs, len(variant.actuated))), variant)
+    state = task.settle(scenes, ramp.resting_state(positions, angles, bodies=bodies), substeps)
+    targets = ramp.along_ramp(state, angles)[:, variant.box] + np.array([0.5, -0.5])
+    # Well inside the limit, so the clip is not what is under test here.
+    wrenches = task.to_wrench(rng.uniform(-1.5, 1.5, size=(steps, n_envs, len(variant.actuated), 2)), angles, variant)
 
     trajectory = np.array(grip.rollout_batch(scenes, state, wrenches, substeps=substeps))
-    dl_dZ, dl_dU = task.reward_seeds(trajectory, wrenches, angles, targets)
+    dl_dZ, dl_dU = task.reward_seeds(trajectory, wrenches, angles, targets, variant)
     _, dJ_dU = grip.adjoint_batch(scenes, trajectory, wrenches, substeps, dl_dZ, dl_dU)
 
     def total(controls):
         rolled = grip.rollout_batch(scenes, state, controls, substeps=substeps)
-        return task.reward(rolled, controls, angles, targets).sum()
+        return task.reward(rolled, controls, angles, targets, variant).sum()
 
-    indices = [(rng.integers(steps), rng.integers(n_envs), 0, rng.integers(3)) for _ in range(probes)]
+    indices = [(rng.integers(steps), rng.integers(n_envs), rng.integers(variant.bodies), rng.integers(3)) for _ in range(probes)]
     worst = 0.0
     for index in indices:
         saved, h = wrenches[index], 1e-5
@@ -175,8 +197,7 @@ def check_adjoint():
         finite = (plus - minus) / (2.0 * h)
         worst = max(worst, abs(finite - dJ_dU[index]) / max(abs(finite), 1e-9))
 
-    print(f"  {probes} components of dJ_dU vs central differences through {steps * substeps} integration steps: worst relative error {worst:.2e}")
-    assert worst < 1e-4, worst
+    return worst
 
 
 def check_observation():
@@ -185,28 +206,41 @@ def check_observation():
     state = ramp.resting_state([0.4, 0.4], angles)
     targets = np.array([1.0, 1.0])
     observation = task.observe(state, angles, targets)
-    assert observation.shape == (2, 1, 7), observation.shape
+    assert observation.shape == (2, 7), observation.shape
 
-    flat = observation[0, 0]
+    flat = observation[0]
     assert np.allclose(flat[0], (0.4 - 1.0) / ramp.BOX_SIDE)  # error in box widths
     assert np.allclose(flat[2:], [0.0, 0.0, 0.0, 0.0, 0.0])   # flush, at rest, on the flat
     # Slope-invariance: the same placement on a tilted ramp reads identically
     # except for the gravity load in the last entry.
-    assert np.allclose(observation[0, 0, :6], observation[1, 0, :6])
-    assert np.allclose(observation[1, 0, 6], math.sin(angles[1]))
-    print(f"  observation {observation.shape}, slope-invariant except sin(a) = {observation[1, 0, 6]:.4f}")
+    assert np.allclose(observation[0, :6], observation[1, :6])
+    assert np.allclose(observation[1, 6], math.sin(angles[1]))
+
+    # Two pushers: the box's seven, then four per pusher, relative to it.
+    pushers = task.TWO_PUSHERS
+    bodies = task.bodies_for(pushers)
+    placed = task.placement(np.full(2, 0.4), np.zeros((2, 2)), pushers)
+    wide = task.observe(ramp.resting_state(placed, angles, bodies=bodies), angles, targets, pushers)
+    assert wide.shape == (2, 15), wide.shape
+    assert np.allclose(wide[:, 0:7], observation)  # the box block is unchanged
+    # Pushers sit either side, touching, so their relative xi is symmetric.
+    assert np.allclose(wide[:, 7], -wide[:, 11])
+    assert np.allclose(wide[:, [9, 10, 13, 14]], 0.0)  # flush, level, at rest
+
+    print(f"  box only {observation.shape}, two pushers {wide.shape}; slope-invariant except sin(a) = {observation[1, 6]:.4f}")
+    print(f"  pushers read at {wide[0, 7]:+.4f} and {wide[0, 11]:+.4f} box widths from the box")
 
 
 def check_action_limit():
     """The limit must let the box move, and still not let it leave the ramp.
 
-    Two bounds from different physics, which is why FORCE_LIMIT is a box
+    Two bounds from different physics, which is why the limit is a box
     and not a magnitude. Sizing one alone is how an earlier 5 N limit came
     out below the force needed to move the box at all, leaving the task
     unsolvable until `check_trajopt.py` reported it.
     """
     steep = task.RAMP_ANGLE_RANGE[1]
-    tangential, perpendicular = task.FORCE_LIMIT
+    tangential, perpendicular = task.BOX_ONLY.limit
     break_free = ramp.break_free_force(steep)
     load = ramp.normal_load(steep)
 
@@ -215,7 +249,7 @@ def check_action_limit():
     assert tangential > break_free, "the box cannot be moved at all"
     assert perpendicular < load, "an outward push could peel the box off the ramp"
 
-    assert np.allclose(task.to_wrench(np.array([[99.0, -99.0]]), [0.0])[0, 0], [tangential, -perpendicular, 0.0])
+    assert np.allclose(task.to_wrench(np.array([[[99.0, -99.0]]]), [0.0])[0, 0], [tangential, -perpendicular, 0.0])
 
     angles = np.array([math.radians(20.0)])
     scenes = ramp.make_scenes(angles)
@@ -223,13 +257,13 @@ def check_action_limit():
     state = task.settle(scenes, ramp.resting_state(0.0, angles), substeps)
 
     # Push straight out as hard as allowed: the box must stay in contact.
-    lifting = task.to_wrench(np.tile([0.0, perpendicular], (100, 1, 1)), angles)
+    lifting = task.to_wrench(np.tile([0.0, perpendicular], (100, 1, 1, 1)), angles)
     gap = max(corner_depths(np.array(grip.rollout_batch(scenes, state, lifting, substeps=substeps)[-1]), angles))
     assert gap[0] < 0.0, "the box left the surface"
 
     # Push along the ramp as hard as allowed: the box must actually go
     # somewhere, and must not tip while doing it.
-    driving = task.to_wrench(np.tile([tangential, 0.0], (task.EPISODE_STEPS, 1, 1)), angles)
+    driving = task.to_wrench(np.tile([tangential, 0.0], (task.EPISODE_STEPS, 1, 1, 1)), angles)
     trajectory = np.array(grip.rollout_batch(scenes, state, driving, substeps=substeps))
     moved = ramp.along_ramp(trajectory, angles)[-1, 0, 0] - ramp.along_ramp(state, angles)[0, 0]
     tilt = np.abs(trajectory[:, 0, 0, 2] - angles[0]).max()

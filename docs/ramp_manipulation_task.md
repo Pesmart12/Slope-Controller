@@ -641,11 +641,39 @@ Two pushers, one either side, make the box bidirectionally drivable. Cost
 is three bodies at 98 episodes/s, and GRIP needs nothing new — it already
 sweeps every `i < j` pair.
 
-One consequence to size before building: the driving pusher can carry
-itself and the box comfortably (1.65× headroom at `mass = 2.0`), but it
-**cannot shove a passive stack** at 22° — that needs 18.37 N against an
-18.19 N ceiling, and more pusher mass raises both sides of the inequality
-rather than fixing it. So the trailing pusher has to actively yield. That
-is real bilateral manipulation rather than bulldozing, but it means a naive
-policy is physically impossible at the steep end of the slope range, which
-is worth knowing before blaming the learner.
+### The force budget, measured
+
+An earlier draft claimed the driving pusher "cannot shove a passive
+stack," on the grounds that it needed 18.37 N against an 18.19 N ceiling.
+That was a **tangential requirement compared against a normal ceiling** —
+different axes, the same mistake that produced the unsolvable 5 N limit.
+Nothing prevents a large tangential push. The real numbers, at 22°:
+
+```
+break free, pusher alone            16.45 N
+break free, pusher + box            24.67 N   <- to drive the box
+break free, + a passive pusher      41.11 N
+pusher normal load                  18.19 N   <- only an outward push beats this
+```
+
+Measured: the box does not move at 24 N and is driven 3.8 m at 26 N, so
+the closed form is exact again. Nothing tips — 4 mrad at 60 N, 8.6 mrad
+with a 3 cm impact.
+
+So the limit is **(30, 12) N** per pusher. 30 N is deliberately short of
+the 41.11 N that would bulldoze a passive partner, which makes coordination
+*necessary* rather than impossible: driven properly, the trailing pusher
+carries itself uphill (16.45 N) while the driving one handles itself and
+the box (24.67 N), both inside 30.
+
+### Uphill and downhill are wildly asymmetric
+
+```
+drive the box uphill     (M+m)g(sin α + μ·cos α)      = 24.67 N
+drive the box downhill   μ(M+m)g·cos α - (M+m)g·sin α  =  2.63 N
+```
+
+Roughly **9× cheaper to correct downhill than to travel uphill**, because
+gravity changes sides. So overshoot recovery — the whole reason for a
+second pusher — is not merely possible but nearly free. This one is still
+closed form only; verify it when the downhill case is first exercised.

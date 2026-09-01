@@ -40,6 +40,20 @@ DEFAULT_TIMESTEP = 5.0e-4
 BOX_SIDE = 0.3
 BOX_MASS = 1.0
 
+# Wide and short, so it cannot tip and needs no orientation controller --
+# measured at 4 mrad under 60 N. The box-facing edge is tilted, which is
+# what keeps the pusher off GRIP's parallel-face tie-break: it meets the
+# box at a vertex instead of flush.
+#
+# The height is half the box's side on purpose. The tilt only displaces
+# vertices in x, so the contact vertex always sits a full body-height above
+# the ramp, and at this height that is exactly the box's centre of mass --
+# the push therefore exerts no tipping moment on the box, at any tilt.
+PUSHER_WIDTH = 0.30
+PUSHER_HEIGHT = 0.15
+PUSHER_MASS = 2.0
+PUSHER_FACE_TILT = math.radians(3.0)
+
 GRAVITY = 9.81
 
 
@@ -78,13 +92,106 @@ def square_vertices(side):
     return [[-h, -h], [h, -h], [h, h], [-h, h]]
 
 
-def make_scene(ramp_angle=DEFAULT_RAMP_ANGLE, dt=DEFAULT_TIMESTEP, penalty=None, side=BOX_SIDE, mass=BOX_MASS):
-    """One box on a tilted half-plane."""
+def polygon_properties(vertices):
+    """Area, centroid and second moment about the centroid, for a CCW polygon.
+
+    Needed because the pusher is not a rectangle and its centroid is not
+    where the rectangle's centre would be. GRIP takes `BodyShape` vertices
+    in a frame centred on the centre of mass, so an un-recentred list puts
+    a standing torque offset into every contact the body makes.
+    """
+    v = np.asarray(vertices, dtype=float)
+    x, y = v[:, 0], v[:, 1]
+    xn, yn = np.roll(x, -1), np.roll(y, -1)
+    cross = x * yn - xn * y
+
+    area = 0.5 * cross.sum()
+    centroid = np.array([((x + xn) * cross).sum(), ((y + yn) * cross).sum()]) / (6.0 * area)
+    ixx = ((y * y + y * yn + yn * yn) * cross).sum() / 12.0
+    iyy = ((x * x + x * xn + xn * xn) * cross).sum() / 12.0
+    return area, centroid, (ixx + iyy) - area * centroid.dot(centroid)
+
+
+def pusher_vertices(width=PUSHER_WIDTH, height=PUSHER_HEIGHT, tilt=PUSHER_FACE_TILT):
+    """The pusher's trapezoid, counterclockwise and centred on its centroid.
+
+    The +x face is the one that meets the box. Leaning it outward puts the
+    contact at the TOP vertex; leaning it the other way would put contact
+    at the bottom vertex, down where the ramp contact already is.
+
+    Derived rather than written down, because the 3 degree trim moves the
+    centroid about 2 mm and shifts the inertia 2%, and a hardcoded vertex
+    list is exactly the sort of thing that silently stops matching the
+    constants above it.
+    """
+    half_w, half_h = 0.5 * width, 0.5 * height
+    trim = height * math.tan(tilt)
+    raw = [[-half_w, -half_h], [half_w - trim, -half_h], [half_w, half_h], [-half_w, half_h]]
+    _, centroid, _ = polygon_properties(raw)
+    return [[vx - centroid[0], vy - centroid[1]] for vx, vy in raw]
+
+
+def uniform_inertia(vertices, mass):
+    """Second moment of a uniform-density polygon about its own centroid."""
+    area, _, second = polygon_properties(vertices)
+    return mass * second / area
+
+
+def resting_offset(vertices):
+    """How far a body's centre of mass sits from the surface when it rests flush.
+
+    The lowest vertex touches, so this is just how far the shape extends
+    below its own centroid -- which is not half the height once the
+    centroid has moved.
+    """
+    return -min(vy for _, vy in vertices)
+
+
+def mirrored_vertices(vertices):
+    """Reflect a polygon across its own y axis, keeping the winding CCW.
+
+    The uphill pusher pushes downhill, so its tilted face has to be on the
+    other side. Rotating the body 180 degrees will not do it -- that puts
+    the trimmed edge at the bottom, so the contact vertex ends up down at
+    the ramp surface instead of at the box's centre of mass. Reflecting
+    keeps the shape resting the same way up and moves only the face.
+
+    Without this the uphill pusher meets the box flat, which is exactly the
+    parallel-face tie-break the tilt exists to avoid.
+    """
+    reflected = [[-vx, vy] for vx, vy in reversed(vertices)]  # reversed, or the winding flips
+    assert polygon_properties(reflected)[0] > 0.0, "mirrored winding came out clockwise"
+    return reflected
+
+
+BOX = dict(vertices=square_vertices(BOX_SIDE), mass=BOX_MASS, inertia=BOX_MASS * BOX_SIDE ** 2 / 6.0)
+PUSHER = dict(vertices=pusher_vertices(), mass=PUSHER_MASS, inertia=uniform_inertia(pusher_vertices(), PUSHER_MASS))
+PUSHER_MIRRORED = dict(vertices=mirrored_vertices(PUSHER["vertices"]), mass=PUSHER_MASS, inertia=PUSHER["inertia"])
+
+# Pusher, box, pusher. The box is unactuated and sits between them, which
+# is what makes it drivable in both directions -- a single convex pusher
+# only pushes, and which way is fixed by the side it starts on.
+BOX_ONLY_BODIES = [BOX]
+TWO_PUSHER_BODIES = [PUSHER, BOX, PUSHER_MIRRORED]
+
+
+def contact_reach(body, toward_uphill):
+    """How far a body's contact vertex extends toward the box it pushes."""
+    xs = [vx for vx, _ in body["vertices"]]
+    return max(xs) if toward_uphill else -min(xs)
+
+
+def make_scene(ramp_angle=DEFAULT_RAMP_ANGLE, bodies=None, dt=DEFAULT_TIMESTEP, penalty=None):
+    """Bodies on a tilted half-plane, in the order given.
+
+    Defaults to the single box, which is what `drift.py` and the box-only
+    task want. Pass `TWO_PUSHER_BODIES` for the manipulation scene.
+    """
+    bodies = BOX_ONLY_BODIES if bodies is None else bodies
     penalty = DEFAULT_PENALTY if penalty is None else penalty
-    inertia = mass * side * side / 6.0  # a square about its centre
     return grip.Scene(
-        params=[grip.RigidBodyParams(mass=mass, inertia=inertia)],
-        shapes=[grip.BodyShape(square_vertices(side))],
+        params=[grip.RigidBodyParams(mass=b["mass"], inertia=b["inertia"]) for b in bodies],
+        shapes=[grip.BodyShape(b["vertices"]) for b in bodies],
         plane=grip.HalfPlane(normal=normal(ramp_angle).tolist(), offset=0.0),
         penalty=grip.PenaltyParams(**penalty),
         dt=dt,
@@ -92,18 +199,18 @@ def make_scene(ramp_angle=DEFAULT_RAMP_ANGLE, dt=DEFAULT_TIMESTEP, penalty=None,
     )
 
 
-def make_scenes(ramp_angles, dt=DEFAULT_TIMESTEP, penalty=None, side=BOX_SIDE, mass=BOX_MASS):
+def make_scenes(ramp_angles, bodies=None, dt=DEFAULT_TIMESTEP, penalty=None):
     """One Scene per environment, each carrying its own slope.
 
     GRIP requires only that the body count match across a batch, so the
     ramp angle randomizes for free. That is the whole reason the task's
     per-episode slope costs nothing.
     """
-    return [make_scene(ramp_angle=a, dt=dt, penalty=penalty, side=side, mass=mass) for a in np.atleast_1d(ramp_angles)]
+    return [make_scene(ramp_angle=a, bodies=bodies, dt=dt, penalty=penalty) for a in np.atleast_1d(ramp_angles)]
 
 
-def resting_state(xi, ramp_angles, side=BOX_SIDE):
-    """Boxes sitting flush on their ramps at `xi` along them, shaped (N, 1, 6).
+def resting_state(xi, ramp_angles, bodies=None):
+    """Bodies sitting flush on their ramps, shaped (environments, bodies, 6).
 
     Flush means the bottom face is parallel to the surface, so the body
     angle is the ramp angle, and the centre of mass sits half a side out
@@ -117,14 +224,28 @@ def resting_state(xi, ramp_angles, side=BOX_SIDE):
     different initial conditions and quietly spoil the comparison they
     exist for. Start flush and let `task.settle` ring it down instead.
 
-    `xi` broadcasts against `ramp_angles`, so a scalar places every
-    environment at the same point along its own slope.
+    `xi` gives each body's position along the ramp and broadcasts against
+    (environments, bodies), so a scalar places everything at the same point
+    on every slope. Each body sits out along the normal by however far its
+    shape extends below its own centroid, which is not half its height once
+    the centroid has moved.
     """
+    bodies = BOX_ONLY_BODIES if bodies is None else bodies
     angles = np.atleast_1d(np.asarray(ramp_angles, dtype=float))
-    xi = np.broadcast_to(np.asarray(xi, dtype=float), angles.shape)
-    state = np.zeros((angles.size, 1, 6))
-    state[:, 0, 0:2] = xi[:, None] * uphill(angles) + 0.5 * side * normal(angles)
-    state[:, 0, 2] = angles
+
+    # A bare (environments,) means one position per environment, shared by
+    # every body -- not one per body. Numpy would align it to the trailing
+    # axis and get that backwards, so say which axis it is.
+    xi = np.asarray(xi, dtype=float)
+    if xi.ndim == 1 and xi.size == angles.size:
+        xi = xi[:, None]
+    xi = np.broadcast_to(xi, (angles.size, len(bodies)))
+
+    up, out = uphill(angles), normal(angles)
+    state = np.zeros((angles.size, len(bodies), 6))
+    for index, body in enumerate(bodies):
+        state[:, index, 0:2] = xi[:, index, None] * up + resting_offset(body["vertices"]) * out
+        state[:, index, 2] = angles
     return state
 
 

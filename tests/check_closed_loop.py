@@ -54,7 +54,7 @@ def rollout_closed_loop(scenes, state, angles, targets, gain, substeps, steps=ST
     states, controls, errors = [state], [], []
     for _ in range(steps):
         error = ramp.along_ramp(state, angles)[:, 0] - targets
-        wrench = task.to_wrench(np.stack([-gain * error, np.zeros_like(error)], axis=-1), angles)
+        wrench = task.to_wrench(np.stack([-gain * error, np.zeros_like(error)], axis=-1)[:, None, :], angles)
 
         errors.append(error)
         controls.append(wrench)
@@ -67,7 +67,7 @@ def rollout_closed_loop(scenes, state, angles, targets, gain, substeps, steps=ST
 def one_call_gradient(scenes, trajectory, controls, angles, dl_dZ, dl_dU, dpi_dgain, substeps):
     """The task doc's recipe: one sweep, contracted with the direct dpi/dK."""
     _, dJ_dU = grip.adjoint_batch(scenes, trajectory, controls, substeps, dl_dZ, dl_dU)
-    return (task.to_action_gradient(dJ_dU, angles)[..., 0] * dpi_dgain).sum()
+    return (task.to_action_gradient(dJ_dU, angles)[..., 0, 0] * dpi_dgain).sum()
 
 
 def per_step_gradient(scenes, trajectory, controls, angles, dl_dZ, dl_dU, dpi_dgain, gain, substeps):
@@ -79,7 +79,7 @@ def per_step_gradient(scenes, trajectory, controls, angles, dl_dZ, dl_dU, dpi_dg
         seed[1] = adjoint
         dJ_dZ0, dJ_dU = grip.adjoint_batch(scenes, trajectory[t:t + 2], controls[t:t + 1], substeps, seed, dl_dU[t:t + 1])
 
-        action_gradient = task.to_action_gradient(dJ_dU, angles)[0, :, 0]
+        action_gradient = task.to_action_gradient(dJ_dU, angles)[0, :, 0, 0]
         total += (action_gradient * dpi_dgain[t]).sum()
 
         # The path a single call cannot see: the state feeds the policy,
@@ -101,7 +101,7 @@ def check(gain):
     trajectory, controls, errors = rollout_closed_loop(scenes, state, angles, targets, gain, substeps)
 
     peak = np.abs(gain * errors).max()
-    assert peak < task.FORCE_LIMIT[0], f"the feedback law saturates at K = {gain}, so the clip is what is under test"
+    assert peak < task.BOX_ONLY.limit[0], f"the feedback law saturates at K = {gain}, so the clip is what is under test"
 
     # If the recorded controls do not replay to the same trajectory, the
     # adjoint is being handed a different problem than the one measured.
