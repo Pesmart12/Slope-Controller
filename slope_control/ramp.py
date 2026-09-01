@@ -14,6 +14,11 @@ uphill gives -g*sin(a), so it pulls downhill as it should.
 Position along the ramp is written `xi` throughout -- a single coordinate
 is enough because a box resting on the surface has only one degree of
 freedom that any task here cares about.
+
+The slope is per environment. Every function below takes either a scalar
+`ramp_angle` or an array of `ramp_angles`, one per environment, because
+the task randomizes the slope across a batch and a single shared angle
+would be a quiet way to get that wrong.
 """
 
 import math
@@ -44,11 +49,27 @@ def friction_angle(mu):
 
 
 def uphill(ramp_angle):
-    return np.array([math.cos(ramp_angle), math.sin(ramp_angle)])
+    """(cos a, sin a). A scalar gives (2,), an array of N gives (N, 2)."""
+    a = np.asarray(ramp_angle, dtype=float)
+    return np.stack([np.cos(a), np.sin(a)], axis=-1)
 
 
 def normal(ramp_angle):
-    return np.array([-math.sin(ramp_angle), math.cos(ramp_angle)])
+    """(-sin a, cos a). A scalar gives (2,), an array of N gives (N, 2)."""
+    a = np.asarray(ramp_angle, dtype=float)
+    return np.stack([-np.sin(a), np.cos(a)], axis=-1)
+
+
+def scene_angle(scene):
+    """Recover a ramp angle from a built Scene's plane normal.
+
+    Angles and scenes travel as separate values and nothing structurally
+    stops them disagreeing, which would project a batch onto the wrong
+    slopes while every shape still lined up. Reading the angle back out
+    of the scene turns that silent failure into a check.
+    """
+    n = np.asarray(scene.plane.normal, dtype=float)
+    return math.atan2(-n[0], n[1])
 
 
 def square_vertices(side):
@@ -71,30 +92,56 @@ def make_scene(ramp_angle=DEFAULT_RAMP_ANGLE, dt=DEFAULT_TIMESTEP, penalty=None,
     )
 
 
-def resting_state(xi, ramp_angle=DEFAULT_RAMP_ANGLE, side=BOX_SIDE):
-    """A box sitting flush on the ramp at position `xi` along it.
+def make_scenes(ramp_angles, dt=DEFAULT_TIMESTEP, penalty=None, side=BOX_SIDE, mass=BOX_MASS):
+    """One Scene per environment, each carrying its own slope.
+
+    GRIP requires only that the body count match across a batch, so the
+    ramp angle randomizes for free. That is the whole reason the task's
+    per-episode slope costs nothing.
+    """
+    return [make_scene(ramp_angle=a, dt=dt, penalty=penalty, side=side, mass=mass) for a in np.atleast_1d(ramp_angles)]
+
+
+def resting_state(xi, ramp_angles, side=BOX_SIDE):
+    """Boxes sitting flush on their ramps at `xi` along them, shaped (N, 1, 6).
 
     Flush means the bottom face is parallel to the surface, so the body
     angle is the ramp angle, and the centre of mass sits half a side out
-    along the normal. The resulting gap is exactly zero -- the box settles
-    the further mg*cos(a)/2k into the surface within the first few
-    milliseconds of any rollout.
+    along the normal. The resulting gap is exactly zero.
+
+    Deliberately *not* the penalty equilibrium, for two reasons. It is
+    unreachable by a uniform offset, because friction's moment arm tilts
+    the box and loads the downhill corner harder than the uphill one, so
+    the two corners settle to different depths. And it is a
+    penalty-contact fact, so starting there would hand 1.0 and 2.0
+    different initial conditions and quietly spoil the comparison they
+    exist for. Start flush and let `task.settle` ring it down instead.
+
+    `xi` broadcasts against `ramp_angles`, so a scalar places every
+    environment at the same point along its own slope.
     """
-    centre = xi * uphill(ramp_angle) + 0.5 * side * normal(ramp_angle)
-    state = np.zeros((1, 1, 6))
-    state[0, 0, 0:2] = centre
-    state[0, 0, 2] = ramp_angle
+    angles = np.atleast_1d(np.asarray(ramp_angles, dtype=float))
+    xi = np.broadcast_to(np.asarray(xi, dtype=float), angles.shape)
+    state = np.zeros((angles.size, 1, 6))
+    state[:, 0, 0:2] = xi[:, None] * uphill(angles) + 0.5 * side * normal(angles)
+    state[:, 0, 2] = angles
     return state
 
 
-def along_ramp(states, ramp_angle=DEFAULT_RAMP_ANGLE):
-    """Project body positions onto the uphill direction.
+def along_ramp(states, ramp_angles):
+    """Project body positions onto each environment's uphill direction.
 
-    Accepts any array whose last axis is GRIP's 6-vector, so it works on a
-    single state, a batch, or a whole trajectory, and returns the matching
-    shape with the last axis dropped.
+    Expects GRIP's layout with the environment axis at -3, so a batch
+    (environments, bodies, 6) and a whole trajectory (steps,
+    environments, bodies, 6) both work and the last axis drops.
+
+    Unlike the single-angle version this cannot take a squeezed array.
+    With one angle per environment there is no way left to tell which
+    axis is which, and guessing is how a batch silently projects onto the
+    wrong slopes.
     """
-    return np.asarray(states)[..., 0:2] @ uphill(ramp_angle)
+    states = np.asarray(states)
+    return np.einsum("...nbi,ni->...nb", states[..., 0:2], uphill(np.atleast_1d(ramp_angles)))
 
 
 def creep_rate(ramp_angle=DEFAULT_RAMP_ANGLE, penalty=None, mass=BOX_MASS):
@@ -122,4 +169,21 @@ def creep_rate(ramp_angle=DEFAULT_RAMP_ANGLE, penalty=None, mass=BOX_MASS):
     So: exact while both corners stick, a lower bound once one does not.
     """
     penalty = DEFAULT_PENALTY if penalty is None else penalty
-    return mass * GRAVITY * math.sin(ramp_angle) / (2.0 * penalty["slip_damping"])
+    return mass * GRAVITY * np.sin(ramp_angle) / (2.0 * penalty["slip_damping"])
+
+
+def hold_force(ramp_angle=DEFAULT_RAMP_ANGLE, mass=BOX_MASS):
+    """What a controller must supply to hold a box perfectly still: mg*sin(a).
+
+    Under penalty contact friction is beta = -b_slip*s, so zero slip is
+    zero friction. A motionless box gets no help at all from the surface
+    and the controller pays the entire gravity component for as long as
+    it holds. Rigid friction does the same job for free on any slope
+    below the friction angle.
+
+    This is what the reward's control term is pricing, and it is a floor
+    rather than a tuning artifact: no feedback law beats it, because the
+    mechanism that would let it stop pushing is the one penalty contact
+    removes.
+    """
+    return mass * GRAVITY * np.sin(ramp_angle)

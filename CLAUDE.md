@@ -64,16 +64,18 @@ would produce something worse, say so.
 
 ## What exists
 
-Four source files. The repository is small and should stay legible.
+Six source files. The repository is small and should stay legible.
 
 | | |
 |---|---|
 | `slope_control/ramp.py` | the ramp scene and its geometry conventions, shared by everything |
+| `slope_control/task.py` | the step-2 task — action limit and frame, reward and its gradient seeds, episode and settle window, batch sampling |
 | `experiments/drift.py` | artifact 1 — the drift measurement and its figure |
 | `figures/drift.png` | committed output, so results are visible without running anything |
+| `tests/check_task.py` | the checks step 2 rests on, chiefly the finite-difference of `dJ_dU` through GRIP |
 | `docs/ramp_manipulation_task.md` | the task definition; the authority on scene numbers, reward and episode structure |
 
-The one result so far, reproducible by `python experiments/drift.py`:
+The one **result** so far, reproducible by `python experiments/drift.py`:
 
 ```
 20° ramp, zero controls, 5 s   ->   4.75 cm of drift, where rigid physics says 0
@@ -81,8 +83,11 @@ closed form mg·sin α / (2·b_slip) exact to five figures up to 18°
 departs at 19°, 48% low at 26°
 ```
 
-Nothing else is built. No policy, no planner, no training loop, no tests, no
-packaging.
+`tests/check_task.py` is not a result and produces no figure — it is what
+makes the step-2 machinery trustworthy, and `python tests/check_task.py`
+should stay at 9/9.
+
+Still not built: no policy, no planner, no training loop, no packaging.
 
 ## Build order
 
@@ -91,10 +96,15 @@ so a session knows where it is.
 
 1. **Done.** Box on a 20° tilted `HalfPlane`, five seconds of zero controls,
    plot `ξ` against time.
-2. **Next.** Minimal task — box alone, wrench applied directly to the box, no
-   pusher. De-risks the reward, the observation space and the training loop
-   against one contact set.
-3. Add the pusher. Body-body contact and friction join the critical path.
+2. **Substrate done.** Minimal task — box alone, wrench applied directly to
+   the box, no pusher. `slope_control/task.py` plus `tests/check_task.py`.
+   The reward and the gradient path are de-risked: `dJ_dU` matches central
+   differences to 3e-7 relative through GRIP. The **observation space is
+   not** — nothing consumes an observation until SHAC, so `observe` is
+   fixed but unvalidated, and step 2's original claim to de-risk it was
+   never achievable before step 5.
+3. **Next.** Add the pusher. Body-body contact and friction join the
+   critical path.
 4. MPPI on penalty. Confirms the task is solvable.
 5. SHAC on penalty. Completes the 1.0 column.
 6. Wait for GRIP 2.0, rerun the column, fill in the cross-eval table.
@@ -191,11 +201,19 @@ Pedro's preferences, the same ones GRIP uses where they carry over to Python.
 
 Real, and each one will bite in a specific place:
 
-- **`resting_state` hardcodes `(1, 1, 6)`** — one environment, one body. It
-  is the first thing that has to generalize at step 2, since training wants a
-  batch and the task randomizes ramp angle per environment.
-- **No `pyproject.toml`.** `experiments/drift.py` reaches the package via
-  `sys.path.insert`. Fine for one script; worth fixing before there are five.
+- **Angles and scenes travel separately.** `resting_state` and `along_ramp`
+  now take one angle per environment, but nothing structurally binds an
+  angle array to the scenes built from it, and a mismatch projects a batch
+  onto the wrong slopes with every shape still lining up. `ramp.scene_angle`
+  reads the angle back out of a scene so that failure is checkable; prefer
+  `task.sample_batch`, which hands them back together.
+- **`along_ramp` no longer accepts a squeezed array.** It needs the
+  environment axis at −3. With one angle per environment there is no way to
+  infer which axis is which, so passing `trajectory[:, 0, 0, :]` raises
+  instead of quietly projecting onto the wrong thing.
+- **No `pyproject.toml`.** `experiments/drift.py` and `tests/check_task.py`
+  both reach the package via `sys.path.insert`. That is now two scripts;
+  worth fixing before there are five.
 - **An editable install of GRIP does not rebuild on C++ changes.** Reinstall
   after touching its `src/`. This has already cost time once.
 - **The toolchain lives behind `vcvars`.** The import incantation is in the
@@ -250,11 +268,23 @@ silently pick one.
 
 ## Standing reminder
 
-The drift measurement is done and stands on its own. **Step 2 is next** —
-box alone, wrench applied directly, no pusher — and the honest first task in
-it is generalizing `resting_state` past its hardcoded single environment.
+The drift measurement is done and stands on its own. Step 2's substrate is
+done too, and checked — but it is **machinery, not a result**, and it was
+deliberately landed without a figure. Don't go looking for the artifact it
+didn't produce.
 
-Steps 2 through 5 need nothing that does not already exist. The 2.0 column
+**Step 3 is next** — add the pusher, and angle its contact face 2–3° before
+anything trains against it, per the last of the snags below.
+
+The two things step 2 left open, so they aren't mistaken for oversights:
+`observe` is written but unexercised until a policy consumes it at step 5,
+and `clip_action` is a hard clip with zero gradient once saturated, which is
+fine unless SHAC turns out to sit on the limit. If it does, the fix is a
+smooth squash, **not** a larger `MAX_FORCE` — the limit is what stops the
+box flying to the target, and raising it would quietly remove the contact
+this task exists to exercise.
+
+Steps 3 through 5 need nothing that does not already exist. The 2.0 column
 is written down so it isn't re-litigated and so nothing here forecloses it,
 **not** so it gets built early.
 

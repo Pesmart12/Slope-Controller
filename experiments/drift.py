@@ -46,11 +46,11 @@ def run(ramp_angle, duration=DURATION):
     substeps = int(round(1.0 / (CONTROL_HZ * scene.dt)))
     steps = int(round(duration * CONTROL_HZ))
 
-    initial = ramp.resting_state(0.0, ramp_angle=ramp_angle)
+    initial = ramp.resting_state(0.0, [ramp_angle])
     trajectory = grip.rollout_batch([scene], initial, np.zeros((steps, 1, 1, 3)), substeps=substeps)
 
     times = np.arange(steps + 1) / CONTROL_HZ
-    xi = ramp.along_ramp(trajectory[:, 0, 0, :], ramp_angle=ramp_angle)
+    xi = ramp.along_ramp(trajectory, [ramp_angle])[:, 0, 0]
     return times, xi - xi[0]
 
 

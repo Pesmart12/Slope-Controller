@@ -140,8 +140,24 @@ perpendicular distance `half-height` from the surface along `n`:
 q_body = (point on ramp) + 0.15·n,   θ_body = α
 ```
 
-Under penalty they will settle a further `mg·cos α / 2k ≈ 0.46 mm` into the
-surface. Either start them there or give the episode a brief settle window.
+Under penalty they settle a further `mg·cos α / 2k ≈ 0.46 mm` into the
+surface — but that is the **mean** of the two bottom corners, not a uniform
+sink. Friction's moment arm tilts the box, so the corners come to rest at
+different depths: 0.63 mm and 0.29 mm at 20°, widening with slope. No
+uniform offset reaches that state, so "start them there" is not actually
+available.
+
+Start flush and give the episode a **settle window** instead. The contact
+spring is underdamped — `ζ = 0.35` at these constants — so it overshoots by
+about a quarter and rings at ~50 ms per cycle; **0.2 s** covers it across
+the sampled slope range. The window is also the formulation-agnostic
+choice, because it runs under zero control: an NCP solve settles in it
+immediately and pays nothing, where starting at the penalty equilibrium
+would hand the two columns different initial conditions and quietly spoil
+the comparison they exist for.
+
+Measured in `tests/check_task.py`, which asserts the window is still long
+enough — that is what catches a later change to `k`, `b` or the box.
 
 ---
 
@@ -156,6 +172,30 @@ early training is miserable.
 
 Giving the policy all three components is a legitimate alternative — it just
 costs training time and buys nothing the comparison needs.
+
+### Step 2: the wrench applied directly
+
+The minimal task has no pusher, so the force lands on the box itself. Two
+decisions there, recorded so they don't get rediscovered later.
+
+**The action is in the ramp frame**, `(tangential, normal)`, rotated into
+GRIP's world wrench on the way in. The slope randomizes per episode, so a
+world-frame action would mean something different in every environment; a
+ramp-frame one means the same thing everywhere, and a positive tangential
+component always pushes toward increasing `ξ`. The torque row stays zero,
+mirroring the pusher's fixed-PD wrist.
+
+**The magnitude saturates at 5 N**, and that is not a tuning knob. A box
+that can be flown to its target makes this task de-risk nothing about
+contact, which is the only reason it exists. Lift-off needs `mg·cos α =
+9.1 N` at the steepest sampled slope, and tipping about the downhill
+corner needs roughly the same, so a 5 N limit means the box **cannot leave
+the ramp at all** — contact stays live for the whole episode by
+construction, rather than because the control cost discourages leaving.
+It still leaves 1.3 N of net uphill authority above the 3.7 N holding
+force. `tests/check_task.py` asserts all three inequalities, including the
+physical one: a full second of maximum outward force, and the box stays in
+contact.
 
 ---
 
