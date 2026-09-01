@@ -74,6 +74,7 @@ Six source files. The repository is small and should stay legible.
 | `figures/drift.png` | committed output, so results are visible without running anything |
 | `tests/check_task.py` | the checks step 2 rests on, chiefly the finite-difference of `dJ_dU` through GRIP |
 | `tests/check_trajopt.py` | the baseline — Adam on the raw control sequence, which is what says the reward is solvable at all |
+| `tests/check_closed_loop.py` | why SHAC needs a per-step adjoint sweep and not one call per window |
 | `docs/ramp_manipulation_task.md` | the task definition; the authority on scene numbers, reward and episode structure |
 
 The one **result** so far, reproducible by `python experiments/drift.py`:
@@ -303,13 +304,15 @@ Three things left open on purpose, so they aren't mistaken for oversights:
   baseline saturates for under 1% of steps, so it is not currently a
   problem; if SHAC ends up pinned to the limit the fix is a smooth squash,
   **not** a larger limit.
-- The task doc's SHAC recipe — one `adjoint_batch` call per window, read
-  `dJ_dU` — is the **open-loop** gradient. That is right for the baseline,
-  which optimizes a fixed control sequence, and it is what the baseline
-  validated. A closed-loop policy is a different derivative, because
-  perturbing `U_t` moves `Z_{t+1}` and therefore `a_{t+1}`. The likely fix
-  is a per-step backward sweep at the same total adjoint cost. **Verify
-  this before writing SHAC**, not during.
+- **SHAC needs a per-step adjoint sweep, not one call per window.** This
+  was a suspicion; it is now measured, in `tests/check_closed_loop.py`. One
+  call gives the open-loop gradient, which is exactly right for the
+  baseline's fixed control sequence and **119% wrong** for a policy at one
+  gain, 11% at another — state-dependent, so it cannot be absorbed into a
+  learning rate. The per-step sweep is exact to 2e-6 and costs the same
+  total adjoint work. Lift it out of the check and into `task.py` when
+  SHAC becomes its second consumer; there is no reason to generalize it
+  before then.
 
 Steps 4 and 5 need nothing that does not already exist. The 2.0 column
 is written down so it isn't re-litigated and so nothing here forecloses it,

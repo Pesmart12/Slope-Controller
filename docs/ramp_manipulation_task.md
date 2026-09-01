@@ -472,14 +472,45 @@ contingency, not a milestone.
 ### SHAC — the one that uses the gradients
 
 Short-horizon actor-critic with a learned value function, consuming analytic
-gradients through the dynamics. It maps directly onto `adjoint_batch`:
+gradients through the dynamics.
 
-- roll out a window of `W = 32` control steps
-- seed `dl_dZ[t]` with `∂r_t/∂Z_t` at every step
-- seed the terminal entry with `∂V/∂Z` from the critic
-- read back `dJ_dU[t]` and step the policy
+**It does not map onto one `adjoint_batch` call.** An earlier draft here
+prescribed exactly that — roll out `W = 32` steps, seed `dl_dZ[t]` at every
+step and the terminal entry from the critic, read back `dJ_dU[t]`, step the
+policy — and that recipe is **wrong for a policy**, measured:
 
-A result falls out of this for free: SHAC on penalty backpropagates through
+```
+one-parameter feedback a_t = -K(xi - xi*), 200 steps, dJ/dK
+  K = 25    truth  5.129    one call   5.706   ( 11.3% off)
+  K = 30    truth 28.790    one call  63.187   (119.5% off)
+```
+
+`adjoint_batch` returns `∂J/∂U_t` holding the other controls fixed. For a
+control *sequence* that is exactly the gradient, which is why
+`tests/check_trajopt.py` optimizes cleanly. For a *policy* it is not:
+`U_t = π(Z_t)`, and `Z_t` depends on every earlier control, so perturbing a
+parameter moves `U_0`, which moves `Z_1`, which moves `a_1` again through
+the policy. Contracting `dJ_dU` with the direct `∂π/∂θ` picks up only the
+first path.
+
+Note the error is not a constant factor — 11% at one gain, 119% at another.
+It cannot be absorbed into a learning rate.
+
+**What works** is a per-step backward sweep. Each step's adjoint call
+returns both pieces: `dJ_dU_t` to contract against `∂π/∂θ`, and `dJ_dZ0` to
+carry the adjoint back one step. Between calls, add the path a single call
+cannot see, `Z_t → a_t → Z_{t+1}`. Exact to 2e-6 relative, in
+`tests/check_closed_loop.py`.
+
+The cost is Python round trips, not simulation: `W` calls of `substeps`
+each rather than one call of `W·substeps`, so the total adjoint work is
+unchanged.
+
+This is **not** something to ask GRIP for. A state-dependent control is a
+policy, and policies belong on this side of the split — GRIP's contract
+that controls are exogenous is correct.
+
+A result still falls out for free: SHAC on penalty backpropagates through
 `32 × 20 = 640` integration steps per window, against NCP's 32. **Twenty
 times the adjoint cost and worse-conditioned gradients, from the same
 training configuration.**
