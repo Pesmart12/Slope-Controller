@@ -120,16 +120,59 @@ a cheap sanity check. Gravity `(0, −g)` projected onto the uphill direction
 
 | | |
 |---|---|
-| shape | rectangle, `0.15 × 0.3 m` |
-| vertices (CCW, body frame) | `(−0.075,−0.15), (0.075,−0.15), (0.075,0.15), (−0.075,0.15)` |
-| mass | `1.0` |
-| inertia | `m(w²+h²)/12 = 0.009375` |
+| shape | trapezoid, nominally `0.30 × 0.15 m`, box-facing edge tilted 3° |
+| vertices (CCW, body frame) | `(−0.148043,−0.075332), (0.144095,−0.075332), (0.151957, 0.074668), (−0.148043, 0.074668)` |
+| mass | `2.0` |
+| inertia | `0.018364` about the true centroid |
+
+**Wide and short, not tall and narrow.** An earlier draft specified
+`0.15 × 0.3 m` at `mass = 1.0`, standing on its narrow base. That shape
+**tips at 4.55 N** — below the 7.35 N it needs to do its job — so it falls
+over before it can hold the box, which is why that draft also needed an
+orientation PD. Flipped to `0.30 × 0.15` it tips at 18.2 N per kg, or
+36.4 N at `mass = 2.0`, far beyond anything the policy can command. **No PD
+is required, and none should be added** — see Actuation for why that
+matters more than it looks.
+
+**The mass is 2.0 because the force budget demands it.** The pusher has to
+hold *itself and* arrest the box's creep, without ever exceeding the normal
+force pinning it to the ramp:
+
+| pusher mass | hold self + box | lift-off ceiling | headroom |
+|---|---|---|---|
+| 0.5 | 5.51 N | 4.55 N | **impossible** |
+| 1.0 | 7.35 N | 9.10 N | 1.24× |
+| 2.0 | 11.02 N | 18.19 N | 1.65× |
+
+at the steepest sampled slope. Below about 0.68 kg there is no valid force
+limit at all. `mass = 1.0` leaves a 1.75 N window to work in; `2.0` leaves
+seven, which is what makes a limit choosable with margin on both sides.
+
+**The box-facing edge is tilted 3°, so the pusher meets the box at a
+vertex** rather than face-to-face — the tie-break degeneracy at the end of
+this document, removed from the critical path rather than managed on it.
+The tilt leans the edge *outward*, putting the contact at the **top**
+vertex; leaning it the other way would put contact at the bottom vertex,
+down where the ramp contact already is.
+
+One property worth naming, because it is structural rather than lucky: the
+tilt only displaces vertices in `x`, so the contact vertex always sits a
+full body-height above the ramp. At **half the box's side** that is exactly
+the box's COM height, so the push generates **no tipping moment on the box
+at all**, for any face angle.
 
 **Not gravity-compensated.** The pusher rests on the ramp like the box does,
 so it has its own friction contact and its own creep. That is deliberate —
-two creeping contacts, not one.
+two creeping contacts, not one. At `mass = 2.0` it creeps twice as fast as
+the box.
 
 Vertices must wind counterclockwise; GRIP's SAT-and-clip path requires it.
+They are also given **relative to the true centroid**, which the 3° trim
+moves 1.96 mm off the rectangle's centre — GRIP's `BodyShape` takes vertices
+in a frame centred on the COM, so an un-recentred list puts a standing
+torque offset into every contact. The trapezoid's inertia is 2.1% below
+what the rectangle formula gives; use the computed value. A check should
+assert the centroid is at the origin when this is built.
 
 ### Initial placement
 
@@ -163,15 +206,80 @@ enough — that is what catches a later change to `k`, `b` or the box.
 
 ## Actuation
 
-The policy commands a **2D force on the pusher**, `(fx, fy)`, in world frame.
+The policy commands a **2D force on the pusher**, in the ramp frame as at
+step 2, rotated into GRIP's world wrench on the way in. The torque row stays
+zero.
 
-A fixed internal PD holds the pusher's orientation at `θ = α`, supplying the
-`τ` component of the wrench. This is a stand-in for a wrist and it lives in
-this repository, not in GRIP. Without it, a free-floating pusher tumbles and
-early training is miserable.
+### Why there is no orientation PD
 
-Giving the policy all three components is a legitimate alternative — it just
-costs training time and buys nothing the comparison needs.
+An earlier draft held the pusher's orientation with a fixed internal PD,
+supplying the `τ` row. That was a workaround for a shape that tipped over,
+and the shape is fixed now — the wide pusher cannot tip under any force the
+policy can command, so the PD has nothing left to do.
+
+Removing it matters for a reason beyond tidiness. **A PD is state feedback
+inside the episode**, and `adjoint_batch` treats controls as exogenous: it
+answers "how does the score change if I perturb `U_t` and let the physics
+respond." If `τ_t` is a function of `Z_t`, that is no longer the derivative
+anyone wants, because perturbing anything upstream moves `Z_t`, which moves
+`τ_t`, which moves everything after it.
+
+Keeping all feedback in the policy means there is exactly one place where
+state reaches the controls, instead of two that have to be chained
+correctly and independently.
+
+This is **not** something to ask GRIP for. A state-dependent control is a
+policy, and policies belong on this side of the split. GRIP's contract that
+controls are exogenous is right; the consequence is ours to handle.
+
+### The force limit
+
+**The limit is a box, not a magnitude.** The two components of the action
+are bounded by entirely different physics, and a single magnitude cap
+conflates them:
+
+| | closed form | at 22° | limit |
+|---|---|---|---|
+| tangential must **exceed** | `mg(sin α + μ·cos α)` | 8.22 N | 12 N |
+| normal must stay **below** | `mg·cos α` | 9.10 N | 6 N |
+
+The tangential bound is the force that breaks the box free of friction.
+The normal bound is the load pinning it to the ramp — push outward harder
+and the contact unloads and the body leaves the surface.
+
+This was got wrong first. An earlier draft sized a single 5 N magnitude cap
+against `hold_force = mg·sin α = 3.7 N` alone, never against the force
+needed to *move* anything, and 5 N is below the break-free threshold at
+every sampled slope. **The task was literally unsolvable**, and stayed that
+way through a passing gradient check, because a correct gradient on an
+impossible objective is still correct. `tests/check_trajopt.py` is what
+caught it.
+
+Tipping is **not** a constraint, though the same draft claimed it was. A
+wrench acts at the centre of mass, so it exerts no moment there; friction's
+couple at the base is balanced by the centre of pressure shifting `μ·h` =
+7.5 cm, inside the 15 cm half-width, for any force whatever. Measured: 2
+mrad of tilt under 25 N.
+
+The purpose of the normal bound is worth restating: a body that can leave
+the ramp makes this task de-risk nothing about contact, which is the only
+reason it exists.
+
+### Coulomb friction has no gentle regime
+
+Worth stating separately, because it shapes what a solution can look like.
+Measured at 15°, 20° and 22°, sweeping a constant uphill force:
+
+```
+20 deg    7.0 N ->   4.6 cm      stuck; this is arrested creep, not motion
+          8.0 N ->  44.2 cm      breaking free
+          9.0 N -> 840.7 cm      gone
+```
+
+There is no force that produces slow, controlled sliding. Below the
+threshold nothing moves; a newton above it the box accelerates away
+without bound. Any solution is therefore some form of shove-and-brake, and
+the precision has to come from somewhere other than modulating the push.
 
 ### Step 2: the wrench applied directly
 
@@ -183,19 +291,45 @@ GRIP's world wrench on the way in. The slope randomizes per episode, so a
 world-frame action would mean something different in every environment; a
 ramp-frame one means the same thing everywhere, and a positive tangential
 component always pushes toward increasing `ξ`. The torque row stays zero,
-mirroring the pusher's fixed-PD wrist.
+mirroring the pusher, which is shaped so it needs no orientation control.
 
-**The magnitude saturates at 5 N**, and that is not a tuning knob. A box
-that can be flown to its target makes this task de-risk nothing about
-contact, which is the only reason it exists. Lift-off needs `mg·cos α =
-9.1 N` at the steepest sampled slope, and tipping about the downhill
-corner needs roughly the same, so a 5 N limit means the box **cannot leave
-the ramp at all** — contact stays live for the whole episode by
-construction, rather than because the control cost discourages leaving.
-It still leaves 1.3 N of net uphill authority above the 3.7 N holding
-force. `tests/check_task.py` asserts all three inequalities, including the
-physical one: a full second of maximum outward force, and the box stays in
-contact.
+**The action saturates componentwise at `(12, 6)` N**, per the force-limit
+section above. `tests/check_task.py` asserts both inequalities and their
+physical counterparts: a full second of maximum outward push leaves the box
+still in contact, and a full episode of maximum uphill push moves it far
+enough to reach any target and brake.
+
+### What the baseline solution looks like
+
+`tests/check_trajopt.py` optimizes the raw 400-step control sequence with
+Adam and reaches the target to **1.4 cm** at every sampled slope, from a
+reward of −1195 down to −94. So the reward is solvable and its gradients
+are navigable across 8000 integration steps — which is the thing that had
+to be true before SHAC was worth writing.
+
+The *shape* of the solution is the part worth recording:
+
+```
+        peak push   above break-free   last above    moved
+ 15 deg   10.61 N               6.5%      0.25 s    0.51 m
+ 20 deg   11.88 N               7.0%      0.27 s    0.51 m
+ 22 deg   12.00 N               7.8%      0.30 s    0.51 m
+```
+
+A shove of about **0.3 s** does essentially all the travel, friction brakes
+it, and then the force settles into the band between `hold_force` and
+`break_free_force` — too little to slide the box, more than enough to make
+it creep *uphill* rather than down, at `(f − mg·sin α)/2b_slip`. Measured
+at 0.67 cm/s across all three slopes, closing the last centimetre or two
+over the remaining 3.7 s.
+
+**That second phase is penalty contact only.** Below the friction bound a
+rigid box does not move at all, so under an NCP solve this fine-positioning
+mechanism does not exist and the last centimetre has to be closed some
+other way. It is the first concrete instance of the thing this project
+exists to measure, and it turned up in the baseline before any policy was
+trained. What a learned controller does with it is for the measurements to
+say.
 
 ---
 
@@ -308,15 +442,32 @@ GRIP uniquely provides, and the sample budget is brutal — at `dt = 5e-4`,
 one simulated second is 2000 integration steps. Not a judgement about PPO;
 it is just not what this project is for.
 
-### MPPI / CEM — the zeroth-order control
+### Trajectory optimization — the baseline
 
-Sampling-based MPC. A planner, not a learner: no training loop, no sample
-budget, a couple hundred lines. It answers *"is this task solvable and what
-does good behaviour look like"* immediately, and it runs identically on both
-simulators.
+**MPPI is dropped.** It was here to remove an ambiguity — if SHAC
+struggles, is it the gradients or the task? — but being zeroth order it
+never calls the adjoint, so it could only ever answer half of that.
+`tests/check_task.py` answered the other half by finite difference, and
+direct trajectory optimization answers what was left more cheaply: Adam on
+the raw control sequence, one real hyperparameter, no policy and no
+training loop.
 
-Its job is to remove ambiguity. If SHAC struggles, this is what tells you
-whether the problem is the gradients or the task.
+It establishes two things MPPI could not:
+
+- **The reward is solvable.** 1.4 cm to target at every sampled slope.
+- **The gradients are navigable**, not merely correct. A finite-difference
+  check proves correctness at a point; this crosses 8000 integration steps
+  of stiff contact and ends at its best iterate. SHAC's 32-step windows are
+  a far easier gradient problem than the full episode solved here.
+
+It is also where the force limit turned out to be unsolvable, which no
+amount of gradient checking would have surfaced — a correct gradient on an
+impossible objective is still correct.
+
+MPPI keeps one job in reserve, and only one: if trajectory optimization
+ever *fails*, being gradient-free is exactly what would separate "the
+reward is wrong" from "the gradients are right but unusable." That is a
+contingency, not a milestone.
 
 ### SHAC — the one that uses the gradients
 
@@ -340,14 +491,17 @@ training configuration.**
 1. **The drift plot.** Box released on the ramp, no policy, no RL.
    Displacement against time: penalty drifts 4.7 cm in 5 s, NCP sits at
    zero, and Coulomb's law says zero. **Done** — `experiments/drift.py`.
-2. **MPPI on both** — what good behaviour looks like, without a training
-   loop in the way.
-3. **SHAC on both** — the learned result.
-4. **The cross-eval table.**
-5. **A video** of whichever cell turns out to be the interesting one.
+2. **SHAC on both** — the learned result.
+3. **The cross-eval table.**
+4. **A video** of whichever cell turns out to be the interesting one.
 
 (1) is a measurement against a closed form and stands on its own whatever
 the rest do. The rest are the build, and they are allowed to be modest.
+
+The trajectory-optimization baseline is deliberately **not** on this list.
+It is machinery — it produces no number that means anything without an NCP
+column to set it against, and unlike the drift plot it has no closed form
+standing behind it. It lives in `tests/`, not `experiments/`.
 
 ---
 
@@ -394,17 +548,18 @@ A flat pusher pressed squarely against a flat box is precisely that
 configuration. It is measure-zero in floating point and the forward
 simulation is fine, but **SHAC gradients taken near it are suspect**.
 
-Two options, and this is a judgment call worth making deliberately:
+**Decided, and already in the geometry above:** the pusher's box-facing
+edge is tilted 3°, so it meets the box at a vertex and the tie never
+arises. The alternative was to accept it and note it — randomization and
+floating point mean the exact tie is essentially never hit, and the
+neighbourhood is well-behaved — but the hazard sits exactly where the
+policy spends most of its time, and the cost of removing it turned out to
+be a 7.86 mm trim.
 
-- **Accept it and note it.** Randomization and floating point mean the exact
-  tie is essentially never hit, and the surrounding neighbourhood is
-  well-behaved.
-- **Angle the pusher's contact face by 2–3°**, so it meets the box at a
-  vertex rather than flush. Cheap insurance, slightly less clean-looking,
-  and it removes the degeneracy from the critical path entirely.
-
-Recommended: angle it. The cost is cosmetic and the hazard sits exactly where
-the policy spends most of its time.
+Two consequences of the trim are easy to miss, and both are recorded with
+the vertex list: the centroid moves 1.96 mm, so the vertices have to be
+re-centred before GRIP sees them, and the inertia is 2.1% below the
+rectangle formula.
 
 ---
 
@@ -413,13 +568,53 @@ the policy spends most of its time.
 1. **Done.** Place a box on a 20° tilted `HalfPlane`, roll out five seconds
    of zero controls, plot `ξ` against time. It drifts 4.7 cm —
    `experiments/drift.py`.
-2. Minimal task: box alone on the ramp, wrench applied directly to the box,
-   no pusher. De-risks the reward, the observation space and the training
-   loop with one object and one contact set.
-3. Add the pusher. Body-body contact and friction join the critical path,
-   and it starts looking like manipulation rather than a physics test.
-4. MPPI on penalty. Confirms solvability.
+2. **Done.** Minimal task: box alone on the ramp, wrench applied directly,
+   no pusher — `slope_control/task.py`, `tests/check_task.py`. De-risked
+   the reward and the gradient path. It did **not** de-risk the observation
+   space, which nothing consumes before SHAC.
+3. **Done.** Trajectory-optimization baseline —
+   `tests/check_trajopt.py`. Confirms the reward is solvable and its
+   gradients navigable, and it is what caught the unsolvable force limit.
+   Replaces the MPPI step.
+4. **Next.** Add the pushers. Body-body contact and friction join the
+   critical path, and it starts looking like manipulation rather than a
+   physics test. **Two** pushers, not one — see below.
 5. SHAC on penalty. Completes the 1.0 column.
 6. Wait for GRIP 2.0, rerun the whole column, fill in the cross-eval matrix.
 
 Steps 1–5 need nothing from GRIP that does not already exist.
+
+### Why two pushers and not one
+
+A convex pusher can only push, and which direction it pushes is fixed by
+which side of the box it starts on — moving it does not change that. It
+cannot get to the other side either: the box is twice its height, going
+over means leaving the ramp, and `BodyShape` is convex-only so there is no
+hook that could pull.
+
+So with one pusher the box is drivable in one direction only, and
+**overshoot is unrecoverable**. Not merely expensive:
+
+```
+overshoot recovery, if creep is the only restoring mechanism
+  15°  0.63 cm/s -> 7.9 s to undo 5 cm   |  NCP: never
+  22°  0.92 cm/s -> 5.4 s                |  NCP: never
+```
+
+against a 4 s episode. An earlier draft here claimed penalty "partially
+forgives" overshoot where a solve does not — it does not, at the timescale
+the task actually has. Neither forgives it, so the asymmetry is not a
+measurement worth having, just brittleness in both columns.
+
+Two pushers, one either side, make the box bidirectionally drivable. Cost
+is three bodies at 98 episodes/s, and GRIP needs nothing new — it already
+sweeps every `i < j` pair.
+
+One consequence to size before building: the driving pusher can carry
+itself and the box comfortably (1.65× headroom at `mass = 2.0`), but it
+**cannot shove a passive stack** at 22° — that needs 18.37 N against an
+18.19 N ceiling, and more pusher mass raises both sides of the inequality
+rather than fixing it. So the trailing pusher has to actively yield. That
+is real bilateral manipulation rather than bulldozing, but it means a naive
+policy is physically impossible at the steep end of the slope range, which
+is worth knowing before blaming the learner.

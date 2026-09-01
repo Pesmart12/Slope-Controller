@@ -13,7 +13,8 @@ thing everywhere, and a positive first component always pushes toward
 increasing `xi`.
 
 The torque component is never written. That mirrors the pusher planned
-for step 3, which gets a 2D force and a fixed PD holding its orientation.
+for step 3, which gets a 2D force and a shape stable enough not to need
+an orientation controller.
 """
 
 import math
@@ -38,18 +39,34 @@ EPISODE_STEPS = int(round(EPISODE_SECONDS * CONTROL_HZ))
 SETTLE_SECONDS = 0.2
 SETTLE_STEPS = int(round(SETTLE_SECONDS * CONTROL_HZ))
 
-# Three constraints meet here, and 5 N clears all of them.
-#   Cannot break contact: lift-off needs mg*cos(a) = 9.2 N of normal
-#     force, so under this limit the box physically cannot leave the ramp
-#     and contact stays live for the whole episode by construction. That
-#     matters more than it sounds -- a box that can fly to the target
-#     makes this task de-risk nothing about contact, which is its job.
-#   Cannot tip: overturning about the downhill corner also needs roughly
-#     mg*cos(a), since the centre of mass is 0.15 m up and the base half
-#     width is 0.15 m too.
-#   Enough authority: holding at the steepest sampled slope costs
-#     mg*sin(22 deg) = 3.7 N, leaving 1.3 N of net uphill acceleration.
-MAX_FORCE = 5.0
+# A box, not a ball. The two components are bounded by different physics
+# and a single magnitude cap conflates them -- sizing one leaves the other
+# wrong, which is how the first version came out unable to move the box at
+# all.
+#
+#   Tangential must EXCEED ramp.break_free_force, mg(sin a + mu cos a) =
+#     8.22 N at the steepest sampled slope. Below it nothing moves; a
+#     newton above it the box accelerates away, because Coulomb friction
+#     has no gentle regime. 12 N leaves about 3.8 N of net drive, so a
+#     half-metre move and its braking phase fit inside an episode.
+#   Normal must stay BELOW ramp.normal_load, mg*cos(a) = 9.10 N, or an
+#     outward push unloads the contact and the box leaves the ramp. 6 N
+#     keeps lambda >= 3.1 N, so contact is live for the whole episode by
+#     construction -- a box that can fly to its target makes this task
+#     de-risk nothing about contact, which is its job.
+#
+# Tipping is NOT a constraint here, though an earlier draft claimed it
+# was. A wrench acts at the centre of mass, so it exerts no moment there;
+# friction's couple at the base is balanced by the centre of pressure
+# shifting mu*h = 7.5 cm, inside the 15 cm half-width, for any force.
+# Measured: 2 mrad of tilt at 25 N.
+FORCE_LIMIT = np.array([12.0, 6.0])
+
+# One isotropic scale for the control cost, deliberately not the limits.
+# A per-component weighting would not commute with the rotation into world
+# coordinates, so the seed would stop being a plain scaled copy of the
+# wrench and the reward and its derivative would drift apart for no gain.
+FORCE_SCALE = 12.0
 
 RAMP_ANGLE_RANGE = (math.radians(15.0), math.radians(22.0))
 START_RANGE = (0.0, 0.4)
@@ -66,17 +83,16 @@ def control_weight(tolerance=POSITION_TOLERANCE, ramp_angle=ramp.DEFAULT_RAMP_AN
     """Fix w_ctrl from a stated tolerance instead of picking a number.
 
     Both reward terms are normalized -- error by the box side, force by
-    MAX_FORCE -- so the weights are directly comparable and the choice
+    FORCE_SCALE -- so the weights are comparable and the choice
     reduces to one question: at what position error does holding stop
     being worth the force it costs? Setting the two terms equal there,
 
-        w_ctrl * (mg*sin(a) / F_max)^2  =  (tolerance / side)^2
+        w_ctrl * (mg*sin(a) / F_scale)^2  =  (tolerance / side)^2
 
-    which at the nominal slope comes out near 0.01. Stating the tolerance
-    rather than the weight means the number stays meaningful if MAX_FORCE
-    or the box changes.
+    Stating the tolerance rather than the weight means the number stays
+    meaningful if the force scale or the box changes.
     """
-    return (tolerance / ramp.BOX_SIDE) ** 2 / (ramp.hold_force(ramp_angle) / MAX_FORCE) ** 2
+    return (tolerance / ramp.BOX_SIDE) ** 2 / (ramp.hold_force(ramp_angle) / FORCE_SCALE) ** 2
 
 
 WEIGHTS = dict(position=1.0, control=control_weight())
@@ -93,19 +109,20 @@ def substeps_for(scene):
 
 
 def clip_action(actions):
-    """Saturate the action magnitude at MAX_FORCE.
+    """Clamp each component to its own entry in FORCE_LIMIT.
 
     Applied inside `to_wrench`, which is the only place an action becomes
     physics, so the limit cannot be bypassed by a caller that forgets it.
+    Beware when measuring anything against force: a sweep that routes
+    through `to_wrench` silently makes every value above the limit the
+    same experiment.
 
     A hard clip has zero gradient once saturated. That is fine for a
     planner and acceptable for SHAC as long as the policy is not pinned
     to the limit; if it turns out to be, a smooth squash is the fix, not
     a larger limit.
     """
-    actions = np.asarray(actions, dtype=float)
-    magnitude = np.linalg.norm(actions, axis=-1, keepdims=True)
-    return actions * np.minimum(1.0, MAX_FORCE / np.maximum(magnitude, 1e-12))
+    return np.clip(np.asarray(actions, dtype=float), -FORCE_LIMIT, FORCE_LIMIT)
 
 
 def to_wrench(actions, ramp_angles):
@@ -143,7 +160,7 @@ def to_action_gradient(dJ_dU, ramp_angles):
 def reward(states, controls, ramp_angles, targets, weights=None):
     """Per-step reward, shaped (steps, environments).
 
-        r_t = -w_pos * ((xi - xi*)/side)^2  -  w_ctrl * (|f|/F_max)^2
+        r_t = -w_pos * ((xi - xi*)/side)^2  -  w_ctrl * (|f|/F_scale)^2
 
     Both terms are normalized, which is what makes the weights order one
     and comparable. In raw units the ratio is about 1e-5 -- metres
@@ -163,7 +180,7 @@ def reward(states, controls, ramp_angles, targets, weights=None):
     weights = WEIGHTS if weights is None else weights
     xi = ramp.along_ramp(states, ramp_angles)[1:, :, 0]
     error = (xi - np.asarray(targets)) / ramp.BOX_SIDE
-    force = np.linalg.norm(np.asarray(controls)[..., 0, 0:2], axis=-1) / MAX_FORCE
+    force = np.linalg.norm(np.asarray(controls)[..., 0, 0:2], axis=-1) / FORCE_SCALE
     return -weights["position"] * error ** 2 - weights["control"] * force ** 2
 
 
@@ -183,7 +200,7 @@ def reward_seeds(states, controls, ramp_angles, targets, weights=None):
     not see theta, and it does not see velocity. dl_dZ[0] is zero for the
     index convention `reward` describes. For the control,
 
-        dr/df = -2*w_ctrl*f / F_max^2
+        dr/df = -2*w_ctrl*f / F_scale^2
 
     with the torque row zero. Both are partials of the stage cost only --
     GRIP supplies everything that makes them total derivatives.
@@ -200,7 +217,7 @@ def reward_seeds(states, controls, ramp_angles, targets, weights=None):
     dl_dZ[1:, :, 0, 0:2] = coefficient[1:, :, None] * ramp.uphill(angles)[None, :, :]
 
     dl_dU = np.zeros(controls.shape)
-    dl_dU[..., 0, 0:2] = -2.0 * weights["control"] * controls[..., 0, 0:2] / MAX_FORCE ** 2
+    dl_dU[..., 0, 0:2] = -2.0 * weights["control"] * controls[..., 0, 0:2] / FORCE_SCALE ** 2
     return dl_dZ, dl_dU
 
 

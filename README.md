@@ -49,7 +49,7 @@ Full task definition, scene numbers, reward and what gets measured:
 | | |
 |---|---|
 | Task | push a box up a ramp to a target and hold it |
-| Zeroth-order | MPPI / CEM — a planner, not a learner. Confirms the task is solvable and shows what good looks like. |
+| Baseline | Trajectory optimization — Adam on the raw control sequence. Confirms the task is solvable and the gradients navigable, with no policy in the way. |
 | First-order | SHAC, consuming GRIP's analytic gradients through `adjoint_batch` |
 | Scoring | NCP, whichever simulator a policy trained in — the more accurate of the two. |
 
@@ -67,7 +67,9 @@ the end reports whatever the numbers turn out to say.
 | | |
 |---|---|
 | Drift measurement | **done** — `experiments/drift.py`, the plot above |
-| MPPI / CEM planner | not started |
+| Ramp task, reward and gradient path | **done** — `slope_control/task.py`, `tests/check_task.py` |
+| Trajectory-optimization baseline | **done** — `tests/check_trajopt.py`, 1.4 cm to target |
+| Pushers | not started |
 | SHAC | not started |
 | NCP half of every comparison | waiting on GRIP 2.0 |
 

@@ -73,6 +73,7 @@ Six source files. The repository is small and should stay legible.
 | `experiments/drift.py` | artifact 1 — the drift measurement and its figure |
 | `figures/drift.png` | committed output, so results are visible without running anything |
 | `tests/check_task.py` | the checks step 2 rests on, chiefly the finite-difference of `dJ_dU` through GRIP |
+| `tests/check_trajopt.py` | the baseline — Adam on the raw control sequence, which is what says the reward is solvable at all |
 | `docs/ramp_manipulation_task.md` | the task definition; the authority on scene numbers, reward and episode structure |
 
 The one **result** so far, reproducible by `python experiments/drift.py`:
@@ -103,9 +104,19 @@ so a session knows where it is.
    not** — nothing consumes an observation until SHAC, so `observe` is
    fixed but unvalidated, and step 2's original claim to de-risk it was
    never achievable before step 5.
-3. **Next.** Add the pusher. Body-body contact and friction join the
-   critical path.
-4. MPPI on penalty. Confirms the task is solvable.
+3. **Done.** Trajectory-optimization baseline — `tests/check_trajopt.py`.
+   Adam on the raw control sequence reaches the target to 1.4 cm at every
+   sampled slope, so the reward is solvable and its gradients are
+   navigable across 8000 integration steps, not merely correct at a point.
+   **This replaces the MPPI step**, which was dropped: being zeroth order
+   it never calls the adjoint, so it could only ever answer half the
+   question it was there for. It keeps one job in reserve — if trajopt
+   ever fails, gradient-free is what separates "bad reward" from "correct
+   but unusable gradients."
+4. **Next.** Add the pushers — **two**, not one. A convex pusher only
+   pushes, and its direction is fixed by which side it starts on, so one
+   pusher makes overshoot unrecoverable (5–8 s of creep to undo 5 cm under
+   penalty, never under NCP, against a 4 s episode).
 5. SHAC on penalty. Completes the 1.0 column.
 6. Wait for GRIP 2.0, rerun the column, fill in the cross-eval table.
 
@@ -273,18 +284,34 @@ done too, and checked — but it is **machinery, not a result**, and it was
 deliberately landed without a figure. Don't go looking for the artifact it
 didn't produce.
 
-**Step 3 is next** — add the pusher, and angle its contact face 2–3° before
-anything trains against it, per the last of the snags below.
+The baseline is done too, and it earned its place immediately: it caught a
+force limit that made the task **unsolvable**, sized against the force to
+*hold* the box and never against the force to *move* it. A passing gradient
+check did not catch that and could not have — a correct gradient on an
+impossible objective is still correct. When something is checked and still
+doesn't work, suspect the task before the machinery.
 
-The two things step 2 left open, so they aren't mistaken for oversights:
-`observe` is written but unexercised until a policy consumes it at step 5,
-and `clip_action` is a hard clip with zero gradient once saturated, which is
-fine unless SHAC turns out to sit on the limit. If it does, the fix is a
-smooth squash, **not** a larger `MAX_FORCE` — the limit is what stops the
-box flying to the target, and raising it would quietly remove the contact
-this task exists to exercise.
+**Step 4 is next** — add the pushers, **two** of them, per the task doc's
+"Why two pushers and not one". The 3° contact-face angle is already in the
+geometry there, along with the centroid and inertia corrections the trim
+forces.
 
-Steps 3 through 5 need nothing that does not already exist. The 2.0 column
+Three things left open on purpose, so they aren't mistaken for oversights:
+
+- `observe` is written but unexercised until a policy consumes it at step 5.
+- `clip_action` is a hard clip with zero gradient once saturated. The
+  baseline saturates for under 1% of steps, so it is not currently a
+  problem; if SHAC ends up pinned to the limit the fix is a smooth squash,
+  **not** a larger limit.
+- The task doc's SHAC recipe — one `adjoint_batch` call per window, read
+  `dJ_dU` — is the **open-loop** gradient. That is right for the baseline,
+  which optimizes a fixed control sequence, and it is what the baseline
+  validated. A closed-loop policy is a different derivative, because
+  perturbing `U_t` moves `Z_{t+1}` and therefore `a_{t+1}`. The likely fix
+  is a per-step backward sweep at the same total adjoint cost. **Verify
+  this before writing SHAC**, not during.
+
+Steps 4 and 5 need nothing that does not already exist. The 2.0 column
 is written down so it isn't re-litigated and so nothing here forecloses it,
 **not** so it gets built early.
 

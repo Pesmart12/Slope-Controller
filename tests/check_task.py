@@ -198,27 +198,44 @@ def check_observation():
 
 
 def check_action_limit():
-    """MAX_FORCE has to be small enough that the box cannot leave the ramp."""
-    lift_off = ramp.BOX_MASS * ramp.GRAVITY * math.cos(task.RAMP_ANGLE_RANGE[1])
-    hold = ramp.hold_force(task.RAMP_ANGLE_RANGE[1])
-    print(f"  MAX_FORCE {task.MAX_FORCE:.1f} N   lift-off needs {lift_off:.2f} N   holding at 22 deg needs {hold:.2f} N")
-    assert task.MAX_FORCE < lift_off, "the box could break contact and fly to the target"
-    assert task.MAX_FORCE > 1.2 * hold, "not enough authority left over to move the box"
+    """The limit must let the box move, and still not let it leave the ramp.
 
-    saturated = task.to_wrench(np.array([[30.0, 40.0]]), [0.0])
-    assert math.isclose(np.linalg.norm(saturated[0, 0, 0:2]), task.MAX_FORCE)
+    Two bounds from different physics, which is why FORCE_LIMIT is a box
+    and not a magnitude. Sizing one alone is how an earlier 5 N limit came
+    out below the force needed to move the box at all, leaving the task
+    unsolvable until `check_trajopt.py` reported it.
+    """
+    steep = task.RAMP_ANGLE_RANGE[1]
+    tangential, perpendicular = task.FORCE_LIMIT
+    break_free = ramp.break_free_force(steep)
+    load = ramp.normal_load(steep)
 
-    # The physical version: push straight into free space as hard as allowed
-    # and the box must stay in contact.
+    print(f"  at {math.degrees(steep):.0f} deg: break free needs {break_free:.2f} N, tangential limit {tangential:.1f} N ({tangential / break_free:.2f}x)")
+    print(f"  {' ':>15}lift-off needs {load:.2f} N, normal limit {perpendicular:.1f} N (leaves lambda >= {load - perpendicular:.2f} N)")
+    assert tangential > break_free, "the box cannot be moved at all"
+    assert perpendicular < load, "an outward push could peel the box off the ramp"
+
+    assert np.allclose(task.to_wrench(np.array([[99.0, -99.0]]), [0.0])[0, 0], [tangential, -perpendicular, 0.0])
+
     angles = np.array([math.radians(20.0)])
     scenes = ramp.make_scenes(angles)
     substeps = task.substeps_for(scenes[0])
     state = task.settle(scenes, ramp.resting_state(0.0, angles), substeps)
-    lifting = task.to_wrench(np.tile([0.0, task.MAX_FORCE], (100, 1, 1)), angles)
-    trajectory = grip.rollout_batch(scenes, state, lifting, substeps=substeps)
-    gap = max(corner_depths(np.array(trajectory[-1]), angles))
-    print(f"  1 s of full outward force: deepest corner still {-1e3 * gap[0]:.3f} mm inside the ramp")
+
+    # Push straight out as hard as allowed: the box must stay in contact.
+    lifting = task.to_wrench(np.tile([0.0, perpendicular], (100, 1, 1)), angles)
+    gap = max(corner_depths(np.array(grip.rollout_batch(scenes, state, lifting, substeps=substeps)[-1]), angles))
     assert gap[0] < 0.0, "the box left the surface"
+
+    # Push along the ramp as hard as allowed: the box must actually go
+    # somewhere, and must not tip while doing it.
+    driving = task.to_wrench(np.tile([tangential, 0.0], (task.EPISODE_STEPS, 1, 1)), angles)
+    trajectory = np.array(grip.rollout_batch(scenes, state, driving, substeps=substeps))
+    moved = ramp.along_ramp(trajectory, angles)[-1, 0, 0] - ramp.along_ramp(state, angles)[0, 0]
+    tilt = np.abs(trajectory[:, 0, 0, 2] - angles[0]).max()
+    print(f"  full outward push: {-1e3 * gap[0]:.3f} mm still inside the ramp   full uphill push: {moved:.2f} m in an episode, {1e3 * tilt:.2f} mrad of tilt")
+    assert moved > 4.0 * task.TARGET_OFFSET_RANGE[1], "not enough authority to reach a far target and brake"
+    assert tilt < 0.05, "the box tipped"
 
 
 def check_batch():

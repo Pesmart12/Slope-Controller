@@ -187,3 +187,35 @@ def hold_force(ramp_angle=DEFAULT_RAMP_ANGLE, mass=BOX_MASS):
     removes.
     """
     return mass * GRAVITY * np.sin(ramp_angle)
+
+
+def break_free_force(ramp_angle=DEFAULT_RAMP_ANGLE, penalty=None, mass=BOX_MASS):
+    """What it takes to actually move the box uphill: mg(sin a + mu*cos a).
+
+    Holding and moving are different problems and the gap between them is
+    the whole friction cone. `hold_force` only cancels gravity, leaving the
+    box stationary; to slide it uphill you must also overrun friction at
+    its bound mu*lambda, and lambda is the full normal load mg*cos(a).
+
+    Measured exact at 15, 20 and 22 degrees: below this the box does not
+    move at all -- what looks like motion is arrested creep, a couple of
+    centimetres over a whole episode -- and a newton above it the box
+    accelerates away. Coulomb friction has no gentle regime, which is what
+    makes this a real control problem rather than a set-and-forget one.
+
+    An earlier force limit was sized against `hold_force` alone and came
+    out at 5 N, below this threshold at every sampled slope, so the task
+    was literally unsolvable until `check_trajopt.py` said so.
+    """
+    penalty = DEFAULT_PENALTY if penalty is None else penalty
+    return mass * GRAVITY * (np.sin(ramp_angle) + penalty["friction"] * np.cos(ramp_angle))
+
+
+def normal_load(ramp_angle=DEFAULT_RAMP_ANGLE, mass=BOX_MASS):
+    """mg*cos(a), the force pinning the box to the ramp.
+
+    An outward push at or above this unloads the contact entirely and the
+    body leaves the surface, which is the one thing the action limit
+    exists to prevent.
+    """
+    return mass * GRAVITY * np.cos(ramp_angle)
