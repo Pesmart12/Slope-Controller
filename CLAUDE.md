@@ -237,6 +237,13 @@ Real, and each one will bite in a specific place:
 - **The toolchain lives behind `vcvars`.** The import incantation is in the
   README's Setup section; a `pip install -e ../GRIP` without it fails
   confusingly.
+- **The conda environment must be activated, not addressed by path.**
+  Calling `envs/slope-control/python.exe` directly runs GRIP, numpy and
+  torch perfectly and then kills the process on `savefig` with
+  `0xC06D007F` and **no traceback** — a delay-load failure for a DLL that
+  only activation puts on `PATH`. Every symptom points at matplotlib and
+  none of them point at the environment. Use `conda run -n slope-control
+  python ...` in scripts.
 - **Parallel faces sit on a tie-break degeneracy.** A flat pusher pressed
   squarely against a flat box is exactly the configuration GRIP's
   `pair_detection.md` flags: both bodies report identical penetration, so
@@ -324,9 +331,11 @@ Three things left open on purpose, so they aren't mistaken for oversights:
 
 - `observe` is written but unexercised until a policy consumes it at step 5.
 - `clip_action` is a hard clip with zero gradient once saturated. The
-  baseline saturates for under 1% of steps, so it is not currently a
-  problem; if SHAC ends up pinned to the limit the fix is a smooth squash,
-  **not** a larger limit.
+  converged baseline saturates **2.1%** of steps on box-only and **5.9%**
+  on two pushers — climbing as the solutions got better, and worth
+  watching rather than assuming benign. If SHAC ends up pinned to the
+  limit the fix is a smooth squash, **not** a larger limit; the limits are
+  what keep the bodies on the ramp.
 - **SHAC needs a per-step adjoint sweep, not one call per window.** This
   was a suspicion; it is now measured, in `tests/check_closed_loop.py`. One
   call gives the open-loop gradient, which is exactly right for the

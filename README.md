@@ -80,7 +80,15 @@ a solve in place of a spring.
 
 ## Setup
 
-Needs GRIP installed. On a machine where the C++ toolchain is not on
+A conda environment, because PyTorch arrives that way and the CPU build
+from conda-forge matches the Python the rest of the stack already uses:
+
+```powershell
+conda create -n slope-control -c conda-forge --override-channels `
+    python=3.13 numpy matplotlib "pytorch=*=cpu*"
+```
+
+GRIP is then built into it. On a machine where the C++ toolchain is not on
 `PATH`, import the build environment first:
 
 ```powershell
@@ -91,11 +99,20 @@ cmd /c "`"$vs\VC\Auxiliary\Build\vcvars64.bat`" && set" |
 $env:PATH = "$vs\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin;" +
             "$vs\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja;$env:PATH"
 
+conda activate slope-control
 pip install -e ..\GRIP
 ```
 
 An editable install of GRIP does **not** rebuild on C++ changes — reinstall
 after touching its `src/`.
+
+**Activate the environment; do not call its `python.exe` by path.** Conda
+puts its own DLLs on `PATH` at activation, and matplotlib's PNG writer
+delay-loads one of them. Without activation `savefig` dies with
+`0xC06D007F` and *no Python traceback at all* — every other part of the
+stack, GRIP included, keeps working, so it reads as a matplotlib bug
+rather than a missing path. `conda run -n slope-control python ...` works
+too and is the safer form in scripts.
 
 ## Layout
 
