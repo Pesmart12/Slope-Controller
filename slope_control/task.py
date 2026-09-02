@@ -438,6 +438,43 @@ def observe(states, ramp_angles, targets, variant=BOX_ONLY):
     return np.stack(channels, axis=-1)
 
 
+def observation_jacobian(ramp_angles, variant=BOX_ONLY):
+    """d(observation)/d(state), shaped (environments, features, bodies, 6).
+
+    `observe` is affine in the state -- every channel is a projection onto
+    uphill or normal, a difference of two such, or a component passed
+    straight through, and the only nonlinear thing in it, sin(a), is a
+    constant with respect to Z. So this is a CONSTANT matrix per
+    environment: build it once when the batch is sampled, never again.
+
+    That matters because the closed-loop policy gradient needs
+    d(action)/d(state) = (d action/d obs)(d obs/d Z) at every step of the
+    backward sweep. The first factor is the network's input gradient and
+    has to be recomputed; the second is this, and does not.
+
+    Built by evaluating `observe` on unit states rather than by finite
+    differences -- for an affine map that is exact, not an approximation.
+    `check_task.py` asserts the affinity that makes it legitimate.
+    """
+    angles = np.atleast_1d(np.asarray(ramp_angles, dtype=float))
+    shape = (angles.size, variant.bodies, 6)
+    targets = np.zeros(angles.size)  # only shifts the constant term
+
+    base = observe(np.zeros(shape), angles, targets, variant)
+    jacobian = np.zeros(base.shape + (variant.bodies, 6))
+    for body in range(variant.bodies):
+        for component in range(6):
+            probe = np.zeros(shape)
+            probe[:, body, component] = 1.0
+            jacobian[..., body, component] = observe(probe, angles, targets, variant) - base
+    return jacobian
+
+
+def state_gradient(dJ_dobs, jacobian):
+    """Pull an adjoint on the observation back to an adjoint on the state."""
+    return np.einsum("...nf,nfbc->...nbc", np.asarray(dJ_dobs), jacobian)
+
+
 def settle(scenes, state, substeps):
     """Ring the contact spring down before the episode is scored.
 

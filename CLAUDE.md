@@ -69,12 +69,14 @@ Six source files. The repository is small and should stay legible.
 | | |
 |---|---|
 | `slope_control/ramp.py` | the ramp scene and its geometry conventions, shared by everything |
+| `slope_control/policy.py` | the actor and critic, and the seam where torch's autograd meets GRIP's adjoint |
 | `slope_control/task.py` | the step-2 task — action limit and frame, reward and its gradient seeds, episode and settle window, batch sampling |
 | `experiments/drift.py` | artifact 1 — the drift measurement and its figure |
 | `figures/drift.png` | committed output, so results are visible without running anything |
 | `tests/check_task.py` | the checks step 2 rests on, chiefly the finite-difference of `dJ_dU` through GRIP |
 | `tests/check_trajopt.py` | the baseline — Adam on the raw control sequence, which is what says the reward is solvable at all |
 | `tests/check_closed_loop.py` | why SHAC needs a per-step adjoint sweep and not one call per window |
+| `tests/check_policy_gradient.py` | the same statement for a real network — `dJ/d(theta)` against central differences |
 | `docs/ramp_manipulation_task.md` | the task definition; the authority on scene numbers, reward and episode structure |
 
 `slope_control/task.py` carries two variants, `BOX_ONLY` and `TWO_PUSHERS`,
@@ -329,22 +331,25 @@ silent and makes numbers incomparable across columns.
 
 Three things left open on purpose, so they aren't mistaken for oversights:
 
-- `observe` is written but unexercised until a policy consumes it at step 5.
-- `clip_action` is a hard clip with zero gradient once saturated. The
-  converged baseline saturates **2.1%** of steps on box-only and **5.9%**
-  on two pushers — climbing as the solutions got better, and worth
-  watching rather than assuming benign. If SHAC ends up pinned to the
-  limit the fix is a smooth squash, **not** a larger limit; the limits are
-  what keep the bodies on the ramp.
-- **SHAC needs a per-step adjoint sweep, not one call per window.** This
-  was a suspicion; it is now measured, in `tests/check_closed_loop.py`. One
-  call gives the open-loop gradient, which is exactly right for the
-  baseline's fixed control sequence and **119% wrong** for a policy at one
-  gain, 11% at another — state-dependent, so it cannot be absorbed into a
-  learning rate. The per-step sweep is exact to 2e-6 and costs the same
-  total adjoint work. Lift it out of the check and into `task.py` when
-  SHAC becomes its second consumer; there is no reason to generalize it
-  before then.
+- `observe` finally has a consumer: `policy.Actor` reads it, and
+  `check_policy_gradient` differentiates through it. It is exercised for
+  *shape and gradient*, not for whether it contains the right channels —
+  that only training can say.
+- `clip_action` is a hard clip with zero gradient once saturated, and the
+  converged baseline sits on its limit **2.1%** of steps on box-only and
+  **5.9%** on two pushers. The actor sidesteps it: it emits
+  `limit * tanh(...)`, so every action is feasible by construction and the
+  derivative survives everywhere. `clip_action` still runs downstream,
+  where it is now a no-op that documents the guarantee. **Never widen the
+  limit instead** — it is what keeps the bodies on the ramp.
+- **SHAC needs a per-step adjoint sweep, not one call per window.**
+  Measured in `tests/check_closed_loop.py`: one call gives the open-loop
+  gradient, right for the baseline's fixed control sequence and **119%
+  wrong** for a policy at one gain, 11% at another — state-dependent, so
+  not something a learning rate absorbs. The sweep now lives in
+  `policy.policy_gradient`, **not** `task.py` as originally planned: it
+  needs torch, and keeping `task.py` torch-free is worth more, since
+  `drift.py` and the numpy-side checks depend on it.
 
 Steps 4 and 5 need nothing that does not already exist. The 2.0 column
 is written down so it isn't re-litigated and so nothing here forecloses it,
