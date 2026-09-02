@@ -164,9 +164,22 @@ def mirrored_vertices(vertices):
     return reflected
 
 
-BOX = dict(vertices=square_vertices(BOX_SIDE), mass=BOX_MASS, inertia=BOX_MASS * BOX_SIDE ** 2 / 6.0)
-PUSHER = dict(vertices=pusher_vertices(), mass=PUSHER_MASS, inertia=uniform_inertia(pusher_vertices(), PUSHER_MASS))
-PUSHER_MIRRORED = dict(vertices=mirrored_vertices(PUSHER["vertices"]), mass=PUSHER_MASS, inertia=PUSHER["inertia"])
+def body(vertices, mass):
+    """A shape and its mass properties, with the inertia derived from the outline.
+
+    Derived for every body rather than written down for some. The box's
+    closed form m*s^2/6 agrees with this exactly -- `check_task.py` asserts
+    that -- but a hardcoded formula only stays right for the shape it was
+    written for, and the pusher is already a shape it was not written for.
+    """
+    return dict(vertices=vertices, mass=mass, inertia=uniform_inertia(vertices, mass))
+
+
+BOX = body(square_vertices(BOX_SIDE), BOX_MASS)
+PUSHER = body(pusher_vertices(), PUSHER_MASS)
+# Reflection preserves both the centroid at the origin and the polar moment
+# about it, so this rebuilds to the same inertia rather than assuming so.
+PUSHER_MIRRORED = body(mirrored_vertices(PUSHER["vertices"]), PUSHER_MASS)
 
 # Pusher, box, pusher. The box is unactuated and sits between them, which
 # is what makes it drivable in both directions -- a single convex pusher
@@ -213,8 +226,12 @@ def resting_state(xi, ramp_angles, bodies=None):
     """Bodies sitting flush on their ramps, shaped (environments, bodies, 6).
 
     Flush means the bottom face is parallel to the surface, so the body
-    angle is the ramp angle, and the centre of mass sits half a side out
-    along the normal. The resulting gap is exactly zero.
+    angle is the ramp angle and the centre of mass sits `resting_offset`
+    out along the normal -- how far the shape extends below its own
+    centroid, which is NOT half its height once the centroid has moved.
+    The box's 150.000 mm is half its side; the pusher's 75.332 mm is not
+    half of 150, because the 3 degree face trim shifts the centroid. The
+    resulting gap is exactly zero either way.
 
     Deliberately *not* the penalty equilibrium, for two reasons. It is
     unreachable by a uniform offset, because friction's moment arm tilts
@@ -226,9 +243,7 @@ def resting_state(xi, ramp_angles, bodies=None):
 
     `xi` gives each body's position along the ramp and broadcasts against
     (environments, bodies), so a scalar places everything at the same point
-    on every slope. Each body sits out along the normal by however far its
-    shape extends below its own centroid, which is not half its height once
-    the centroid has moved.
+    on every slope.
     """
     bodies = BOX_ONLY_BODIES if bodies is None else bodies
     angles = np.atleast_1d(np.asarray(ramp_angles, dtype=float))

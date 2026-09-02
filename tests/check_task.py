@@ -66,6 +66,47 @@ def check_flat_ground():
     assert drift < 1e-9, drift
 
 
+def check_body_geometry():
+    """Mass properties and resting offsets, against what they are supposed to be.
+
+    The inertias are derived from the outlines rather than written down, so
+    what needs asserting is that the derivation agrees with the closed form
+    where one exists, and that the trapezoid's centroid really did end up
+    at the origin -- GRIP takes vertices in a COM-centred frame, and an
+    un-recentred list puts a standing torque into every contact.
+    """
+    closed_form = ramp.BOX_MASS * ramp.BOX_SIDE ** 2 / 6.0
+    print(f"  box inertia: derived {ramp.BOX['inertia']:.9f} vs m*s^2/6 = {closed_form:.9f}")
+    assert math.isclose(ramp.BOX["inertia"], closed_form, rel_tol=1e-12)
+
+    for name, shape in [("box", ramp.BOX), ("pusher", ramp.PUSHER), ("mirrored", ramp.PUSHER_MIRRORED)]:
+        area, centroid, _ = ramp.polygon_properties(shape["vertices"])
+        assert area > 0.0, f"{name} winds clockwise; GRIP's SAT path requires counterclockwise"
+        assert np.abs(centroid).max() < 1e-12, (name, centroid)
+
+    # Reflection preserves the polar moment, so the two pushers must match.
+    assert math.isclose(ramp.PUSHER["inertia"], ramp.PUSHER_MIRRORED["inertia"], rel_tol=1e-12)
+
+    # The claim resting_state's docstring makes, in numbers.
+    offsets = {name: ramp.resting_offset(s["vertices"]) for name, s in [("box", ramp.BOX), ("pusher", ramp.PUSHER)]}
+    print(f"  resting offset: box {1e3 * offsets['box']:.3f} mm (= half side), pusher {1e3 * offsets['pusher']:.3f} mm (NOT half height)")
+    assert math.isclose(offsets["box"], 0.5 * ramp.BOX_SIDE, rel_tol=1e-12)
+    assert not math.isclose(offsets["pusher"], 0.5 * ramp.PUSHER_HEIGHT, rel_tol=1e-6), "the face trim no longer moves the centroid"
+
+    # Both pushers must reach the box by the same amount, or the two sides
+    # of a symmetric placement are not symmetric.
+    low = ramp.contact_reach(ramp.PUSHER, toward_uphill=True)
+    high = ramp.contact_reach(ramp.PUSHER_MIRRORED, toward_uphill=False)
+    print(f"  contact reach: lower {1e3 * low:.3f} mm, upper {1e3 * high:.3f} mm")
+    assert math.isclose(low, high, rel_tol=1e-12)
+
+    # And the contact vertex sits at the box's centre of mass height, which
+    # is what makes the push exert no tipping moment on the box.
+    height = ramp.resting_offset(ramp.PUSHER["vertices"]) + max(vy for _, vy in ramp.PUSHER["vertices"])
+    print(f"  contact vertex {1e3 * height:.3f} mm above the ramp, box COM at {1e3 * 0.5 * ramp.BOX_SIDE:.3f} mm")
+    assert math.isclose(height, 0.5 * ramp.BOX_SIDE, rel_tol=1e-12)
+
+
 def check_scene_angles():
     """Scenes and the angles that built them must not disagree."""
     angles = np.linspace(*task.RAMP_ANGLE_RANGE, 7)
@@ -319,7 +360,7 @@ def check_batch():
 
 
 def main():
-    checks = [check_flat_ground, check_scene_angles, check_substeps, check_settle_window, check_reward_seeds, check_shaping_vanishes, check_adjoint, check_observation, check_action_limit, check_batch]
+    checks = [check_flat_ground, check_body_geometry, check_scene_angles, check_substeps, check_settle_window, check_reward_seeds, check_shaping_vanishes, check_adjoint, check_observation, check_action_limit, check_batch]
     failures = 0
     for check in checks:
         print(f"{check.__name__}  --  {check.__doc__.splitlines()[0]}")
