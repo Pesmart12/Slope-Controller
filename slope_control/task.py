@@ -24,6 +24,13 @@ and there is no single number that serves both:
                   them, because a convex pusher only pushes and its
                   direction is fixed by the side it starts on, so one
                   pusher leaves overshoot unrecoverable.
+
+The reward has two terms, position and control effort, and that pair is
+the task objective -- it is what gets reported, and it is identical in
+both the penalty and NCP columns. There is a third term, `approach_penalty`,
+which is REWARD SHAPING: off by default, added only to the training
+objective, and documented at length where it is defined. Anything scored
+for the record is scored without it.
 """
 
 import math
@@ -150,10 +157,21 @@ def clip_action(actions, variant=BOX_ONLY):
     through `to_wrench` silently makes every value above the limit the
     same experiment.
 
-    A hard clip has zero gradient once saturated. That is fine for a
-    planner and acceptable for SHAC as long as the policy is not pinned to
-    the limit; if it turns out to be, a smooth squash is the fix, not a
-    larger limit.
+    A hard clip has zero gradient once saturated, and the converged
+    baseline sits on its limit 2.1% of steps on box-only and 5.9% on two
+    pushers -- enough that a policy optimizing through it would spend real
+    time somewhere it cannot be improved.
+
+    That is already handled upstream rather than here: `policy.Actor`
+    emits `limit * tanh(...)`, so a policy's actions are feasible by
+    construction and this clip is a no-op for them. It still runs, because
+    it is the one place the limit is enforced for callers that are NOT a
+    policy -- `check_trajopt` optimizes a raw control sequence and needs
+    projecting back onto the box every iteration.
+
+    If a trained policy still lives at its limit, that is a statement
+    about the force budget rather than about the clip. **Never widen the
+    limit** -- it is what keeps the bodies on the ramp.
     """
     return np.clip(np.asarray(actions, dtype=float), -variant.limit, variant.limit)
 
@@ -235,9 +253,11 @@ def reward(states, controls, ramp_angles, targets, variant=BOX_ONLY, weights=Non
     against newtons squared -- a number that tells a reader nothing and
     invites someone to "fix" it later.
 
-    Only the box's position is scored. Where the pushers end up is their
-    own business, and pricing it would be deciding for the policy how to
-    use its second body.
+    Only the box's position is scored by the task objective. Where the
+    pushers end up is their own business, and pricing it would be deciding
+    for the policy how to use its second body. (`shaping=True` does score
+    a pusher's distance from the box, but one-sidedly and only while it is
+    away -- see `approach_penalty`.)
 
     The control term is not boilerplate. Under penalty contact a held body
     gets no friction for free, so holding costs mg*sin(a) forever
@@ -276,10 +296,6 @@ def approach_penalty(states, ramp_angles, variant, weights=None):
     Named as such on purpose. This is not part of the task objective; it
     is a term added to the *training* objective to remove a region where
     the task objective has no gradient at all.
-
-    THIS IS REWARD SHAPING and is named as such on purpose. It is not part
-    of the task objective; it is a term added to the *training* objective
-    to remove a region where the task objective has no gradient at all.
 
     The region: a pusher not touching the box contributes nothing to the
     box's position, so d(box position)/d(pusher action) is identically
@@ -340,18 +356,24 @@ def reward_seeds(states, controls, ramp_angles, targets, variant=BOX_ONLY, weigh
     visibly next to the other -- a wrong seed raises nothing, it just
     quietly trains for something else.
 
-    The state enters only through the box's xi = p . uphill, so
+    Unshaped, the state enters only through the box's xi = p . uphill, so
 
         dr/d(x, y)_box = -2*w_pos*(xi - xi*)/side^2 * uphill
 
-    and every other entry is zero: the reward does not see orientation, it
-    does not see velocity, and it does not see where the pushers are. For
-    each actuated body,
+    and every other entry is zero: the task objective does not see
+    orientation, it does not see velocity, and it does not see where the
+    pushers are. For each actuated body,
 
         dr/df_i = -2*w_ctrl*f_i / scale^2
 
     with the torque row zero. Both are partials of the stage cost only --
     GRIP supplies everything that makes them total derivatives.
+
+    With `shaping=True` the pushers DO enter, through the separation term,
+    and each one writes two entries rather than one -- its own position and
+    the box's, with opposite signs, because a separation is a difference.
+    That is the block at the bottom of this function, and it is why the
+    seed check runs shaped and unshaped separately.
 
     For a *policy* these seeds are not the whole story. One `adjoint_batch`
     call over a window gives the open-loop gradient, which is right for a
@@ -402,10 +424,16 @@ def observe(states, ramp_angles, targets, variant=BOX_ONLY):
     action's, so a positive first action always pushes toward a larger
     first observation.
 
-    Nothing consumes this yet -- there is no policy before SHAC -- so it is
-    fixed here only to pin the frame down alongside the action mapping that
-    shares it, and it is exercised only for shape and for the a = 0
-    reduction. Treat it as unvalidated.
+    `policy.Actor` consumes this and `check_policy_gradient` differentiates
+    through it, so the frame and the gradient path are exercised. What is
+    NOT exercised is whether these are the right channels -- whether a
+    policy can actually control the box from them, and whether any of them
+    is dead weight. Only training answers that.
+
+    Being affine in the state is a property worth preserving rather than an
+    accident: it is what makes `observation_jacobian` a constant matrix
+    built once per batch instead of a derivative recomputed every step. A
+    channel with a square or a norm in it would quietly cost that.
     """
     states = np.asarray(states)
     angles = np.atleast_1d(np.asarray(ramp_angles, dtype=float))
