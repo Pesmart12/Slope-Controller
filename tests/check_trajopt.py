@@ -23,12 +23,17 @@ and every newton reaching it has to cross a body-body contact. Solving
 that here is what says the task is worth training on at all.
 
 The one thing this turned up that nothing else would have: **gradients
-cannot discover a contact that does not exist.** From a zero
-initialization the two-pusher case does not converge slowly, it does not
-move at all -- the driving pusher's action sits at exactly 0.00 N for
-every iteration, because with no contact d(box position)/d(pusher action)
-is identically zero. See `warm_start`, and expect SHAC to meet the same
-flat region.
+cannot discover a contact that does not exist.** With the task objective
+alone the two-pusher case does not converge slowly, it does not move at
+all -- the driving pusher's action sits at exactly 0.00 N for every
+iteration, because with no contact d(box position)/d(pusher action) is
+identically zero.
+
+The fix is the shaping term in `task.approach_penalty`, and this check is
+what holds it honest: optimization runs with `shaping=True`, and every
+number reported is the UNSHAPED task reward. A shaping term that only
+looked good on its own objective would show up here as a good shaped
+score and a bad task score.
 
 Not an artifact and not an experiment: no figure, and it produces no
 number that means anything without GRIP 2.0 to compare against.
@@ -56,33 +61,11 @@ ITERATIONS = 800
 STEP_FRACTION = 0.05 / 12.0
 TARGET_OFFSET = 0.5
 
-# Zero, because a gap cannot be closed from a zero initialization. Under
-# no control the 2 kg pusher creeps downhill at 1.68 cm/s and the 1 kg box
-# at 0.84, so the gap between them OPENS, contact never forms, and
-# d(box position)/d(pusher action) is identically zero -- the driving
-# pusher's action stays at 0.00 N for all 300 iterations. Gradients cannot
-# discover a contact that does not exist.
-APPROACH_GAP = 0.0
-
-
-def warm_start(variant, angles):
-    """Start every actuated body at its own holding force, not at zero.
-
-    Zero is a stationary point here, and not a useful one. Holding is the
-    "do nothing but do not slide away" control, it encodes none of the
-    solution, and it is enough to bring the bodies into contact: with the
-    pushers holding station the box still creeps downhill into the lower
-    one, so a gradient exists from the first iteration.
-
-    This matters beyond the baseline. A SHAC policy initialized near zero
-    output faces exactly the same flat region, so its initialization or
-    its exploration noise has to solve the same bootstrap problem.
-    """
-    bodies = task.bodies_for(variant)
-    actions = np.zeros((task.EPISODE_STEPS, len(angles), len(variant.actuated), 2))
-    for slot, body in enumerate(variant.actuated):
-        actions[:, :, slot, 0] = ramp.hold_force(angles, mass=bodies[body]["mass"])
-    return actions
+# The top of the sampled range, and deliberately the hard case: at 5 cm
+# neither creep nor a holding-force initialization brings the pushers to
+# the box within an episode. The shaping term has to do it, so this is
+# where it earns its place.
+APPROACH_GAP = 0.05
 
 
 def setup(variant, degrees):
@@ -118,7 +101,10 @@ def optimize(variant, scenes, state, angles, targets, substeps, iterations=ITERA
     steps move the load, late steps only hold it -- and a single global
     step size serves one or the other, not both.
     """
-    actions = warm_start(variant, angles)
+    # Zero, deliberately. The shaping term is what has to lift the
+    # optimizer off this point; an initialization that did it instead
+    # would hide whether the term works.
+    actions = np.zeros((task.EPISODE_STEPS, len(scenes), len(variant.actuated), 2))
     first_moment, second_moment = np.zeros_like(actions), np.zeros_like(actions)
     beta_1, beta_2, epsilon = 0.9, 0.999, 1e-8
     learning_rate = STEP_FRACTION * variant.scale
@@ -127,9 +113,9 @@ def optimize(variant, scenes, state, angles, targets, substeps, iterations=ITERA
     for iteration in range(1, iterations + 1):
         wrenches = task.to_wrench(actions, angles, variant)
         trajectory = np.array(grip.rollout_batch(scenes, state, wrenches, substeps=substeps))
-        history.append(task.reward(trajectory, wrenches, angles, targets, variant).sum(axis=0))
+        history.append(task.reward(trajectory, wrenches, angles, targets, variant).sum(axis=0))  # unshaped, for reporting
 
-        dl_dZ, dl_dU = task.reward_seeds(trajectory, wrenches, angles, targets, variant)
+        dl_dZ, dl_dU = task.reward_seeds(trajectory, wrenches, angles, targets, variant, shaping=True)
         _, dJ_dU = grip.adjoint_batch(scenes, trajectory, wrenches, substeps, dl_dZ, dl_dU)
         gradient = task.to_action_gradient(dJ_dU, angles, variant)
 
@@ -147,7 +133,7 @@ def optimize(variant, scenes, state, angles, targets, substeps, iterations=ITERA
 def solve(name, variant, degrees):
     """Optimize one variant and report what the solution looks like."""
     scenes, angles, substeps, state, targets = setup(variant, degrees)
-    idle, _ = total_reward(variant, scenes, state, warm_start(variant, angles), angles, targets, substeps)
+    idle, _ = total_reward(variant, scenes, state, np.zeros((task.EPISODE_STEPS, len(scenes), len(variant.actuated), 2)), angles, targets, substeps)
 
     actions, history = optimize(variant, scenes, state, angles, targets, substeps)
     final, trajectory = total_reward(variant, scenes, state, actions, angles, targets, substeps)
@@ -169,31 +155,42 @@ def solve(name, variant, degrees):
 def report_creep_band(actions, angles, degrees):
     """The box-only solution's second phase, which is a penalty artifact.
 
-    The settled force lands between holding and breaking free every time.
-    That band is the creep regime: too little force to slide the box, more
-    than enough to make it creep uphill instead of down, at
-    (f - mg sin a) / 2*b_slip. The optimizer is using contact softening as
-    a fine-positioning mechanism, because the alternative -- exceed
-    break-free and brake -- has no gentle setting.
+    Once parked, the force settles NEAR mg*sin(a) -- the balance point --
+    and the residual, either sign, trims the last few millimetres by
+    creeping at (f - mg sin a) / 2*b_slip. What it never does is approach
+    break-free again: the endgame is entirely inside the creep regime,
+    where the box cannot slide and can only ooze.
 
-    Worth stating plainly: this strategy does not exist under an NCP solve.
-    Below the friction bound a rigid box does not move at all.
+    That regime is a penalty artifact and has no counterpart under an NCP
+    solve, where a box below the friction bound does not move at all and
+    the last millimetre has to be closed some other way. It is the sharpest
+    thing the baseline says about the comparison.
+
+    A correction worth recording: an earlier run reported the settled force
+    sitting strictly between hold and break-free, creeping uphill at
+    0.67 cm/s at every slope. That was an under-converged optimizer still
+    travelling the last centimetre. Converged, it parks at the balance
+    point instead and the residual creep drops to +/-0.3 cm/s with either
+    sign. The mechanism was right; the number was measuring how far the
+    solution still had to go.
     """
     settled = slice(int(2.0 * task.CONTROL_HZ), int(3.5 * task.CONTROL_HZ))
     held = actions[settled, :, 0, 0].mean(axis=0)
     hold_force, break_free = ramp.hold_force(angles), ramp.break_free_force(angles)
 
-    in_band = (hold_force < held) & (held < break_free)
+    # Well inside the creep regime, rather than anywhere near sliding.
+    margin = np.abs(held - hold_force) / (break_free - hold_force)
     creep = 100 * (held - hold_force) / (2 * ramp.DEFAULT_PENALTY["slip_damping"])
-    print(f"  settled force in the creep band at every slope: {'yes' if in_band.all() else 'NO'}"
-          f"   implied uphill creep {np.array2string(creep, precision=2)} cm/s")
-    return in_band.all()
+    print(f"  settled force {np.array2string(held, precision=2)} N against mg sin(a) {np.array2string(hold_force, precision=2)} N"
+          f"   -> {np.array2string(100 * margin, precision=0)}% of the way to break-free")
+    print(f"  residual creep {np.array2string(creep, precision=2)} cm/s, trimming rather than travelling")
+    return (margin < 0.5).all()
 
 
 def main():
     degrees = np.array([15.0, 20.0, 22.0])
     box_error, box_final, box_idle, actions, angles = solve("box only", task.BOX_ONLY, degrees)
-    in_band = report_creep_band(actions, angles, degrees)
+    in_creep_regime = report_creep_band(actions, angles, degrees)
     pusher_error, pusher_final, pusher_idle, _, _ = solve("two pushers", task.TWO_PUSHERS, degrees)
 
     failures = []
@@ -201,8 +198,8 @@ def main():
         failures.append(f"box only: worst error {100 * np.abs(box_error).max():.2f} cm exceeds the {100 * task.POSITION_TOLERANCE:.0f} cm tolerance")
     if box_final.mean() <= box_idle.mean():
         failures.append("box only: optimization did not beat doing nothing")
-    if not in_band:
-        failures.append("box only: settled force left the creep band, so the recorded solution shape no longer holds")
+    if not in_creep_regime:
+        failures.append("box only: the settled force is no longer deep in the creep regime, so the recorded solution shape has changed")
     if pusher_final.mean() <= pusher_idle.mean():
         failures.append("two pushers: optimization did not beat doing nothing")
     if np.abs(pusher_error).max() > 10.0 * task.POSITION_TOLERANCE:

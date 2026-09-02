@@ -198,7 +198,34 @@ def to_action_gradient(dJ_dU, ramp_angles, variant=BOX_ONLY):
     return np.stack(gradients, axis=-2)
 
 
-def reward(states, controls, ramp_angles, targets, variant=BOX_ONLY, weights=None):
+def pushing_bodies(variant):
+    """Actuated bodies that are not the scored one -- the ones that approach.
+
+    Empty for BOX_ONLY, where the actuated body *is* the box and there is
+    nothing to approach.
+    """
+    return [body for body in variant.actuated if body != variant.box]
+
+
+def separations(states, ramp_angles, variant):
+    """Each pushing body's gap to the box face it meets. Positive is a gap.
+
+    The reach is read off the vertex list rather than written down, since
+    the 3 degree face trim moves it, and from the correct side -- the
+    uphill pusher is mirrored, so its contact vertex is at -x.
+    """
+    bodies = bodies_for(variant)
+    xi = ramp.along_ramp(states, ramp_angles)
+    gaps = []
+    for body in pushing_bodies(variant):
+        uphill_of_box = body > variant.box
+        reach = 0.5 * ramp.BOX_SIDE + ramp.contact_reach(bodies[body], toward_uphill=not uphill_of_box)
+        sign = 1.0 if uphill_of_box else -1.0
+        gaps.append(sign * (xi[..., body] - xi[..., variant.box]) - reach)
+    return gaps
+
+
+def reward(states, controls, ramp_angles, targets, variant=BOX_ONLY, weights=None, shaping=False):
     """Per-step reward, shaped (steps, environments).
 
         r_t = -w_pos * ((xi_box - xi*)/side)^2  -  w_ctrl * sum_i |f_i|^2 / scale^2
@@ -221,6 +248,14 @@ def reward(states, controls, ramp_angles, targets, variant=BOX_ONLY, weights=Non
     Index convention: control u_t is scored against the state it produces,
     Z_{t+1}. Z_0 is fixed by the initial condition and no control reaches
     it, so it contributes a constant and is left out.
+
+    `shaping=True` adds the approach term documented in
+    `approach_penalty`. It is OFF by default, so a reported number is the
+    task objective unless someone asked for otherwise. Train with it on,
+    score with it off; the two mistakes are not symmetric, since training
+    without it fails loudly -- the driving pusher's action sits at exactly
+    0.00 N -- while reporting with it on is silent and makes numbers
+    incomparable across columns.
     """
     weights = variant.weights if weights is None else weights
     controls = np.asarray(controls)
@@ -228,10 +263,76 @@ def reward(states, controls, ramp_angles, targets, variant=BOX_ONLY, weights=Non
     xi = ramp.along_ramp(states, ramp_angles)[1:, :, variant.box]
     error = (xi - np.asarray(targets)) / ramp.BOX_SIDE
     effort = sum((controls[..., body, 0:2] ** 2).sum(axis=-1) for body in variant.actuated)
-    return -weights["position"] * error ** 2 - weights["control"] * effort / variant.scale ** 2
+    total = -weights["position"] * error ** 2 - weights["control"] * effort / variant.scale ** 2
+
+    if shaping:
+        total = total - approach_penalty(states, ramp_angles, variant, weights)[1:]
+    return total
 
 
-def reward_seeds(states, controls, ramp_angles, targets, variant=BOX_ONLY, weights=None):
+def approach_penalty(states, ramp_angles, variant, weights=None):
+    """REWARD SHAPING: the cost of a pusher not being at the box yet.
+
+    Named as such on purpose. This is not part of the task objective; it
+    is a term added to the *training* objective to remove a region where
+    the task objective has no gradient at all.
+
+    THIS IS REWARD SHAPING and is named as such on purpose. It is not part
+    of the task objective; it is a term added to the *training* objective
+    to remove a region where the task objective has no gradient at all.
+
+    The region: a pusher not touching the box contributes nothing to the
+    box's position, so d(box position)/d(pusher action) is identically
+    zero. Measured -- from a zero initialization at a 5 cm approach gap,
+    trajectory optimization leaves the driving pusher at exactly 0.00 N
+    for every iteration and the box 52 cm short. Gradients cannot discover
+    a contact that does not exist.
+
+    The term is
+
+        -w_pos * sum_i max(0, separation_i / side)^2
+
+    over the pushing bodies. Three properties, each deliberate:
+
+      One-sided, so it is EXACTLY zero once contact is made and cannot
+      distort behaviour in the regime where the task objective takes over.
+      max(0, x)^2 is C1, so the gradient stays continuous at the kink.
+
+      No new weight. It reuses w_pos and the same normalization by the box
+      side, which says: penalize a pusher being away from the box exactly
+      as much as we penalize the box being away from its target, but only
+      while it actually is away.
+
+      Live from the first iteration, because the pushers are DIRECTLY
+      actuated -- d(pusher position)/d(pusher action) is never zero,
+      contact or no contact. That is the whole mechanism.
+
+    Measured effect, same setup as the failure above: the driving pusher
+    reaches its 30 N limit, both contacts form, and the box lands 1.8-2.4
+    cm from target. The *unshaped* reward improves from -1193 to -93, so
+    the term is not buying its result by moving the goalposts.
+
+    It belongs in both columns identically. It is formulation-agnostic --
+    approaching is the same problem under penalty and under a solve --
+    and under an NCP solve it is not merely convenient but necessary:
+    penalty creep happens to close one of the two gaps on its own, and a
+    rigid solve closes neither, so the flat region there is total.
+
+    Worth re-checking once a policy optimizes against it rather than an
+    open-loop sequence. A policy has more freedom to find a degenerate way
+    to satisfy a shaped term.
+
+    Returned over all steps including the initial state, so callers slice
+    it the same way they slice the position term.
+    """
+    weights = variant.weights if weights is None else weights
+    gaps = separations(states, ramp_angles, variant)
+    if not gaps:
+        return np.zeros(np.asarray(states).shape[:-2])
+    return weights["position"] * sum(np.maximum(0.0, gap / ramp.BOX_SIDE) ** 2 for gap in gaps)
+
+
+def reward_seeds(states, controls, ramp_angles, targets, variant=BOX_ONLY, weights=None, shaping=False):
     """dl_dZ and dl_dU for `adjoint_batch`, matching `reward` term for term.
 
     Deliberately adjacent to the reward it differentiates. The two have to
@@ -270,6 +371,16 @@ def reward_seeds(states, controls, ramp_angles, targets, variant=BOX_ONLY, weigh
     dl_dU = np.zeros(controls.shape)
     for body in variant.actuated:
         dl_dU[..., body, 0:2] = -2.0 * weights["control"] * controls[..., body, 0:2] / variant.scale ** 2
+
+    if shaping:
+        # d/d(sep) of -w*max(0, sep/side)^2, chained through
+        # sep = sign*(xi_body - xi_box) - reach and xi = p . uphill.
+        up = ramp.uphill(angles)[None, :, :]
+        for body, gap in zip(pushing_bodies(variant), separations(states, angles, variant)):
+            sign = 1.0 if body > variant.box else -1.0
+            coefficient = -2.0 * weights["position"] * np.maximum(0.0, gap) / ramp.BOX_SIDE ** 2
+            dl_dZ[1:, :, body, 0:2] += (sign * coefficient[1:])[:, :, None] * up
+            dl_dZ[1:, :, variant.box, 0:2] += (-sign * coefficient[1:])[:, :, None] * up
     return dl_dZ, dl_dU
 
 

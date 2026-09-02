@@ -302,34 +302,50 @@ enough to reach any target and brake.
 ### What the baseline solution looks like
 
 `tests/check_trajopt.py` optimizes the raw 400-step control sequence with
-Adam and reaches the target to **1.4 cm** at every sampled slope, from a
-reward of −1195 down to −94. So the reward is solvable and its gradients
-are navigable across 8000 integration steps — which is the thing that had
-to be true before SHAC was worth writing.
-
-The *shape* of the solution is the part worth recording:
+Adam, from a **zero** initialization and a 5 cm approach gap:
 
 ```
-        peak push   above break-free   last above    moved
- 15 deg   10.61 N               6.5%      0.25 s    0.51 m
- 20 deg   11.88 N               7.0%      0.27 s    0.51 m
- 22 deg   12.00 N               7.8%      0.30 s    0.51 m
+                 final error per slope        unshaped reward
+ box only      0.59 / 0.22 / −0.10 cm         −1195 -> −69
+ two pushers   0.76 / −0.09 / −0.32 cm        −1195 -> −82
 ```
 
-A shove of about **0.3 s** does essentially all the travel, friction brakes
-it, and then the force settles into the band between `hold_force` and
-`break_free_force` — too little to slide the box, more than enough to make
-it creep *uphill* rather than down, at `(f − mg·sin α)/2b_slip`. Measured
-at 0.67 cm/s across all three slopes, closing the last centimetre or two
-over the remaining 3.7 s.
+Sub-centimetre on both, so the reward is solvable and its gradients are
+navigable across 8000 integration steps — the thing that had to be true
+before SHAC was worth writing. The two-pusher case is the one that matters:
+the box is unactuated, so every newton reaching it crosses a body-body
+contact.
 
-**That second phase is penalty contact only.** Below the friction bound a
-rigid box does not move at all, so under an NCP solve this fine-positioning
-mechanism does not exist and the last centimetre has to be closed some
-other way. It is the first concrete instance of the thing this project
-exists to measure, and it turned up in the baseline before any policy was
-trained. What a learned controller does with it is for the measurements to
-say.
+The *shape* of the solution is worth recording. A shove of a few tenths of
+a second does essentially all the travel — friction has no gentle setting,
+so there is no other way to move — then friction brakes it, and the endgame
+runs entirely inside the **creep regime**: the force settles near
+`mg·sin α` and the residual, of either sign, trims the last millimetres at
+`(f − mg·sin α)/2b_slip`.
+
+```
+                settled force    mg·sin α    residual creep
+ 15 deg              3.79 N        2.54 N       +0.31 cm/s
+ 20 deg              4.02 N        3.36 N       +0.17 cm/s
+ 22 deg              3.42 N        3.67 N       −0.06 cm/s
+```
+
+**That endgame is penalty contact only.** Below the friction bound a rigid
+box does not move at all, so under an NCP solve the creep regime does not
+exist and the last millimetre has to be closed some other way. It is the
+first concrete instance of the thing this project exists to measure, and it
+turned up in the baseline before any policy was trained. What a learned
+controller does with it is for the measurements to say.
+
+**A correction, recorded rather than quietly fixed.** An earlier run
+reported the settled force sitting strictly *between* `hold_force` and
+`break_free_force`, creeping uphill at 0.67 cm/s at every slope, and
+described the optimizer as using creep as a fine-positioning mechanism.
+That run was under-converged — still travelling the last centimetre. With
+the approach term and more iterations it parks at the balance point
+instead, and the residual creep drops to ±0.3 cm/s with either sign. The
+mechanism was right; the number was measuring how far the solution still
+had to go.
 
 ---
 
@@ -354,6 +370,51 @@ function, two different bills.
 The gradient GRIP needs is a quadratic in position chained through
 `∂ξ/∂q_box = (cos α, sin α, 0)` — exactly the seed shape `adjoint_batch`
 already accepts. No new GRIP surface is required.
+
+### Reward shaping: the approach term
+
+Named as shaping on purpose, and kept out of the objective above. The task
+objective is the two terms already given; this is a third term added to the
+**training** objective only, and every reported number excludes it.
+
+**Why it exists.** A pusher not touching the box contributes nothing to the
+box's position, so `∂(box position)/∂(pusher action)` is *identically zero*.
+Measured: from a zero initialization at a 5 cm gap, trajectory optimization
+leaves the driving pusher at exactly **0.00 N** for every iteration and the
+box 52 cm short. Gradients cannot discover a contact that does not exist.
+
+```
+r_t −= w_pos · Σ_i max(0, separation_i / side)²
+```
+
+over the pushing bodies. Three properties, each deliberate:
+
+- **One-sided**, so it is exactly zero once contact is made and cannot
+  distort behaviour in the regime the task objective cares about.
+  `max(0,x)²` is C¹, so the gradient stays continuous at the kink.
+- **No new weight.** It reuses `w_pos` and the same normalization by box
+  side: penalize a pusher being away from the box exactly as much as we
+  penalize the box being away from its target, but only while it is away.
+- **Live from the first iteration**, because the pushers are *directly
+  actuated* — `∂(pusher position)/∂(pusher action)` is never zero, contact
+  or not. That is the whole mechanism.
+
+**Measured effect**, same setup as the failure above: the driving pusher
+reaches its 30 N limit, both contacts form, and the box lands within a
+centimetre. The *unshaped* reward improves from −1195 to −82, so the term is
+not buying its result by moving the goalposts.
+
+**It goes in both columns identically.** It is formulation-agnostic —
+approaching is the same problem under penalty and under a solve — and under
+NCP it is not merely convenient but necessary: penalty creep happens to
+close one of the two gaps on its own, and a rigid solve closes neither, so
+the flat region there is *total*. Any fix that leaned on creep, such as a
+holding-force initialization, would silently stop working at GRIP 2.0.
+
+**Still open:** this was verified against an open-loop optimizer. A policy
+has more freedom to find a degenerate way to satisfy a shaped term, so the
+no-distortion property is worth re-checking once SHAC is optimizing against
+it.
 
 ---
 

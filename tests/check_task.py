@@ -119,28 +119,60 @@ def check_reward_seeds():
     index is a mistake the box-only case structurally cannot make.
     """
     for name, variant in [("box only ", task.BOX_ONLY), ("2 pushers", task.TWO_PUSHERS)]:
-        rng = np.random.default_rng(0)
-        n_envs, steps = 3, 5
-        angles = rng.uniform(*task.RAMP_ANGLE_RANGE, size=n_envs)
-        targets = rng.uniform(-0.5, 0.5, size=n_envs)
-        states = rng.normal(size=(steps + 1, n_envs, variant.bodies, 6))
-        controls = rng.normal(size=(steps, n_envs, variant.bodies, 3))
+        for shaping in [False, True]:
+            rng = np.random.default_rng(0)
+            n_envs, steps = 3, 5
+            angles = rng.uniform(*task.RAMP_ANGLE_RANGE, size=n_envs)
+            targets = rng.uniform(-0.5, 0.5, size=n_envs)
+            states = rng.normal(size=(steps + 1, n_envs, variant.bodies, 6))
+            controls = rng.normal(size=(steps, n_envs, variant.bodies, 3))
 
-        dl_dZ, dl_dU = task.reward_seeds(states, controls, angles, targets, variant)
-        worst = 0.0
-        for array, analytic in [(states, dl_dZ), (controls, dl_dU)]:
-            for index in np.ndindex(array.shape):
-                saved, h = array[index], 1e-6
-                array[index] = saved + h
-                plus = task.reward(states, controls, angles, targets, variant).sum()
-                array[index] = saved - h
-                minus = task.reward(states, controls, angles, targets, variant).sum()
-                array[index] = saved
-                worst = max(worst, abs((plus - minus) / (2.0 * h) - analytic[index]))
+            dl_dZ, dl_dU = task.reward_seeds(states, controls, angles, targets, variant, shaping=shaping)
+            worst = 0.0
+            for array, analytic in [(states, dl_dZ), (controls, dl_dU)]:
+                for index in np.ndindex(array.shape):
+                    saved, h = array[index], 1e-6
+                    array[index] = saved + h
+                    plus = task.reward(states, controls, angles, targets, variant, shaping=shaping).sum()
+                    array[index] = saved - h
+                    minus = task.reward(states, controls, angles, targets, variant, shaping=shaping).sum()
+                    array[index] = saved
+                    worst = max(worst, abs((plus - minus) / (2.0 * h) - analytic[index]))
 
-        scale = max(np.abs(dl_dZ).max(), np.abs(dl_dU).max())
-        print(f"  {name}: {states.size + controls.size:>4} partials finite-differenced, worst error {worst:.2e} against scale {scale:.2e}")
-        assert worst < 1e-6 * scale, (name, worst)
+            scale = max(np.abs(dl_dZ).max(), np.abs(dl_dU).max())
+            label = "shaped  " if shaping else "unshaped"
+            print(f"  {name} {label}: {states.size + controls.size:>4} partials, worst error {worst:.2e} against scale {scale:.2e}")
+            assert worst < 1e-6 * scale, (name, shaping, worst)
+
+
+def check_shaping_vanishes():
+    """The approach term must be exactly zero once the pushers touch.
+
+    That is what keeps it from distorting behaviour in the regime the task
+    objective actually cares about -- it buys a gradient where there was
+    none and then gets out of the way.
+    """
+    variant = task.TWO_PUSHERS
+    bodies = task.bodies_for(variant)
+    angles = np.radians([15.0, 20.0, 22.0])
+
+    # Overlapping, not merely adjacent: a zero placement sits exactly on
+    # the knife edge, where max(0, 1e-17)^2 is small but not bitwise zero.
+    # Real contact means the separation is negative, and there the term has
+    # to be off entirely rather than just nearly off.
+    for gap, expect_zero in [(-0.001, True), (0.03, False)]:
+        positions = task.placement(np.zeros(len(angles)), np.full((len(angles), 2), gap), variant)
+        state = ramp.resting_state(positions, angles, bodies=bodies)
+        penalty = task.approach_penalty(state, angles, variant)
+        gaps = np.array(task.separations(state, angles, variant)).ravel()
+        print(f"  {100 * gap:>5.1f} cm placement: separations {np.round(1e3 * gaps, 2)} mm, penalty {penalty.max():.4f}")
+        assert (penalty.max() == 0.0) == expect_zero, (gap, penalty.max())
+
+    # And it contributes nothing at all to the box-only variant.
+    assert task.pushing_bodies(task.BOX_ONLY) == []
+    state = ramp.resting_state([0.0], [0.35])
+    assert task.approach_penalty(state, [0.35], task.BOX_ONLY).max() == 0.0
+    print("  box only: no pushing bodies, so the term is structurally absent")
 
 
 def check_adjoint():
@@ -287,7 +319,7 @@ def check_batch():
 
 
 def main():
-    checks = [check_flat_ground, check_scene_angles, check_substeps, check_settle_window, check_reward_seeds, check_adjoint, check_observation, check_action_limit, check_batch]
+    checks = [check_flat_ground, check_scene_angles, check_substeps, check_settle_window, check_reward_seeds, check_shaping_vanishes, check_adjoint, check_observation, check_action_limit, check_batch]
     failures = 0
     for check in checks:
         print(f"{check.__name__}  --  {check.__doc__.splitlines()[0]}")

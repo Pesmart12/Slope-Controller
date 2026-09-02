@@ -301,15 +301,24 @@ doesn't work, suspect the task before the machinery.
 **Step 5, SHAC, is next.** Everything it needs exists: a solvable task, a
 verified closed-loop gradient, and a baseline to be measured against.
 
-One finding from step 4 that will bite SHAC directly: **gradients cannot
-discover a contact that does not exist.** From a zero initialization the
-two-pusher case does not converge slowly — the driving pusher's action
-stays at exactly 0.00 N forever, because with no contact
-`d(box position)/d(pusher action)` is identically zero, and the 2 kg
-pusher creeps downhill faster than the 1 kg box so the gap only opens.
-`check_trajopt.warm_start` fixes it by starting every actuated body at its
-own holding force. A policy initialized near zero output faces the same
-flat region.
+One finding from step 4, now fixed rather than merely flagged:
+**gradients cannot discover a contact that does not exist.** With the task
+objective alone the two-pusher case does not converge slowly — the driving
+pusher's action stays at exactly 0.00 N forever, because with no contact
+`d(box position)/d(pusher action)` is identically zero.
+
+The fix is **reward shaping**, `task.approach_penalty`, named as shaping
+and off by default: `reward(..., shaping=True)` for training,
+`shaping=False` for anything reported. It is one-sided so it vanishes on
+contact, reuses `w_pos` so it adds no tunable, and works because the
+pushers are *directly* actuated. An earlier plan to fix this with a
+holding-force initialization was dropped — it leans on penalty creep to
+close the gap, so it would have stopped working at GRIP 2.0, where nothing
+creeps and the flat region is total.
+
+The two mistakes around it are not symmetric. Training unshaped fails
+loudly, with the driving pusher pinned at 0.00 N. Reporting shaped is
+silent and makes numbers incomparable across columns.
 
 Three things left open on purpose, so they aren't mistaken for oversights:
 
