@@ -1,15 +1,16 @@
-"""The actor and critic SHAC trains, and the seam between torch and GRIP.
+"""The actor and critic, and the code that joins torch's autograd to GRIP's.
 
-GRIP is numpy and the networks are torch, so every step of a closed-loop
-rollout crosses the boundary twice: the observation goes in as a tensor,
-the action comes out as an array, and on the way back GRIP's dJ/d(action)
-is handed to `torch.autograd` as the seed of a backward pass. That pass
-returns both things the sweep needs at once -- the parameter gradients,
-accumulated across the window, and the gradient with respect to the
-observation, which carries the adjoint back one step through the policy.
+Two autodiff systems have to meet. GRIP is numpy and differentiates the
+physics; the networks are torch. They meet at the action:
 
-Nothing here knows about ramps, rewards or contact. It is a network and a
-boundary.
+    forward   observation -> [torch] -> action -> [GRIP] -> next state
+    backward  dJ/d(state) <- [torch] <- dJ/d(action) <- [GRIP]
+
+GRIP computes dJ/d(action) and torch continues from there. `accumulate` is
+where the handover happens, `rollout` runs the forward direction and
+`policy_gradient` runs the backward one.
+
+Nothing here knows about ramps, rewards or contact. Those are in `task.py`.
 """
 
 from collections import namedtuple
@@ -43,15 +44,17 @@ INITIAL_LOG_STD = -1.0
 
 
 def mlp(inputs, outputs, hidden=HIDDEN, output_gain=1.0):
-    """A small ELU stack. ELU rather than ReLU because a kinked value
-    function is a poor thing to differentiate a policy through, and this
-    whole project exists to take derivatives.
+    """Build a small fully connected network: Linear, ELU, Linear, ELU, Linear.
 
-    The last layer is scaled down so an untrained policy starts near zero
-    output. That used to be a trap -- a pusher not touching the box has no
-    gradient at all -- but `task.approach_penalty` now supplies one, so
-    starting quiet is safe again and is what keeps the first updates from
-    being dominated by whatever the initialization happened to be.
+    `output_gain` bounds the last layer's initial weights, and its bias
+    starts at zero, so an untrained network outputs close to nothing. That
+    keeps the first few updates from being dominated by the random
+    initialization.
+
+    ELU rather than ReLU because ReLU has a kink, so its derivative jumps.
+    The critic's gradient feeds into the actor's update here, meaning these
+    networks get differentiated through rather than just backpropagated
+    once, and a kinked function makes that gradient field discontinuous.
     """
     layers, width = [], inputs
     for size in hidden:
@@ -64,23 +67,23 @@ def mlp(inputs, outputs, hidden=HIDDEN, output_gain=1.0):
 
 
 class Actor(torch.nn.Module):
-    """Observation -> a bounded, stochastic ramp-frame force per actuated body.
+    """Turn an observation into a force for each actuated body.
 
-        action = limit * tanh(mu(obs) + sigma * eps)
+        action = limit * tanh(network(obs) + sigma * noise)
 
-    The tanh IS the action limit, not a clip applied afterwards. A hard
-    clip has exactly zero gradient once saturated, and the converged
-    baseline sits on its limit 2-6% of the time, so a policy would very
-    likely spend real time in a region where it cannot be improved.
-    Squashing keeps every action feasible by construction and keeps the
-    derivative alive everywhere. `task.clip_action` still runs downstream,
-    where it is now a no-op that documents the guarantee.
+    Forces are in the ramp frame, (tangential, normal), in newtons.
 
-    Reparameterized, so the sample is differentiable with respect to the
-    parameters -- which is the whole point, since SHAC differentiates the
-    pathway rather than estimating a score function. There is no
-    log-probability anywhere in SHAC, so the tanh needs no change-of-
-    variables correction; it is a squash, not a density.
+    The tanh is what enforces the force limit. A hard clip would work too,
+    but its derivative is exactly zero once saturated, and the trajectory
+    optimization baseline sits at its limit 2-6% of the time. A policy
+    would then spend real time somewhere the gradient says nothing. tanh
+    keeps every action inside the limit and every derivative nonzero.
+
+    The noise is added before the tanh, and it is drawn outside the
+    network. That means the sampled action is still a differentiable
+    function of the network's weights, which is what lets SHAC
+    differentiate straight through the sample instead of estimating the
+    gradient statistically the way PPO does.
     """
 
     def __init__(self, observation_size, actuated, limit, hidden=HIDDEN):
@@ -91,7 +94,11 @@ class Actor(torch.nn.Module):
         self.log_std = torch.nn.Parameter(torch.full((actuated, 2), INITIAL_LOG_STD, dtype=torch.float64))
 
     def forward(self, observation, deterministic=False):
-        """(environments, features) -> (environments, actuated, 2), in newtons."""
+        """(environments, features) -> (environments, actuated, 2), in newtons.
+
+        `deterministic=True` skips the noise. Use it whenever two runs have
+        to be comparable, such as a finite-difference check.
+        """
         pre = self.net(observation).reshape(observation.shape[0], self.actuated, 2)
         if not deterministic:
             pre = pre + torch.exp(self.log_std) * torch.randn_like(pre)
@@ -99,12 +106,13 @@ class Actor(torch.nn.Module):
 
 
 class Critic(torch.nn.Module):
-    """Observation -> the value of continuing from here.
+    """Estimate the total reward still to come from a given observation.
 
-    Its whole job is to stand in for the reward beyond the end of a short
-    window. Without it a 32-step window optimizes 0.32 s of behaviour and
-    nothing about the 3.7 s hold that follows, which is where the two
-    contact formulations actually differ.
+    SHAC optimizes short windows -- 32 control steps, 0.32 s -- out of a
+    4 s episode. This estimate stands in for everything after the window
+    ends. Without it the policy would optimize a third of a second and
+    know nothing about the 3.7 s hold that follows, which is exactly where
+    penalty contact and a rigid solve differ.
     """
 
     def __init__(self, observation_size, hidden=HIDDEN):
@@ -116,25 +124,46 @@ class Critic(torch.nn.Module):
 
 
 def as_tensor(array, grad=False):
-    """numpy -> torch, keeping float64 so the finite-difference checks mean something."""
+    """numpy -> torch, in float64.
+
+    `grad=True` marks the tensor as something to differentiate with respect
+    to, which is how `accumulate` can return dJ/d(observation).
+
+    float64 rather than the usual float32 because the finite-difference
+    checks compare against a 1e-6 tolerance, and float32 rounding would
+    swamp that.
+    """
     tensor = torch.as_tensor(np.ascontiguousarray(array), dtype=torch.float64)
     return tensor.requires_grad_(True) if grad else tensor
 
 
 def accumulate(module, outputs, seed, inputs):
-    """One backward pass, seeded by GRIP, read from both ends.
+    """Back-propagate one step through the network, starting from GRIP's seed.
 
-    `outputs` is what the network produced, `seed` is dJ/d(outputs) as
-    computed through the simulator, and `inputs` is the observation tensor.
-    Returns dJ/d(inputs) and accumulates dJ/d(parameters) into `.grad`.
+        module   the network to differentiate
+        outputs  what it produced -- the action tensor, graph attached
+        seed     dJ/d(outputs), which GRIP computed
+        inputs   the observation tensor it was given
 
-    Both come out of a single pass because they are the same pass: the
-    parameter gradient is what the update needs, and the input gradient is
-    what carries the adjoint back another step through the policy. Doing
-    them separately would double the cost for nothing.
+    Returns dJ/d(inputs). Adds dJ/d(parameters) into each parameter's
+    `.grad` as a side effect, so the two results leave by different doors.
 
-    Accumulating rather than assigning is exactly right -- a window's total
-    derivative is the sum over its steps, and the sweep visits each once.
+    Usually you call `loss.backward()` and torch seeds the pass with 1.0 on
+    a scalar. Here the objective is on the far side of the simulator, so
+    the seed has to be supplied by hand. `outputs` says where in the graph
+    to start; `seed` says what the derivative is there.
+
+    Both results come from one pass over the graph because they are the
+    same pass. They are then used differently:
+
+      The parameter gradients are summed, not assigned. The same weights
+      produced the action at every step in the window, so the window's
+      total derivative is a sum over steps.
+
+      The input gradient belongs to this step alone and is returned
+      immediately. `policy_gradient` multiplies it by the observation
+      Jacobian to get dJ/d(state), which is how the adjoint travels back
+      through the policy to the previous step.
     """
     parameters = [p for p in module.parameters() if p.requires_grad]
 
@@ -161,7 +190,12 @@ def accumulate(module, outputs, seed, inputs):
 
 
 def flat_parameters(module):
-    """Every parameter as one vector, for finite-difference checking."""
+    """Every parameter flattened into one vector.
+
+    A finite-difference check nudges parameter i and remeasures, so it
+    needs the parameters as a single indexable vector rather than a list of
+    differently shaped tensors.
+    """
     return torch.cat([p.detach().reshape(-1) for p in module.parameters()])
 
 
@@ -176,7 +210,13 @@ def set_flat_parameters(module, flat):
 
 
 def flat_gradients(module):
-    """Every parameter's accumulated gradient as one vector, zeros where absent."""
+    """Every parameter's `.grad` flattened into one vector, to line up with
+    `flat_parameters`.
+
+    A parameter that never entered the computation has `.grad` of None.
+    Those become zeros rather than being skipped, so both vectors have the
+    same length and index i means the same parameter in each.
+    """
     return torch.cat([(torch.zeros_like(p) if p.grad is None else p.grad).reshape(-1) for p in module.parameters()])
 
 
@@ -186,22 +226,24 @@ def zero_gradients(module):
 
 
 def rollout(batch, actor, steps, deterministic=False):
-    """Step the policy forward from `batch.state`, keeping what the sweep needs.
+    """Run the policy for `steps` control steps and return everything the
+    backward sweep will need.
 
-    `step_batch` rather than `rollout_batch` because the control is not
-    known in advance -- that is what closed loop means -- and because it
-    returns a fresh array per step rather than a view of the simulator's
-    buffer, which a trajectory kept across a whole window would otherwise
-    have overwritten under it.
+    Each step: look at the state, decide a force, apply it, repeat. All the
+    environments in the batch advance together; only time is sequential.
 
-    Takes a whole `task.Batch` rather than the six loose pieces it needs.
-    The scenes, the slopes and the variant have to describe the same world
-    or the rollout is quietly simulating something else, and handing them
-    over as one value is what makes that unexpressible.
+    Returns a `Window`. `states` has one more entry than the rest, because
+    it includes the state the rollout started from.
 
-    Windows chain by advancing the batch: `batch = batch._replace(state =
-    window.states[-1])`, which is how SHAC carries a state across a window
-    boundary without resetting the episode.
+    Uses `step_batch`, not `rollout_batch`, for two reasons. The controls
+    are not known ahead of time -- the action at step 5 depends on the
+    state at step 5 -- which is what closed loop means. And `rollout_batch`
+    returns a view of GRIP's internal buffer, which the next call would
+    overwrite; `step_batch` returns a fresh array each time.
+
+    To continue past the end of a window without resetting the episode:
+
+        batch = batch._replace(state=window.states[-1])
     """
     state = batch.state
 
@@ -236,34 +278,50 @@ def rollout(batch, actor, steps, deterministic=False):
 
 
 def policy_gradient(batch, window, actor, critic=None, shaping=True):
-    """dJ/d(actor parameters) for a closed-loop window, accumulated into .grad.
+    """Differentiate a window's reward with respect to the actor's weights.
 
-    The per-step sweep, lifted out of `tests/check_closed_loop.py` now that
-    SHAC is its second consumer. One `adjoint_batch` call per window gives
-    the OPEN-loop gradient, which is right for a fixed control sequence and
-    measured at 119% wrong for a policy at one gain and 11% at another --
-    state-dependent, so not something a learning rate can absorb.
+    Adds the result into each parameter's `.grad`, ready for an optimizer
+    step. Returns dJ/d(state) at the start of the window, which callers can
+    usually ignore.
 
-    Each step's call returns both pieces the sweep needs: dJ_dU_t to seed
-    the network's backward pass, and dJ_dZ0 to carry the adjoint back one
-    step. Between calls it adds the path a single call cannot see,
-    Z_t -> a_t -> Z_{t+1}, which is the network's input gradient projected
-    through the (constant) observation Jacobian.
+    Walks backwards one CONTROL step at a time, 32 calls to `adjoint_batch`
+    for a 32-step window, each covering that step's 20 integration
+    substeps. One call for the whole window would cover the same 640
+    substeps and cost the same simulation, so the price here is Python
+    round trips, not physics.
 
-    Deliberately NOT in `task.py`, though the plan said to put it there.
-    It needs torch, and task.py is the only thing `drift.py` and the
-    numpy-side checks depend on -- keeping it torch-free is worth more
-    than filing this by its original address.
+    The reason for the round trips is what happens between the calls. A
+    single call treats the controls as fixed inputs, which is correct for
+    an optimizer tuning a control sequence and wrong for a policy that
+    reacts to the state. Measured against finite differences, one call is
+    11% off at one feedback gain and 119% off at another. Being
+    state-dependent, that error is not something a learning rate absorbs.
 
-    `critic` supplies the terminal bootstrap, dV/dZ_W. Passing None makes
-    the objective the windowed reward alone, which is what a
-    finite-difference check needs, since the check has to differentiate
-    exactly the quantity it perturbs.
+    At each step the state can reach the objective three ways, and the code
+    adds all three:
 
-    Takes the `task.Batch` and the `Window` whole. The two used to arrive
-    as eleven loose positional arguments, six of which were also `rollout`
-    arguments, and a swapped pair among them raises nothing -- it just
-    differentiates a different problem.
+        through the physics      Z_t -> Z_{t+1}, force held fixed
+        through the policy       Z_t -> obs_t -> a_t -> Z_{t+1}
+        through the reward       r(Z_t) directly
+
+    `adjoint_batch` supplies the first and the third. The middle one has to
+    be built here, because GRIP's contract is that controls come from
+    outside and it has no idea the action was computed from the state:
+
+        1. `to_action_gradient` rotates GRIP's dJ/d(wrench) into
+           dJ/d(action), the ramp-frame force the network emits.
+        2. `accumulate` back-propagates that through the network, banking
+           dJ/d(weights) and returning dJ/d(observation).
+        3. `state_gradient` multiplies dJ/d(observation) by the observation
+           Jacobian to get dJ/d(state).
+
+    `critic`, when given, estimates the reward after the window ends and
+    its derivative joins the seed at the window's final state. Pass None to
+    make the objective the window's reward alone. A finite-difference check
+    needs that, because it perturbs the weights and remeasures the window's
+    reward -- if this function included the critic's contribution and the
+    check did not, the two would differ for a legitimate reason and the
+    check would prove nothing. Training always passes a critic.
     """
     trajectory, wrenches = window.states, window.wrenches
 

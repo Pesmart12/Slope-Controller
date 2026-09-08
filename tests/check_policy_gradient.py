@@ -1,26 +1,26 @@
-"""dJ/d(policy parameters), finite-differenced.  Run: python tests/check_policy_gradient.py
+"""Check the policy gradient against finite differences.  Run: python tests/check_policy_gradient.py
 
-`check_closed_loop.py` established that a policy needs a per-step adjoint
-sweep and measured what one call per window costs -- 119% at one gain.
-That was a one-parameter feedback law, hand-differentiated. This is the
-same statement for the thing SHAC actually trains: an MLP, with the chain
-running
+`check_closed_loop.py` made this point for a one-parameter feedback law
+differentiated by hand. This makes it for the thing SHAC actually trains:
+a network, with the derivative crossing between GRIP and torch twice per
+step.
 
-    dJ/dU  ->  dJ/d(action)  ->  dJ/d(theta)   and   dJ/d(obs)  ->  dJ/dZ
+    GRIP gives dJ/d(wrench)
+      -> rotate to dJ/d(action)
+      -> back-propagate to dJ/d(weights) and dJ/d(observation)
+      -> multiply by the observation Jacobian to get dJ/d(state)
+      -> hand back to GRIP as the next seed
 
-through torch on one side and GRIP on the other. Every one of those hops
-is a place a sign or a transpose can hide, and none of them raise when
-wrong -- they just train something that is not the objective.
+Every one of those hops can hide a sign or a transpose, and none of them
+raise when wrong. They just train something that is not the objective.
 
-Finite-differencing a network means perturbing parameters and re-rolling,
-so the policy must be DETERMINISTIC here: with sampling on, the two
-evaluations differ by noise far larger than the perturbation and the
-comparison is meaningless. Sampling is a separate concern and is not what
-this checks.
+The policy must run deterministically here. Finite differencing means
+perturbing a weight and re-rolling, and with sampling on the two rollouts
+would differ by noise far larger than the perturbation.
 
 The critic is left out for the same reason. It would be a legitimate part
-of the objective, but the check has to differentiate exactly the quantity
-it perturbs, and the windowed reward is that quantity.
+of the objective, but the check has to differentiate exactly what it
+perturbs, and what it perturbs is the window's reward.
 """
 
 import numpy as np

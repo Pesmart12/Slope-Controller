@@ -246,10 +246,24 @@ Pedro's preferences, the same ones GRIP uses where they carry over to Python.
 - **Two blank lines between top-level definitions.**
 - **No type annotations.** None of the existing code has them; don't add them
   to code you touch.
-- **Docstrings carry the reasoning, not just the signature.** `creep_rate` is
-  the model: the formula, why the factor of 2 is there, and exactly where the
-  closed form stops being true. A docstring that restates the function name
-  is not worth the lines.
+- **Docstrings: one plain sentence first, then only what a caller needs.**
+  In this order — what the function does, then its arguments and return if
+  the names do not already say, then the reasoning required to use it
+  correctly. `creep_rate` is the model for the reasoning part: the formula,
+  why the factor of 2 is there, where the closed form stops being true.
+  A docstring that restates the function name is not worth the lines.
+- **Three ways docstrings here have gone wrong. Do not repeat them.**
+  - *History.* What the code used to be, how many arguments it had before,
+    which file it moved out of, what the plan originally said. That is
+    commit-message material and a reader trying to use the function gains
+    nothing from it.
+  - *Loose terms.* Naming a variable the code does not actually pass, or a
+    vague verb where the operation is ordinary. Say "multiply by the
+    observation Jacobian", not "project through it". Name the real
+    variable.
+  - *Essay register.* Long clause-heavy sentences and em-dash pileups.
+    Write short sentences in plain language. Rationale comes after the
+    reader knows what the thing does, never before.
 - **ASCII in code, Unicode in Markdown.** Python files use `--` and `alpha`;
   `.md` files use — and α. Don't mix them.
 - **Comments explain why in ordinary code, and *what* in dense code.** The

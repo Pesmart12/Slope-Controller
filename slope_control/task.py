@@ -1,43 +1,38 @@
-"""The ramp task, in two variants that share a reward.
+"""What we are asking the controller to do: push a box to a target on a ramp.
 
-Everything here is a task definition and none of it belongs in GRIP. The
-reward, its gradient seeds, the action limits, the observation frame and
-the episode structure are all decisions about what to ask for, not about
-how bodies move.
+Everything here decides what to ask for. Nothing here decides how bodies
+move -- that is GRIP's half. So the reward, its derivatives, the action
+limits, the observation frame and the episode length all live here.
 
-Actions are two-component forces in the *ramp* frame -- tangential first,
-then normal -- rotated into GRIP's world wrench on the way in, one per
-actuated body. The slope randomizes per episode, so a world-frame action
-would mean something different in every environment; a ramp-frame one
-means the same thing everywhere, and a positive tangential component
-always pushes toward increasing `xi`. The torque row is never written.
+Actions are forces, two components per actuated body, given in the RAMP
+frame as (tangential, normal) and rotated into GRIP's world frame on the
+way in. Ramp frame because the slope is different in every environment, so
+a world-frame action would mean something different in each one. A
+positive tangential action always pushes toward a larger `xi`. Nothing
+ever applies a torque.
 
-Two variants, because the force limits are set by the bodies being driven
-and there is no single number that serves both:
+Two variants, because the force limit depends on what is being driven:
 
-    TWO_PUSHERS   pusher, box, pusher. The box is unactuated and
-                  everything it does arrives through a contact. Two of
-                  them, because a convex pusher only pushes and its
-                  direction is fixed by the side it starts on, so one
-                  pusher leaves overshoot unrecoverable. This is the task.
-    BOX_ONLY      one box, wrench applied straight to it. Physically
-                  fictional -- nothing reaches into a box and pushes from
-                  its centre -- and kept only through SHAC bring-up, as a
-                  version of the same problem with the contact taken out.
-                  If a policy fails on pushers and works here, the fault
-                  is in the contact rather than the gradient path.
-                  Scheduled for deletion once step 5 lands; CLAUDE.md
-                  carries the decision.
+    TWO_PUSHERS   Pusher, box, pusher. The box is unactuated, so every
+                  newton reaching it crosses a contact. Two pushers rather
+                  than one because a pusher can only push, and one of them
+                  can never undo an overshoot. This is the task.
 
-No function here defaults its `variant`. One of the two is fictional, so a
-caller that forgets the argument must not silently get it.
+    BOX_ONLY      One box, pushed directly from its centre. Physically
+                  fictional, and kept only while SHAC is being brought up.
+                  It is the same problem with the contact removed, so if a
+                  policy fails on pushers and works here, the fault is the
+                  contact and not the gradient path. Delete it once step 5
+                  lands; CLAUDE.md has the decision.
 
-The reward has two terms, position and control effort, and that pair is
-the task objective -- it is what gets reported, and it is identical in
-both the penalty and NCP columns. There is a third term, `approach_penalty`,
-which is REWARD SHAPING: off by default, added only to the training
-objective, and documented at length where it is defined. Anything scored
-for the record is scored without it.
+No function defaults its `variant`. One of the two is fictional, and a
+caller who forgets the argument must not silently get it.
+
+The reward has two terms, position error and control effort. That pair is
+the task objective, it is what gets reported, and it is the same in both
+the penalty and the NCP column. A third term, `approach_penalty`, is
+reward shaping -- off unless asked for, added only when training, never
+included in a reported number.
 """
 
 import math
@@ -101,19 +96,20 @@ Batch = namedtuple("Batch", "scenes angles state targets substeps jacobian varia
 
 
 def control_weight(scale, hold_forces, tolerance=POSITION_TOLERANCE):
-    """Fix w_ctrl from a stated tolerance instead of picking a number.
+    """Derive the control weight from a position tolerance.
 
-    Both reward terms are normalized -- error by the box side, force by
-    `scale` -- so the weights are comparable and the choice reduces to one
-    question: at what position error does holding stop being worth the
-    force it costs? Setting the two terms equal there,
+    Answers one question: how far off target may the box sit before holding
+    it there stops being worth the force? Set the two reward terms equal at
+    that error and solve for the weight:
 
-        w_ctrl * sum_i (hold_i / scale)^2  =  (tolerance / side)^2
+        w_ctrl * sum over actuated bodies of (hold force / scale)^2
+            = (tolerance / side)^2
 
-    where the sum runs over actuated bodies, because under penalty contact
-    every one of them has to be pushed continuously just to stay put.
-    Stating the tolerance rather than the weight keeps the number
-    meaningful when the force scale or the bodies change.
+    The sum runs over every actuated body because under penalty contact
+    each one needs continuous force just to stay put.
+
+    Stating a tolerance rather than picking a weight means the number stays
+    meaningful when the force scale or the set of bodies changes.
     """
     return (tolerance / ramp.BOX_SIDE) ** 2 / sum((force / scale) ** 2 for force in hold_forces)
 
@@ -163,39 +159,38 @@ def bodies_for(variant):
 
 
 def substeps_for(scene):
-    """Integration steps per control step, so control runs at CONTROL_HZ.
+    """How many integration steps make up one control step.
 
-    20 at penalty's dt = 5e-4. This is the decoupling that keeps the 1.0
-    and 2.0 columns the same control problem rather than two different
-    ones, so it is derived from the scene rather than written down.
+    Works out to 20 at penalty contact's dt of 5e-4, giving 100 Hz control.
+
+    Derived from the scene rather than hardcoded, because the two contact
+    models integrate at different rates. Pinning the control rate instead
+    of the substep count is what keeps them the same control problem, and
+    therefore comparable.
     """
     return int(round(1.0 / (CONTROL_HZ * scene.dt)))
 
 
 def clip_action(actions, variant):
-    """Clamp each component to its own entry in the variant's limit.
+    """Clamp each force component to the variant's limit.
 
-    Applied inside `to_wrench`, which is the only place an action becomes
-    physics, so the limit cannot be bypassed by a caller that forgets it.
-    Beware when measuring anything against force: a sweep that routes
-    through `to_wrench` silently makes every value above the limit the
-    same experiment.
+    Tangential and normal are clamped separately, against their own
+    entries, because they are bounded by different physics.
 
-    A hard clip has zero gradient once saturated, and the converged
-    baseline sits on its limit 2.1% of steps on box-only and 5.9% on two
-    pushers -- enough that a policy optimizing through it would spend real
-    time somewhere it cannot be improved.
+    This runs inside `to_wrench`, the only place an action becomes a force,
+    so no caller can skip it. Two consequences:
 
-    That is already handled upstream rather than here: `policy.Actor`
-    emits `limit * tanh(...)`, so a policy's actions are feasible by
-    construction and this clip is a no-op for them. It still runs, because
-    it is the one place the limit is enforced for callers that are NOT a
-    policy -- `check_trajopt` optimizes a raw control sequence and needs
-    projecting back onto the box every iteration.
+    A force sweep that goes through `to_wrench` makes every value above the
+    limit the same experiment. Build wrenches directly when measuring
+    against force, or the results will silently be identical.
 
-    If a trained policy still lives at its limit, that is a statement
-    about the force budget rather than about the clip. **Never widen the
-    limit** -- it is what keeps the bodies on the ramp.
+    `policy.Actor` already emits `limit * tanh(...)`, so for a policy this
+    clip does nothing. It matters for callers that optimize a raw control
+    sequence, such as `check_trajopt`, which needs its iterate pushed back
+    inside the limit every iteration.
+
+    Never widen the limit to stop a policy saturating. The limit is what
+    keeps the bodies on the ramp.
     """
     return np.clip(np.asarray(actions, dtype=float), -variant.limit, variant.limit)
 
@@ -229,15 +224,16 @@ def to_wrench(actions, ramp_angles, variant):
 
 
 def to_action_gradient(dJ_dU, ramp_angles, variant):
-    """Pull GRIP's wrench derivatives back to the ramp-frame actions.
+    """Convert dJ/d(wrench) from GRIP into dJ/d(action).
 
-    The action-to-wrench map is orthogonal, so its pullback is the
-    transpose: project each actuated body's force gradient onto uphill and
-    normal. Torque rows are dropped because no action wrote them.
+    The inverse direction of `to_wrench`. That map is a rotation, so
+    undoing it is just the transpose: take each actuated body's force
+    gradient and dot it with uphill and with normal. Torque entries are
+    dropped, since no action wrote one.
 
-    Does not account for saturation -- a clipped action has zero derivative
-    and the caller has to mask it. Kept out of here so the rotation stays
-    one obvious thing.
+    Saturation is not handled here. A clipped action has zero derivative
+    and the caller has to mask it if that matters. Leaving it out keeps
+    this function to one job.
     """
     angles = np.atleast_1d(np.asarray(ramp_angles, dtype=float))
     up, out = ramp.uphill(angles), ramp.normal(angles)
@@ -271,11 +267,14 @@ def pushing_bodies(variant):
 
 
 def separations(states, ramp_angles, variant):
-    """Each pushing body's gap to the box face it meets. Positive is a gap.
+    """Distance from each pusher to the box face it will hit.
 
-    The reach is read off the vertex list rather than written down, since
-    the 3 degree face trim moves it, and from the correct side -- the
-    uphill pusher is mirrored, so its contact vertex is at -x.
+    Positive means still apart, zero means touching, negative means
+    overlapping. Returns one array per pushing body, empty for BOX_ONLY.
+
+    The exact inverse of `placement`, which sets a body up at a requested
+    gap. If the two ever disagree, a start requested at 0 cm stops actually
+    being 0 mm apart.
     """
     bodies = bodies_for(variant)
     xi = ramp.along_ramp(states, ramp_angles)
@@ -300,38 +299,35 @@ def separations(states, ramp_angles, variant):
 
 
 def reward(states, controls, ramp_angles, targets, variant, weights=None, shaping=False):
-    """Per-step reward, shaped (steps, environments).
+    """Score each step. Returns (steps, environments).
 
-        r_t = -w_pos * ((xi_box - xi*)/side)^2  -  w_ctrl * sum_i |f_i|^2 / scale^2
+        r = -w_pos * ((box position - target) / side)^2
+            -w_ctrl * (total force)^2 / scale^2
 
-    Both terms are normalized, which is what makes the weights order one
-    and comparable. In raw units the ratio is about 1e-5 -- metres squared
-    against newtons squared -- a number that tells a reader nothing and
-    invites someone to "fix" it later.
+    Control u_t is scored against the state it produces, Z_{t+1}. Nothing
+    reaches Z_0, so it is left out and the result has one fewer entry than
+    `states`.
 
-    Only the box's position is scored by the task objective. Where the
-    pushers end up is their own business, and pricing it would be deciding
-    for the policy how to use its second body. (`shaping=True` does score
-    a pusher's distance from the box, but one-sidedly and only while it is
-    away -- see `approach_penalty`.)
+    Both terms are divided by a natural scale, the box side and the force
+    limit, so the two weights come out around one and can be compared. In
+    raw metres and newtons the ratio would be about 1e-5, which tells a
+    reader nothing.
 
-    The control term is not boilerplate. Under penalty contact a held body
-    gets no friction for free, so holding costs mg*sin(a) forever
-    (`ramp.hold_force`) for every actuated body; under a solve it costs
-    nothing after arrival. Same reward, two different bills, and that is
-    the thing worth watching in the comparison.
+    Only the box is scored. Where the pushers end up is their own problem,
+    and pricing it would be deciding for the policy how to use its second
+    body.
 
-    Index convention: control u_t is scored against the state it produces,
-    Z_{t+1}. Z_0 is fixed by the initial condition and no control reaches
-    it, so it contributes a constant and is left out.
+    The control term is not boilerplate. Under penalty contact, friction
+    only appears when something is sliding, so a body held still gets no
+    help from the surface and the controller pays mg*sin(a) for as long as
+    it holds. Under a rigid solve, holding is free once the box has
+    arrived. Same reward, two very different bills -- which is the thing
+    the 1.0 and 2.0 columns are there to compare.
 
-    `shaping=True` adds the approach term documented in
-    `approach_penalty`. It is OFF by default, so a reported number is the
-    task objective unless someone asked for otherwise. Train with it on,
-    score with it off; the two mistakes are not symmetric, since training
-    without it fails loudly -- the driving pusher's action sits at exactly
-    0.00 N -- while reporting with it on is silent and makes numbers
-    incomparable across columns.
+    `shaping=True` adds `approach_penalty`. Train with it on, report with
+    it off. The two mistakes are not symmetric: training without it fails
+    loudly, with the driving pusher stuck at 0.00 N, while reporting with
+    it on fails silently and makes numbers incomparable between columns.
     """
     weights = variant.weights if weights is None else weights
     controls = np.asarray(controls)
@@ -358,55 +354,51 @@ def reward(states, controls, ramp_angles, targets, variant, weights=None, shapin
 
 
 def approach_penalty(states, ramp_angles, variant, weights=None):
-    """REWARD SHAPING: the cost of a pusher not being at the box yet.
+    """Penalize a pusher for not having reached the box yet.
 
-    Named as such on purpose. This is not part of the task objective; it
-    is a term added to the *training* objective to remove a region where
-    the task objective has no gradient at all.
+        cost = w_pos * sum over pushers of max(0, separation / side)^2
 
-    The region: a pusher not touching the box contributes nothing to the
-    box's position, so d(box position)/d(pusher action) is identically
-    zero. Measured -- from a zero initialization at a 5 cm approach gap,
-    trajectory optimization leaves the driving pusher at exactly 0.00 N
-    for every iteration and the box 52 cm short. Gradients cannot discover
-    a contact that does not exist.
+    Positive, and returned for every step including the initial state, so
+    callers slice it the way they slice the position term.
 
-    The term is
+    This is reward shaping. It is not part of the task objective and it is
+    off unless `reward(..., shaping=True)` asks for it. Train with it on,
+    report with it off.
 
-        -w_pos * sum_i max(0, separation_i / side)^2
+    It exists because the task objective has a region with no gradient at
+    all. A pusher that is not touching the box has no effect on the box, so
+    d(box position)/d(pusher action) is exactly zero. Starting from zero
+    force with a 5 cm gap, trajectory optimization left the driving pusher
+    at 0.00 N for all 300 iterations and the box 52 cm short. Gradients
+    cannot find a contact that does not exist.
 
-    over the pushing bodies. Three properties, each deliberate:
+    The fix works because the pushers are actuated directly, so
+    d(pusher position)/d(pusher action) is never zero, contact or not.
 
-      One-sided, so it is EXACTLY zero once contact is made and cannot
-      distort behaviour in the regime where the task objective takes over.
-      max(0, x)^2 is C1, so the gradient stays continuous at the kink.
+    Three properties worth keeping if this is ever changed:
 
-      No new weight. It reuses w_pos and the same normalization by the box
-      side, which says: penalize a pusher being away from the box exactly
-      as much as we penalize the box being away from its target, but only
-      while it actually is away.
+      One-sided. `max(0, gap)` is exactly zero once the bodies touch, so
+      the term cannot distort behaviour once the task objective takes
+      over. Squaring keeps the derivative continuous at the kink.
 
-      Live from the first iteration, because the pushers are DIRECTLY
-      actuated -- d(pusher position)/d(pusher action) is never zero,
-      contact or no contact. That is the whole mechanism.
+      No new weight to tune. It reuses w_pos and the same normalization by
+      the box side, which reads as: being away from the box costs the same
+      as the box being away from its target, but only while it is away.
 
-    Measured effect, same setup as the failure above: the driving pusher
-    reaches its 30 N limit, both contacts form, and the box lands 1.8-2.4
-    cm from target. The *unshaped* reward improves from -1193 to -93, so
-    the term is not buying its result by moving the goalposts.
+      Formulation-agnostic. Approaching is the same problem under penalty
+      contact and under a rigid solve, so this belongs in both columns
+      unchanged. Under a rigid solve it is not just convenient but
+      required: penalty creep happens to close one of the two gaps by
+      itself, and nothing creeps under a solve.
 
-    It belongs in both columns identically. It is formulation-agnostic --
-    approaching is the same problem under penalty and under a solve --
-    and under an NCP solve it is not merely convenient but necessary:
-    penalty creep happens to close one of the two gaps on its own, and a
-    rigid solve closes neither, so the flat region there is total.
+    Measured with it on, same setup as the failure above: both contacts
+    form and the box lands 1.8-2.4 cm from target. The reward measured
+    WITHOUT shaping improves from -1193 to -93, so the term is not buying
+    its result by moving the goalposts.
 
-    Worth re-checking once a policy optimizes against it rather than an
+    Still to check once a policy optimizes against this rather than an
     open-loop sequence. A policy has more freedom to find a degenerate way
     to satisfy a shaped term.
-
-    Returned over all steps including the initial state, so callers slice
-    it the same way they slice the position term.
     """
     weights = variant.weights if weights is None else weights
     gaps = separations(states, ramp_angles, variant)
@@ -416,36 +408,39 @@ def approach_penalty(states, ramp_angles, variant, weights=None):
 
 
 def reward_seeds(states, controls, ramp_angles, targets, variant, weights=None, shaping=False):
-    """dl_dZ and dl_dU for `adjoint_batch`, matching `reward` term for term.
+    """Differentiate `reward`, giving the two seed arrays `adjoint_batch` wants.
 
-    Deliberately adjacent to the reward it differentiates. The two have to
-    agree, and the cheapest guarantee of that is a change to one being
-    visibly next to the other -- a wrong seed raises nothing, it just
-    quietly trains for something else.
+    Returns dr/d(state) and dr/d(control), each shaped like what it
+    differentiates against. These are partial derivatives of one step's
+    reward only. GRIP turns them into total derivatives.
 
-    Unshaped, the state enters only through the box's xi = p . uphill, so
+    Kept next to `reward` on purpose. The two must agree term for term, and
+    a seed that disagrees raises nothing -- it just trains for a different
+    objective. Editing one where you can see the other is the cheapest
+    protection against that.
 
-        dr/d(x, y)_box = -2*w_pos*(xi - xi*)/side^2 * uphill
+    Unshaped, the state enters only through the box's position along the
+    ramp, xi = position . uphill:
 
-    and every other entry is zero: the task objective does not see
-    orientation, it does not see velocity, and it does not see where the
-    pushers are. For each actuated body,
+        dr/d(box x, y) = -2 * w_pos * (xi - target) / side^2 * uphill
 
-        dr/df_i = -2*w_ctrl*f_i / scale^2
+    Everything else is zero. The task objective does not see orientation,
+    velocity, or where the pushers are. For each actuated body:
 
-    with the torque row zero. Both are partials of the stage cost only --
-    GRIP supplies everything that makes them total derivatives.
+        dr/d(force) = -2 * w_ctrl * force / scale^2
 
-    With `shaping=True` the pushers DO enter, through the separation term,
-    and each one writes two entries rather than one -- its own position and
-    the box's, with opposite signs, because a separation is a difference.
-    That is the block at the bottom of this function, and it is why the
-    seed check runs shaped and unshaped separately.
+    with the torque entry zero, since no action writes one.
 
-    For a *policy* these seeds are not the whole story. One `adjoint_batch`
-    call over a window gives the open-loop gradient, which is right for a
-    fixed control sequence and wrong for state feedback; see
-    `tests/check_closed_loop.py`.
+    With `shaping=True` the pushers do enter, through the separation term.
+    Each pusher writes two entries instead of one, its own position and the
+    box's, with opposite signs, because a separation is a difference of the
+    two. `check_task` therefore checks the shaped and unshaped seeds
+    separately.
+
+    These seeds are not the whole gradient for a policy. Contracting them
+    with one `adjoint_batch` call over a window gives the open-loop
+    gradient, which is correct for a fixed control sequence and wrong for
+    state feedback. See `policy.policy_gradient`.
     """
     weights = variant.weights if weights is None else weights
     states, controls = np.asarray(states), np.asarray(controls)
@@ -493,33 +488,41 @@ def reward_seeds(states, controls, ramp_angles, targets, variant, weights=None, 
 
 
 def observe(states, ramp_angles, targets, variant):
-    """What a policy sees, in the ramp frame so it reads the same at every slope.
+    """Build what the policy sees. Returns (..., environments, features).
 
-    Seven numbers for the box,
+    Seven numbers for the box:
 
-        [ (xi - xi*)/side, v_uphill, gap/side, v_normal, theta - a, omega, sin a ]
+        (xi - target) / side     how far off target, in box widths
+        v_uphill                 speed along the ramp
+        gap / side               height above the surface
+        v_normal                 speed away from the surface
+        theta - a                tilt relative to the ramp
+        omega                    spin
+        sin(a)                   the slope itself
 
-    then four more for every other body, relative to the box,
+    Then four more for each other body, measured relative to the box:
 
-        [ (xi_body - xi_box)/side, v_uphill, gap/side, theta - a ]
+        (xi_body - xi_box) / side, v_uphill, gap / side, theta - a
 
-    Everything but sin(a) is slope-invariant. That one entry is what leaks
-    through from the world frame, because it sets the gravity load the
-    controller has to fight, and without it the policy would have to infer
-    the slope from how fast things are losing ground. The frame matches the
-    action's, so a positive first action always pushes toward a larger
-    first observation.
+    Everything is in the ramp frame, so it reads the same at any slope, and
+    it matches the frame the actions are in -- a positive first action
+    always pushes toward a larger first observation.
 
-    `policy.Actor` consumes this and `check_policy_gradient` differentiates
-    through it, so the frame and the gradient path are exercised. What is
-    NOT exercised is whether these are the right channels -- whether a
-    policy can actually control the box from them, and whether any of them
-    is dead weight. Only training answers that.
+    sin(a) is the one channel that is not slope-invariant, and it is here
+    on purpose. It sets how hard gravity is pulling, which the controller
+    has to fight. Without it the policy could only infer the slope by
+    watching how fast things slide.
 
-    Being affine in the state is a property worth preserving rather than an
-    accident: it is what makes `observation_jacobian` a constant matrix
-    built once per batch instead of a derivative recomputed every step. A
-    channel with a square or a norm in it would quietly cost that.
+    `observe` is affine in the state, and that is worth preserving. It is
+    what lets `observation_jacobian` be a constant matrix built once per
+    batch instead of a derivative recomputed at every step of every
+    backward sweep. Adding a channel with a square or a norm in it would
+    quietly cost that.
+
+    These channels are exercised for shape and for their gradient, but
+    nothing yet says they are the RIGHT channels -- whether a policy can
+    control the box from them, or whether any is dead weight. Only training
+    answers that.
     """
     states = np.asarray(states)
     angles = np.atleast_1d(np.asarray(ramp_angles, dtype=float))
@@ -574,20 +577,21 @@ def observe(states, ramp_angles, targets, variant):
 def observation_jacobian(ramp_angles, variant):
     """d(observation)/d(state), shaped (environments, features, bodies, 6).
 
-    `observe` is affine in the state -- every channel is a projection onto
-    uphill or normal, a difference of two such, or a component passed
-    straight through, and the only nonlinear thing in it, sin(a), is a
-    constant with respect to Z. So this is a CONSTANT matrix per
-    environment: build it once when the batch is sampled, never again.
+    Constant for a given batch, so build it once and reuse it. That is only
+    valid because `observe` is affine in the state: every channel is either
+    a projection onto uphill or normal, a difference of two of those, or a
+    state component passed through. The one nonlinear-looking channel,
+    sin(a), does not depend on the state at all.
 
-    That matters because the closed-loop policy gradient needs
-    d(action)/d(state) = (d action/d obs)(d obs/d Z) at every step of the
-    backward sweep. The first factor is the network's input gradient and
-    has to be recomputed; the second is this, and does not.
+    The backward sweep needs d(observation)/d(state) at every step to carry
+    the adjoint through the policy. The other half of that chain, the
+    network's own input gradient, has to be recomputed each step. This half
+    does not, which is why it lives on the batch.
 
-    Built by evaluating `observe` on unit states rather than by finite
-    differences -- for an affine map that is exact, not an approximation.
-    `check_task.py` asserts the affinity that makes it legitimate.
+    Built by evaluating `observe` on unit states, not by finite
+    differences. For an affine map, f(e_k) - f(0) is exactly column k, with
+    no step size to choose and no truncation error. `check_task` asserts
+    the affinity this depends on.
     """
     angles = np.atleast_1d(np.asarray(ramp_angles, dtype=float))
     shape = (angles.size, variant.bodies, 6)
@@ -623,48 +627,45 @@ def state_gradient(dJ_dobs, jacobian):
 
 
 def settle(scenes, state, substeps):
-    """Ring the contact spring down before the episode is scored.
+    """Let the bodies bounce to rest before the episode starts. Returns the
+    settled state, as a copy.
 
-    A flush start sits 0.46 mm above the penalty equilibrium and the
-    contact spring is underdamped -- zeta = 0.35 at GRIP's demo constants
-    -- so it overshoots by about a quarter, rings at roughly 50 ms per
-    cycle, and needs about 100 ms to come within 1% of steady state.
-    Scoring through that makes the opening of every episode a disturbance
-    the policy has to learn around for no reason.
+    A body placed flush on the ramp sits 0.46 mm above where the contact
+    spring wants it. The spring is underdamped, so it overshoots by about a
+    quarter, rings with a period near 50 ms, and needs roughly 100 ms to
+    get within 1% of steady state. Scoring an episode through that would
+    make its first tenth of a second a disturbance the policy has to learn
+    around for no reason.
 
-    Zero control throughout, which is what keeps it formulation-agnostic:
-    under an NCP solve the same window settles at once and costs nothing.
-    That is the whole argument for settling rather than starting at the
-    penalty equilibrium, which is a 1.0-specific state and, being tilted,
-    not reachable by a uniform offset anyway.
+    Runs with zero control, which is what keeps it fair to both contact
+    models. Under a rigid solve the same window settles instantly and costs
+    nothing, so both columns start the same way.
 
-    Returns a copy, because `rollout_batch` hands back a view of the
-    simulator's own buffer and this state has to outlive the next rollout.
+    The alternative -- placing bodies at the spring's equilibrium directly
+    -- was rejected. That position is a fact about penalty contact, so it
+    would hand the two columns different starting conditions. It is also
+    not reachable by shifting every body the same distance, because
+    friction tilts the box and loads its two corners unequally.
+
+    The copy matters: `rollout_batch` returns a view of GRIP's internal
+    buffer, and this state has to survive the next rollout.
     """
     controls = np.zeros((SETTLE_STEPS, len(scenes), state.shape[1], 3))
     return np.array(grip.rollout_batch(scenes, state, controls, substeps=substeps)[-1])
 
 
 def placement(box_xi, gaps, variant):
-    """Where each body starts along the ramp, from the box and the approach gaps.
+    """Place every body along the ramp, given where the box goes and how far
+    back each pusher should start.
 
-    Each pusher is set back so its contact vertex sits `gap` short of the
-    box face it will meet. Zero starts them touching; a few centimetres
-    buys an approach and an impact, which is the second thing the task doc
-    wants instrumented and the one thing a standing start cannot show.
+    A gap of zero starts a pusher touching the box. A few centimetres buys
+    an approach and an impact, which a standing start cannot show.
 
-    The reach is read off the vertex list rather than written down, since
-    the 3 degree trim moves it, and it is read from the correct side --
-    the uphill pusher is mirrored, so its contact vertex is at -x.
+    `gaps` broadcasts, so one number puts every pusher at the same standoff
+    on every slope.
 
-    Loops over the PUSHING bodies rather than the actuated ones, which is
-    what makes this total. Under BOX_ONLY the box is the actuated body,
-    there is nothing to set back, and the loop simply does not run -- so
-    callers no longer branch on the body count to avoid placing the box
-    relative to itself.
-
-    `gaps` broadcasts against (..., pushers), so a single number puts every
-    pusher at the same standoff on every slope.
+    Works for BOX_ONLY too: it has no pushing bodies, the loop does not
+    run, and the box is placed where asked.
     """
     bodies = bodies_for(variant)
     pushers = pushing_bodies(variant)
@@ -688,16 +689,17 @@ def placement(box_xi, gaps, variant):
 
 
 def build_batch(ramp_angles, start, offset, gaps, variant):
-    """Scenes, a settled state and a target, assembled into one `Batch`.
+    """Assemble a `Batch`: build the scenes, place the bodies, settle them,
+    and work out the targets.
 
-    The single place a batch is put together, so `fixed_batch` and
-    `sample_batch` differ only in where their numbers come from and cannot
-    drift on the mechanics -- which body count the scenes get, whether the
-    state was settled, or which direction the target offset is measured in.
+    The one place this sequence lives, so `fixed_batch` and `sample_batch`
+    differ only in where their numbers come from. They cannot drift apart
+    on the mechanics -- body count, whether the state was settled, or where
+    the target offset is measured from.
 
-    Offsets are measured from where the box actually ends up after
-    settling, not from where it was placed, since everything creeps a
-    millimetre or two during the window.
+    `offset` is measured from where the box ends up AFTER settling, not
+    where it was placed. Everything creeps a millimetre or two while
+    settling.
     """
     angles = np.atleast_1d(np.asarray(ramp_angles, dtype=float))
     bodies = bodies_for(variant)
@@ -723,24 +725,21 @@ def build_batch(ramp_angles, start, offset, gaps, variant):
 
 
 def fixed_batch(ramp_angles, variant, start=0.0, offset=0.0, gaps=0.0):
-    """A batch with every number stated rather than sampled.
+    """Build a batch from stated numbers rather than sampled ones.
 
-    The deterministic sibling of `sample_batch`, and what the checks use.
-    Each of them wants a specific slope and a specific target so its
-    printed number means the same thing run to run; three of them had
-    grown their own copy of the make-scenes-place-settle-target sequence,
-    which is exactly the code that must not differ between what is checked
-    and what is trained.
+    The deterministic counterpart to `sample_batch`, used by the checks, so
+    that a printed number means the same thing on every run.
     """
     return build_batch(ramp_angles, start, offset, gaps, variant)
 
 
 def sample_batch(rng, n_envs, variant):
-    """One randomized episode setup per environment, already settled.
+    """Build a batch with a random slope, start, target and approach gap for
+    each environment.
 
-    Targets sit a fixed distance to either side of the start, not always
-    uphill. Uphill-only would let a policy score well by learning "push
-    hard uphill" with no representation of the target at all.
+    Targets land on either side of the start, not always uphill. If they
+    were always uphill a policy could score well by learning "push hard
+    uphill" without representing the target at all.
     """
     angles = rng.uniform(*RAMP_ANGLE_RANGE, size=n_envs)
     start = rng.uniform(*START_RANGE, size=n_envs)

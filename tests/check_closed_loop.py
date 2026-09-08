@@ -1,37 +1,30 @@
-"""The policy gradient is not one adjoint_batch call.  Run: python tests/check_closed_loop.py
+"""Why a policy needs one adjoint call per step.  Run: python tests/check_closed_loop.py
 
-`adjoint_batch` returns dJ/dU_t holding the other controls fixed. For a
-control sequence that is exactly the gradient, which is why
-`check_trajopt.py` optimizes cleanly and why the baseline validated
-against finite differences without trouble.
+`adjoint_batch` computes dJ/d(control) holding the other controls fixed.
+For a fixed control sequence that IS the gradient, which is why
+`check_trajopt.py` optimizes cleanly with one call per episode.
 
-A policy is different. U_t is pi(Z_t), and Z_t depends on every earlier
-control, so perturbing the parameters moves U_0, which moves Z_1, which
-moves a_1 *again* through the policy. Contracting dJ_dU with the direct
-dpi/dparam picks up only the first of those paths.
+A policy is different. Its action is computed from the state, and the
+state depends on every earlier action, so nudging the weights moves the
+first action, which moves the next state, which moves the next action
+again through the policy. One call sees only the first of those paths.
 
-The task doc described SHAC as one call per window seeded at every step,
-reading back dJ_dU. Measured here against a one-parameter feedback law,
-that recipe comes out **more than double** the true gradient -- not a
-small bias, and there is no reason its sign is reliable either.
+Measured here against a one-parameter feedback law, whose gradient can be
+worked out by hand and checked against finite differences: one call per
+window is 11% off at one gain and 119% off at another. The error depends
+on the state, so a learning rate cannot absorb it.
 
-What works is a per-step backward sweep. Each step's adjoint call returns
-both pieces needed: dJ_dU_t, which contracts against dpi/dparam, and
-dJ_dZ0, which carries the adjoint back one step. Between calls the sweep
-adds the path the single call cannot see, Z_t -> a_t -> Z_{t+1}. Total
-adjoint work is unchanged -- W calls of `substeps` each, rather than one
-call of W*substeps -- so this costs Python round trips, not simulation.
+The per-step sweep is exact to 0.0002%. It costs the same simulation --
+W calls of `substeps` each instead of one call of W*substeps -- so the
+price is Python round trips, not physics.
 
 None of this is something to ask GRIP for. A state-dependent control is a
-policy, and policies belong on this side of the split; GRIP's contract
-that controls are exogenous is right.
+policy, and policies belong on this side of the split.
 
-The sweep has since moved to `policy.policy_gradient` -- not `task.py` as
-this file originally said, because it needs torch and keeping `task.py`
-torch-free is worth more. What is left here is a second implementation of
-it, against a hand-differentiated one-parameter feedback law rather than a
-network. That is a cross-check while it lasts, and a copy that can drift;
-`check_policy_gradient.py` is what tests the shipped sweep.
+The sweep itself lives in `policy.policy_gradient`. What is here is a
+second implementation of it against a hand-differentiated feedback law,
+which is a cross-check but also a copy that can drift.
+`check_policy_gradient.py` is what tests the shipped one.
 """
 
 import numpy as np

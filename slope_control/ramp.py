@@ -1,24 +1,27 @@
-"""The ramp scene, shared by every experiment here.
+"""The world: a tilted surface, the bodies on it, and the closed-form physics.
 
-Geometry conventions, fixed once so nothing downstream has to rederive
-them:
+Geometry conventions, fixed here so nothing downstream rederives them:
 
-    uphill  = ( cos a,  sin a)   the direction of increasing height
-    normal  = (-sin a,  cos a)   into free space, perpendicular to uphill
+    uphill  = ( cos a,  sin a)   direction of increasing height
+    normal  = (-sin a,  cos a)   away from the surface, perpendicular
     offset  = 0                  the ramp passes through the origin
 
-At a = 0 the normal is (0, 1) and this reduces to flat ground, which is a
-cheap check that the signs are right. Gravity (0, -g) projected onto
-uphill gives -g*sin(a), so it pulls downhill as it should.
+At a = 0 the normal is (0, 1) and everything reduces to flat ground. That
+is the cheap test that the signs are right; keep it working. Gravity
+(0, -g) dotted with uphill gives -g*sin(a), so it pulls downhill.
 
-Position along the ramp is written `xi` throughout -- a single coordinate
-is enough because a box resting on the surface has only one degree of
-freedom that any task here cares about.
+`xi` means position along the ramp. One coordinate is enough, because a
+body resting on the surface has only one degree of freedom any task here
+cares about.
 
-The slope is per environment. Every function below takes either a scalar
-`ramp_angle` or an array of `ramp_angles`, one per environment, because
-the task randomizes the slope across a batch and a single shared angle
-would be a quiet way to get that wrong.
+Every function takes either one angle or one angle per environment,
+because the task randomizes the slope across a batch. A single shared
+angle would be a quiet way to get that wrong.
+
+The closed forms at the bottom -- `creep_rate`, `hold_force`,
+`break_free_force`, `normal_load` -- are what the measurements are checked
+against. They describe rigid Coulomb friction, so where penalty contact
+disagrees with them, the difference is the modelling error.
 """
 
 import math
@@ -93,12 +96,17 @@ def square_vertices(side):
 
 
 def polygon_properties(vertices):
-    """Area, centroid and second moment about the centroid, for a CCW polygon.
+    """Area, centroid, and polar second moment about that centroid, for a
+    counterclockwise polygon.
 
-    Needed because the pusher is not a rectangle and its centroid is not
-    where the rectangle's centre would be. GRIP takes `BodyShape` vertices
-    in a frame centred on the centre of mass, so an un-recentred list puts
-    a standing torque offset into every contact the body makes.
+    The area comes back signed, so a negative value means the winding is
+    clockwise.
+
+    Needed because the pusher is a trapezoid, not a rectangle, so its
+    centroid is not where you would guess. GRIP expects `BodyShape`
+    vertices measured from the centre of mass, and a list that is not
+    recentred puts a permanent torque offset into every contact that body
+    makes.
     """
     v = np.asarray(vertices, dtype=float)
     x, y = v[:, 0], v[:, 1]
@@ -259,27 +267,25 @@ def make_scenes(ramp_angles, bodies=None, dt=DEFAULT_TIMESTEP, penalty=None):
 
 
 def resting_state(xi, ramp_angles, bodies=None):
-    """Bodies sitting flush on their ramps, shaped (environments, bodies, 6).
+    """Put bodies flush on their ramps. Returns (environments, bodies, 6).
 
-    Flush means the bottom face is parallel to the surface, so the body
-    angle is the ramp angle and the centre of mass sits `resting_offset`
-    out along the normal -- how far the shape extends below its own
-    centroid, which is NOT half its height once the centroid has moved.
-    The box's 150.000 mm is half its side; the pusher's 75.332 mm is not
-    half of 150, because the 3 degree face trim shifts the centroid. The
-    resulting gap is exactly zero either way.
+    Flush means the bottom face lies parallel to the surface, touching it
+    exactly, with no velocity. So each body's angle is its ramp angle, and
+    its centre of mass sits `resting_offset` out along the normal.
 
-    Deliberately *not* the penalty equilibrium, for two reasons. It is
-    unreachable by a uniform offset, because friction's moment arm tilts
-    the box and loads the downhill corner harder than the uphill one, so
-    the two corners settle to different depths. And it is a
-    penalty-contact fact, so starting there would hand 1.0 and 2.0
-    different initial conditions and quietly spoil the comparison they
-    exist for. Start flush and let `task.settle` ring it down instead.
+    That offset is how far the shape extends below its own centroid, which
+    is not half its height once the centroid has moved. The box sits at
+    150.000 mm, half its side. The pusher sits at 75.332 mm, which is not
+    half of 150, because the tilted face shifts its centroid.
 
-    `xi` gives each body's position along the ramp and broadcasts against
-    (environments, bodies), so a scalar places everything at the same point
-    on every slope.
+    `xi` is each body's position along the ramp. It broadcasts against
+    (environments, bodies), so one number places everything at the same
+    point on every slope.
+
+    Flush is not where penalty contact wants the body -- that is about half
+    a millimetre lower. Starting there instead was rejected: it is a fact
+    about penalty contact, so it would give the two columns different
+    initial conditions. Start flush and let `task.settle` handle it.
     """
     bodies = BOX_ONLY_BODIES if bodies is None else bodies
     angles = np.atleast_1d(np.asarray(ramp_angles, dtype=float))
@@ -328,77 +334,85 @@ def along_ramp(states, ramp_angles):
 
 
 def creep_rate(ramp_angle=DEFAULT_RAMP_ANGLE, penalty=None, mass=BOX_MASS):
-    """The drift penalty contact cannot avoid: mg*sin(a) / (2*b_slip).
+    """How fast a box slides on a slope it should be resting on.
 
-    Sticking under a penalty law is not s = 0 but s = -beta/b_slip, so a
-    held box must slide at exactly the rate that generates the friction
-    holding it up.
+        rate = m * g * sin(a) / (2 * b_slip)     metres per second
 
-    The 2 is the number of contact points. A box resting on a face
-    contacts at both bottom corners, each carrying its own friction, so
-    the pair together supply 2*b_slip*s and each has to creep only half as
-    fast as a single contact would. Measured exactly, to five figures,
-    from 5 to 18 degrees.
+    Penalty contact cannot avoid this. Its friction law is
+    beta = -b_slip * slip, so friction only exists when something is
+    sliding. A box held up by friction must therefore be sliding at exactly
+    the speed that generates the friction holding it up. Rigid physics says
+    the box does not move at all below the friction angle, so this whole
+    quantity is the modelling error.
 
-    Above roughly 19 degrees this UNDERESTIMATES, by 13% at 20 and 48% at
-    26. Friction acts at the contact points, 0.15 m below the centre of
-    mass, so it tips the box by about a milliradian; the tilt redistributes
-    normal force between the corners by k*w*dtheta, and the lightly loaded
-    uphill corner saturates on its own cone bound mu*lambda. The downhill
-    corner then has to make up the shortfall, and creeps faster than an
-    even split would. Both corners saturating is the friction angle
-    itself, where the box slides freely and none of this applies.
+    The 2 is the number of contact points. A box resting on its face
+    touches at both bottom corners, and each carries its own friction, so
+    the pair together supply twice as much and each need creep only half as
+    fast.
 
-    So: exact while both corners stick, a lower bound once one does not.
+    Exact to five figures from 5 to 18 degrees. Above about 19 degrees it
+    UNDERESTIMATES -- 13% low at 20 degrees, 48% at 26. Friction acts at
+    the corners, 0.15 m below the centre of mass, so it tilts the box by
+    around a milliradian. The tilt shifts normal load off the uphill
+    corner, which then hits its own friction limit and cannot carry its
+    half. The downhill corner makes up the difference and creeps faster.
+
+    So: exact while both corners grip, a lower bound once one does not.
     """
     penalty = DEFAULT_PENALTY if penalty is None else penalty
     return mass * GRAVITY * np.sin(ramp_angle) / (2.0 * penalty["slip_damping"])
 
 
 def hold_force(ramp_angle=DEFAULT_RAMP_ANGLE, mass=BOX_MASS):
-    """What a controller must supply to hold a box perfectly still: mg*sin(a).
+    """Force needed to hold a body perfectly still on the slope.
 
-    Under penalty contact friction is beta = -b_slip*s, so zero slip is
-    zero friction. A motionless box gets no help at all from the surface
-    and the controller pays the entire gravity component for as long as
-    it holds. Rigid friction does the same job for free on any slope
-    below the friction angle.
+        force = m * g * sin(a)     newtons
 
-    This is what the reward's control term is pricing, and it is a floor
-    rather than a tuning artifact: no feedback law beats it, because the
-    mechanism that would let it stop pushing is the one penalty contact
-    removes.
+    Under penalty contact, friction only appears when something slides, so
+    a body that is not moving gets no help at all from the surface. The
+    controller pays the whole gravity component for as long as it holds.
+    Rigid friction does the same job for free on any slope below the
+    friction angle.
+
+    This is a floor, not a tuning artifact. No feedback law beats it,
+    because the mechanism that would let a controller stop pushing is the
+    one penalty contact removes. It is what the reward's control term
+    prices.
     """
     return mass * GRAVITY * np.sin(ramp_angle)
 
 
 def break_free_force(ramp_angle=DEFAULT_RAMP_ANGLE, penalty=None, mass=BOX_MASS):
-    """What it takes to actually move the box uphill: mg(sin a + mu*cos a).
+    """Force needed to actually slide a body uphill.
 
-    Holding and moving are different problems and the gap between them is
-    the whole friction cone. `hold_force` only cancels gravity, leaving the
-    box stationary; to slide it uphill you must also overrun friction at
-    its bound mu*lambda, and lambda is the full normal load mg*cos(a).
+        force = m * g * (sin(a) + mu * cos(a))     newtons
 
-    Measured exact at 15, 20 and 22 degrees: below this the box does not
-    move at all -- what looks like motion is arrested creep, a couple of
-    centimetres over a whole episode -- and a newton above it the box
-    accelerates away. Coulomb friction has no gentle regime, which is what
-    makes this a real control problem rather than a set-and-forget one.
+    Holding and moving are different problems, and the gap between them is
+    the width of the friction cone. `hold_force` only cancels gravity,
+    which leaves the body stationary. To move it you must also beat
+    friction, which pushes back with up to mu times the normal load.
 
-    An earlier force limit was sized against `hold_force` alone and came
-    out at 5 N, below this threshold at every sampled slope, so the task
-    was literally unsolvable until `check_trajopt.py` said so.
+    Size an action limit against THIS, not against `hold_force`. A limit
+    that can hold a box cannot necessarily move one, and a task posed that
+    way is unsolvable while every gradient check still passes.
+
+    Measured exact at 15, 20 and 22 degrees. A newton below it the body
+    does not move -- what looks like motion is creep, a couple of
+    centimetres over a whole episode. A newton above it the body
+    accelerates away. Coulomb friction has no gentle regime in between,
+    which is what makes this a real control problem.
     """
     penalty = DEFAULT_PENALTY if penalty is None else penalty
     return mass * GRAVITY * (np.sin(ramp_angle) + penalty["friction"] * np.cos(ramp_angle))
 
 
 def normal_load(ramp_angle=DEFAULT_RAMP_ANGLE, mass=BOX_MASS):
-    """mg*cos(a), the force pinning the box to the ramp.
+    """Force pressing a body into the ramp.
 
-    An outward push at or above this unloads the contact entirely and the
-    body leaves the surface, which is the one thing the action limit
-    exists to prevent.
+        force = m * g * cos(a)     newtons
+
+    Push outward this hard and the contact carries no load at all, so the
+    body leaves the surface. The normal component of the action limit has
+    to stay below this.
     """
     return mass * GRAVITY * np.cos(ramp_angle)

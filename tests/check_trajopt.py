@@ -1,46 +1,30 @@
-"""Baseline: can gradient descent actually solve the task?  Run: python tests/check_trajopt.py
+"""Can gradient descent actually solve this task?  Run: python tests/check_trajopt.py
 
-This replaces the MPPI step. MPPI's job in the plan was to remove an
-ambiguity -- if SHAC struggles, is it the gradients or the task? -- but
-being zeroth order it never calls the adjoint, so it can only ever answer
-half of that. `check_task.py` already answered the other half by finite
-difference. What is left open is narrower, and this closes it:
+Adam on the raw control sequence, with no policy, no critic and no
+training loop. Two questions that a gradient check cannot answer:
 
-  * Does the reward produce sensible *behaviour*? Correct gradients say
-    nothing about whether the thing they optimize is worth optimizing.
-  * Are the gradients *navigable*? A finite-difference check proves
-    correctness at a point. It says nothing about whether 8000 integration
-    steps of stiff contact leave a landscape a descent method can cross.
+  Does the reward produce sensible behaviour? A correct gradient says
+  nothing about whether the thing it optimizes is worth optimizing.
 
-Direct trajectory optimization answers both with no policy, no critic and
-no training loop -- Adam on the raw control sequence, which has one real
-hyperparameter. If this converges, SHAC's 32-step windows are a far
-easier gradient problem than the full 400-step episode solved here.
+  Are the gradients navigable? A finite-difference check proves
+  correctness at one point. It says nothing about whether 8000 integration
+  steps of stiff contact leave a landscape a descent method can cross.
 
-Run for both variants. The box-only case is the reward's own de-risking;
-the two-pusher case is the manipulation task, where the box is unactuated
-and every newton reaching it has to cross a body-body contact. Solving
-that here is what says the task is worth training on at all.
+If this converges, SHAC's 32-step windows are a far easier gradient
+problem than the full 400-step episode solved here.
 
-The one thing this turned up that nothing else would have: **gradients
-cannot discover a contact that does not exist.** With the task objective
-alone the two-pusher case does not converge slowly, it does not move at
-all -- the driving pusher's action sits at exactly 0.00 N for every
-iteration, because with no contact d(box position)/d(pusher action) is
-identically zero.
+Runs both variants. Box-only checks the reward against a single contact
+set. Two pushers is the real task, where the box is unactuated and every
+newton reaching it crosses a body-body contact. Solving that is what says
+the task is worth training on.
 
-The fix is the shaping term in `task.approach_penalty`, and this check is
-what holds it honest: optimization runs with `shaping=True`, and every
-number reported is the UNSHAPED task reward. A shaping term that only
-looked good on its own objective would show up here as a good shaped
-score and a bad task score.
+This is also where the shaping term is held honest. Optimization runs with
+`shaping=True`, but every number printed is the reward WITHOUT shaping. A
+shaping term that only looked good on its own objective would show up here
+as a good shaped score and a bad task score.
 
-Not an artifact and not an experiment: no figure, and it produces no
-number that means anything without GRIP 2.0 to compare against.
-
-Takes about seven minutes -- 800 Adam iterations over two variants, each
-a full 400-step episode across three slopes. Lower ITERATIONS if you only
-want the shape of the answer; the errors roughly triple at 300.
+Takes about seven minutes: 800 Adam iterations, two variants, three slopes
+each. Lower ITERATIONS for a rough answer; errors roughly triple at 300.
 """
 
 import numpy as np
