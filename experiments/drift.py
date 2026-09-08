@@ -23,7 +23,6 @@ Run:  python experiments/drift.py
 import argparse
 import math
 import pathlib
-import sys
 
 import matplotlib
 import numpy as np
@@ -31,10 +30,8 @@ import numpy as np
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402  (backend must be set first)
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
-
-import grip  # noqa: E402
-from slope_control import ramp  # noqa: E402
+import grip
+from slope_control import ramp
 
 CONTROL_HZ = 100.0
 DURATION = 5.0

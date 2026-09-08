@@ -24,21 +24,20 @@ call of W*substeps -- so this costs Python round trips, not simulation.
 
 None of this is something to ask GRIP for. A state-dependent control is a
 policy, and policies belong on this side of the split; GRIP's contract
-that controls are exogenous is right. The sweep is assembled here, and it
-should move into `slope_control/task.py` when SHAC becomes its second
-consumer.
-"""
+that controls are exogenous is right.
 
-import math
-import pathlib
-import sys
+The sweep has since moved to `policy.policy_gradient` -- not `task.py` as
+this file originally said, because it needs torch and keeping `task.py`
+torch-free is worth more. What is left here is a second implementation of
+it, against a hand-differentiated one-parameter feedback law rather than a
+network. That is a cross-check while it lasts, and a copy that can drift;
+`check_policy_gradient.py` is what tests the shipped sweep.
+"""
 
 import numpy as np
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
-
-import grip  # noqa: E402
-from slope_control import ramp, task  # noqa: E402
+import grip
+from slope_control import ramp, task
 
 STEPS = 200
 TARGET_OFFSET = 0.3
@@ -54,7 +53,7 @@ def rollout_closed_loop(scenes, state, angles, targets, gain, substeps, steps=ST
     states, controls, errors = [state], [], []
     for _ in range(steps):
         error = ramp.along_ramp(state, angles)[:, 0] - targets
-        wrench = task.to_wrench(np.stack([-gain * error, np.zeros_like(error)], axis=-1)[:, None, :], angles)
+        wrench = task.to_wrench(np.stack([-gain * error, np.zeros_like(error)], axis=-1)[:, None, :], angles, task.BOX_ONLY)
 
         errors.append(error)
         controls.append(wrench)
@@ -67,7 +66,7 @@ def rollout_closed_loop(scenes, state, angles, targets, gain, substeps, steps=ST
 def one_call_gradient(scenes, trajectory, controls, angles, dl_dZ, dl_dU, dpi_dgain, substeps):
     """The task doc's recipe: one sweep, contracted with the direct dpi/dK."""
     _, dJ_dU = grip.adjoint_batch(scenes, trajectory, controls, substeps, dl_dZ, dl_dU)
-    return (task.to_action_gradient(dJ_dU, angles)[..., 0, 0] * dpi_dgain).sum()
+    return (task.to_action_gradient(dJ_dU, angles, task.BOX_ONLY)[..., 0, 0] * dpi_dgain).sum()
 
 
 def per_step_gradient(scenes, trajectory, controls, angles, dl_dZ, dl_dU, dpi_dgain, gain, substeps):
@@ -79,7 +78,7 @@ def per_step_gradient(scenes, trajectory, controls, angles, dl_dZ, dl_dU, dpi_dg
         seed[1] = adjoint
         dJ_dZ0, dJ_dU = grip.adjoint_batch(scenes, trajectory[t:t + 2], controls[t:t + 1], substeps, seed, dl_dU[t:t + 1])
 
-        action_gradient = task.to_action_gradient(dJ_dU, angles)[0, :, 0, 0]
+        action_gradient = task.to_action_gradient(dJ_dU, angles, task.BOX_ONLY)[0, :, 0, 0]
         total += (action_gradient * dpi_dgain[t]).sum()
 
         # The path a single call cannot see: the state feeds the policy,
@@ -108,7 +107,7 @@ def check(gain):
     replay = np.array(grip.rollout_batch(scenes, state, controls, substeps=substeps))
     assert np.abs(replay - trajectory).max() < 1e-12, "closed-loop and open-loop rollouts disagree"
 
-    dl_dZ, dl_dU = task.reward_seeds(trajectory, controls, angles, targets)
+    dl_dZ, dl_dU = task.reward_seeds(trajectory, controls, angles, targets, task.BOX_ONLY)
     dpi_dgain = -errors  # d/dK of -K*(xi - xi*), at fixed state
 
     one_call = one_call_gradient(scenes, trajectory, controls, angles, dl_dZ, dl_dU, dpi_dgain, substeps)
@@ -116,7 +115,7 @@ def check(gain):
 
     def objective(k):
         rolled, held, _ = rollout_closed_loop(scenes, state, angles, targets, k, substeps)
-        return task.reward(rolled, held, angles, targets).sum()
+        return task.reward(rolled, held, angles, targets, task.BOX_ONLY).sum()
 
     h = 1e-3
     truth = (objective(gain + h) - objective(gain - h)) / (2.0 * h)

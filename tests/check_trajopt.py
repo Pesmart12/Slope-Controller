@@ -43,16 +43,10 @@ a full 400-step episode across three slopes. Lower ITERATIONS if you only
 want the shape of the answer; the errors roughly triple at 300.
 """
 
-import math
-import pathlib
-import sys
-
 import numpy as np
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
-
-import grip  # noqa: E402
-from slope_control import ramp, task  # noqa: E402
+import grip
+from slope_control import ramp, task
 
 ITERATIONS = 800
 # Adam steps are about `learning_rate` per iteration whatever the gradient
@@ -76,7 +70,7 @@ def setup(variant, degrees):
     substeps = task.substeps_for(scenes[0])
 
     start = np.zeros(len(degrees))
-    positions = start[:, None] if variant.bodies == 1 else task.placement(start, np.full((len(degrees), len(variant.actuated)), APPROACH_GAP), variant)
+    positions = task.placement(start, APPROACH_GAP, variant)
     state = task.settle(scenes, ramp.resting_state(positions, angles, bodies=bodies), substeps)
     return scenes, angles, substeps, state, ramp.along_ramp(state, angles)[:, variant.box] + TARGET_OFFSET
 

@@ -18,15 +18,11 @@ The two that matter most:
 """
 
 import math
-import pathlib
-import sys
 
 import numpy as np
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
-
-import grip  # noqa: E402
-from slope_control import ramp, task  # noqa: E402
+import grip
+from slope_control import ramp, task
 
 
 def corner_depths(state, ramp_angles, side=ramp.BOX_SIDE):
@@ -54,7 +50,7 @@ def check_flat_ground():
     state = ramp.resting_state([0.7], [0.0])
     assert np.allclose(ramp.along_ramp(state, [0.0]), [[0.7]])
     assert np.allclose(state[0, 0, 1], 0.5 * ramp.BOX_SIDE)
-    assert np.allclose(task.to_wrench(np.array([[[1.3, -0.4]]]), [0.0])[0, 0], [1.3, -0.4, 0.0])
+    assert np.allclose(task.to_wrench(np.array([[[1.3, -0.4]]]), [0.0], task.BOX_ONLY)[0, 0], [1.3, -0.4, 0.0])
 
     # And the physical version: on flat ground there is nothing to creep towards.
     scene = ramp.make_scene(ramp_angle=0.0)
@@ -244,7 +240,7 @@ def probe_adjoint(variant):
     substeps = task.substeps_for(scenes[0])
 
     start = np.array([0.1, 0.3])
-    positions = start[:, None] if variant.bodies == 1 else task.placement(start, np.zeros((n_envs, len(variant.actuated))), variant)
+    positions = task.placement(start, 0.0, variant)
     state = task.settle(scenes, ramp.resting_state(positions, angles, bodies=bodies), substeps)
     targets = ramp.along_ramp(state, angles)[:, variant.box] + np.array([0.5, -0.5])
     # Well inside the limit, so the clip is not what is under test here.
@@ -278,7 +274,7 @@ def check_observation():
     angles = np.array([0.0, math.radians(20.0)])
     state = ramp.resting_state([0.4, 0.4], angles)
     targets = np.array([1.0, 1.0])
-    observation = task.observe(state, angles, targets)
+    observation = task.observe(state, angles, targets, task.BOX_ONLY)
     assert observation.shape == (2, 7), observation.shape
 
     flat = observation[0]
@@ -322,7 +318,7 @@ def check_action_limit():
     assert tangential > break_free, "the box cannot be moved at all"
     assert perpendicular < load, "an outward push could peel the box off the ramp"
 
-    assert np.allclose(task.to_wrench(np.array([[[99.0, -99.0]]]), [0.0])[0, 0], [tangential, -perpendicular, 0.0])
+    assert np.allclose(task.to_wrench(np.array([[[99.0, -99.0]]]), [0.0], task.BOX_ONLY)[0, 0], [tangential, -perpendicular, 0.0])
 
     angles = np.array([math.radians(20.0)])
     scenes = ramp.make_scenes(angles)
@@ -330,13 +326,13 @@ def check_action_limit():
     state = task.settle(scenes, ramp.resting_state(0.0, angles), substeps)
 
     # Push straight out as hard as allowed: the box must stay in contact.
-    lifting = task.to_wrench(np.tile([0.0, perpendicular], (100, 1, 1, 1)), angles)
+    lifting = task.to_wrench(np.tile([0.0, perpendicular], (100, 1, 1, 1)), angles, task.BOX_ONLY)
     gap = max(corner_depths(np.array(grip.rollout_batch(scenes, state, lifting, substeps=substeps)[-1]), angles))
     assert gap[0] < 0.0, "the box left the surface"
 
     # Push along the ramp as hard as allowed: the box must actually go
     # somewhere, and must not tip while doing it.
-    driving = task.to_wrench(np.tile([tangential, 0.0], (task.EPISODE_STEPS, 1, 1, 1)), angles)
+    driving = task.to_wrench(np.tile([tangential, 0.0], (task.EPISODE_STEPS, 1, 1, 1)), angles, task.BOX_ONLY)
     trajectory = np.array(grip.rollout_batch(scenes, state, driving, substeps=substeps))
     moved = ramp.along_ramp(trajectory, angles)[-1, 0, 0] - ramp.along_ramp(state, angles)[0, 0]
     tilt = np.abs(trajectory[:, 0, 0, 2] - angles[0]).max()
@@ -348,7 +344,7 @@ def check_action_limit():
 def check_batch():
     """A sampled batch has to be internally consistent."""
     rng = np.random.default_rng(7)
-    scenes, angles, state, targets = task.sample_batch(rng, 6)
+    scenes, angles, state, targets = task.sample_batch(rng, 6, task.BOX_ONLY)
     assert len(scenes) == 6 and state.shape == (6, 1, 6) and targets.shape == (6,)
     assert np.allclose([ramp.scene_angle(s) for s in scenes], angles)
     assert (angles >= task.RAMP_ANGLE_RANGE[0]).all() and (angles <= task.RAMP_ANGLE_RANGE[1]).all()

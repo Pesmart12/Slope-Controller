@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "slope-control"
+version = "0.1.0"
+description = "Control and reinforcement learning on GRIP's differentiable contact simulator"
+requires-python = ">=3.10"
+
+# GRIP is deliberately NOT listed. It is not on PyPI -- the name there
+# belongs to an unrelated README renderer, so resolving it would install
+# the wrong thing silently. It is a local editable install built behind
+# vcvars; see the README's Setup section.
+dependencies = ["numpy", "matplotlib", "torch"]
+
+[tool.setuptools]
+packages = ["slope_control"]

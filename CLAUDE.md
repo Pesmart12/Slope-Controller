@@ -64,7 +64,7 @@ would produce something worse, say so.
 
 ## What exists
 
-Six source files. The repository is small and should stay legible.
+Eight source files. The repository is small and should stay legible.
 
 | | |
 |---|---|
@@ -78,11 +78,37 @@ Six source files. The repository is small and should stay legible.
 | `tests/check_closed_loop.py` | why SHAC needs a per-step adjoint sweep and not one call per window |
 | `tests/check_policy_gradient.py` | the same statement for a real network — `dJ/d(theta)` against central differences |
 | `docs/ramp_manipulation_task.md` | the task definition; the authority on scene numbers, reward and episode structure |
+| `pyproject.toml` | the editable install, so nothing reaches the package by patching `sys.path` |
 
 `slope_control/task.py` carries two variants, `BOX_ONLY` and `TWO_PUSHERS`,
 which differ in body count, which body is scored, which are actuated, and
 the force limits. Everything else — reward, seeds, observation frame,
 settle — is shared, and every check runs both.
+
+**`BOX_ONLY` is scheduled for deletion, and this is the decision record so
+it does not become permanent by nobody remembering.** It is physically
+fictional by its own docstring — nothing reaches into a box and pushes
+from its centre — and it is the sole reason `Variant` exists at all.
+Remove it and `bodies`, `box`, `actuated`, `limit`, `scale` and `weights`
+all become module constants, `bodies_for` disappears, and `pushing_bodies`
+becomes `[0, 2]`.
+
+It stays **through SHAC bring-up only**. Its remaining value is as a
+strictly easier version of the same problem — same reward, same
+observation frame, same gradient path, no body-body contact — so if SHAC
+does not learn on two pushers, "does it learn on box-only?" separates a
+policy bug from a contact bug at no cost. **Delete it once step 5 lands.**
+
+Two things need rework when it goes, and both would move recorded numbers:
+`tests/check_closed_loop.py` is entirely box-only, so the 119% figure cited
+here and in the task doc would have to be re-derived against pushers; and
+`check_trajopt.report_creep_band` reads the settled force straight off the
+action array, which only works when the action *is* the force.
+
+Nothing takes a default variant. Every task function requires it
+explicitly, so a caller that forgets cannot silently get the fictional
+task — which is what the defaults used to do, `BOX_ONLY` everywhere
+except `placement`.
 
 The one **result** so far, reproducible by `python experiments/drift.py`:
 
@@ -231,9 +257,11 @@ Real, and each one will bite in a specific place:
   environment axis at −3. With one angle per environment there is no way to
   infer which axis is which, so passing `trajectory[:, 0, 0, :]` raises
   instead of quietly projecting onto the wrong thing.
-- **No `pyproject.toml`.** `experiments/drift.py` and `tests/check_task.py`
-  both reach the package via `sys.path.insert`. That is now two scripts;
-  worth fixing before there are five.
+- **The package is an editable install**, `pip install -e . --no-deps`
+  into the conda environment. It replaced five copies of a
+  `sys.path.insert` preamble. A fresh clone that skips it gets an
+  `ImportError` from every script; the README's Setup section has the
+  command.
 - **An editable install of GRIP does not rebuild on C++ changes.** Reinstall
   after touching its `src/`. This has already cost time once.
 - **The toolchain lives behind `vcvars`.** The import incantation is in the

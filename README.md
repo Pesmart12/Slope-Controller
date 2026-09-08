@@ -106,6 +106,14 @@ pip install -e ..\GRIP
 An editable install of GRIP does **not** rebuild on C++ changes — reinstall
 after touching its `src/`.
 
+Then this package, so `slope_control` imports from anywhere rather than
+only from the repository root. `--no-deps` because numpy, matplotlib and
+torch already came from conda and pip should not pull wheels over them:
+
+```powershell
+pip install -e . --no-deps
+```
+
 **Activate the environment; do not call its `python.exe` by path.** Conda
 puts its own DLLs on `PATH` at activation, and matplotlib's PNG writer
 delay-loads one of them. Without activation `savefig` dies with
@@ -117,9 +125,10 @@ too and is the safer form in scripts.
 ## Layout
 
 ```
-slope_control/   the ramp scene, shared by every experiment
+slope_control/   the scene, the task and the policy
 experiments/     one script per artifact, each runnable on its own
 figures/         their output, committed so the results are visible here
+tests/           the checks the build order rests on
 docs/            task definition and experiment design
 ```
 

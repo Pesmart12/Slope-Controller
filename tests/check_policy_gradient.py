@@ -23,15 +23,10 @@ of the objective, but the check has to differentiate exactly the quantity
 it perturbs, and the windowed reward is that quantity.
 """
 
-import pathlib
-import sys
-
 import numpy as np
 import torch
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
-
-from slope_control import policy, ramp, task  # noqa: E402
+from slope_control import policy, task
 
 WINDOW = 24
 PROBES = 12
