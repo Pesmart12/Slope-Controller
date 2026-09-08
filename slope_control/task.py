@@ -33,6 +33,41 @@ the task objective, it is what gets reported, and it is the same in both
 the penalty and the NCP column. A third term, `approach_penalty`, is
 reward shaping -- off unless asked for, added only when training, never
 included in a reported number.
+
+Notation
+--------
+Two symbols, taken from GRIP's `docs/derivations/notation.md`, which is
+canonical for anything the two repositories share:
+
+    l       one step's reward. GRIP calls this slot the stage cost.
+            Written `ell` there, ASCII `l` here.
+    J       the whole objective being differentiated: the sum of `l` over
+            a window, plus the critic's estimate of what follows it.
+
+The distinction is partial against total, and it is the reason both exist:
+
+    dl_dZ, dl_dU     PARTIAL derivatives of one step's reward. These go
+                     INTO `adjoint_batch` as seeds. `reward_seeds` makes
+                     them.
+    dJ_dZ0, dJ_dU    TOTAL derivatives of the objective. These come OUT
+                     of `adjoint_batch`. Converting the first into the
+                     second is the entire job of the adjoint.
+
+There is no separate `r`. If a comment needs the per-step quantity, it is
+`l` or the English word "reward".
+
+**`l` holds a reward, not a cost, so everything here MAXIMIZES.** That is
+a deviation worth stating rather than leaving to be discovered. Optimal
+control conventionally calls `ell` a stage cost and minimizes it. This
+reward is negative-definite instead, and `check_trajopt` ascends it:
+
+    actions += learning_rate * ...
+
+Consistent throughout, so no arithmetic is wrong. But anyone reading
+`dl_dZ` with the usual convention in mind will expect the opposite sign,
+which is a trap in the most gradient-sensitive code here. If a future
+change makes something a genuine cost, flip it everywhere at once and say
+so, rather than letting the two conventions coexist.
 """
 
 import math
@@ -301,8 +336,11 @@ def separations(states, ramp_angles, variant):
 def reward(states, controls, ramp_angles, targets, variant, weights=None, shaping=False):
     """Score each step. Returns (steps, environments).
 
-        r = -w_pos * ((box position - target) / side)^2
+        l = -w_pos * ((box position - target) / side)^2
             -w_ctrl * (total force)^2 / scale^2
+
+    `l` is one step's reward, the stage-cost slot in GRIP's notation. It
+    is negative, and it is MAXIMIZED. See the module docstring.
 
     Control u_t is scored against the state it produces, Z_{t+1}. Nothing
     reaches Z_0, so it is left out and the result has one fewer entry than
@@ -410,9 +448,14 @@ def approach_penalty(states, ramp_angles, variant, weights=None):
 def reward_seeds(states, controls, ramp_angles, targets, variant, weights=None, shaping=False):
     """Differentiate `reward`, giving the two seed arrays `adjoint_batch` wants.
 
-    Returns dr/d(state) and dr/d(control), each shaped like what it
-    differentiates against. These are partial derivatives of one step's
-    reward only. GRIP turns them into total derivatives.
+    Returns dl/d(state) and dl/d(control) -- the arrays the code calls
+    `dl_dZ` and `dl_dU` -- each shaped like what it differentiates
+    against.
+
+    These are PARTIAL derivatives of one step's reward. `adjoint_batch`
+    takes them as seeds and returns total derivatives of the whole
+    objective. That partial-against-total split is what `l` and `J` mean
+    here; the module docstring has the table.
 
     Kept next to `reward` on purpose. The two must agree term for term, and
     a seed that disagrees raises nothing -- it just trains for a different
@@ -422,12 +465,12 @@ def reward_seeds(states, controls, ramp_angles, targets, variant, weights=None, 
     Unshaped, the state enters only through the box's position along the
     ramp, xi = position . uphill:
 
-        dr/d(box x, y) = -2 * w_pos * (xi - target) / side^2 * uphill
+        dl/d(box x, y) = -2 * w_pos * (xi - target) / side^2 * uphill
 
     Everything else is zero. The task objective does not see orientation,
     velocity, or where the pushers are. For each actuated body:
 
-        dr/d(force) = -2 * w_ctrl * force / scale^2
+        dl/d(force) = -2 * w_ctrl * force / scale^2
 
     with the torque entry zero, since no action writes one.
 

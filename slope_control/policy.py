@@ -325,8 +325,9 @@ def policy_gradient(batch, window, actor, critic=None, shaping=True):
     """
     trajectory, wrenches = window.states, window.wrenches
 
-    # Partials of the stage cost only -- dr/dZ_t and dr/dU_t at each step,
-    # holding everything else fixed. GRIP turns them into total derivatives.
+    # Partials of one step's reward -- dl/dZ_t and dl/dU_t, holding
+    # everything else fixed. `adjoint_batch` turns them into total
+    # derivatives of the objective, which is the l-to-J step.
     dl_dZ, dl_dU = task.reward_seeds(trajectory, wrenches, batch.angles, batch.targets, batch.variant, shaping=shaping)
 
     # `adjoint` is the running quantity, dJ/dZ at whichever step the sweep has
@@ -366,7 +367,7 @@ def policy_gradient(batch, window, actor, critic=None, shaping=True):
         # The three paths by which Z_t reaches the objective, summed:
         #   dJ_dZ0            Z_t -> Z_{t+1} through physics, force held fixed
         #   state_gradient(.) Z_t -> obs_t -> a_t -> Z_{t+1}, THROUGH THE POLICY
-        #   dl_dZ[t]          the reward's own dependence on Z_t
+        #   dl_dZ[t]          this step's own reward, dl/dZ_t
         # The middle term is what a single whole-window call cannot see: it
         # treats the controls as fixed inputs, which is right for a trajectory
         # optimizer and wrong for anything that reacts to the state.

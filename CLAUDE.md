@@ -237,6 +237,31 @@ is the cheap check that the signs are right; keep it working.
 `docs/derivations/notation.md` in GRIP is the canonical symbol table for
 anything shared. Don't reuse one of its symbols for something else here.
 
+Two of its symbols are ours to fill in — it says so: **`ℓ` and `J` are the
+consumer's, not GRIP's.** `slope_control/task.py`'s module docstring is
+where they are defined, and the definitions are:
+
+- **`ℓ` is one step's reward** (`l` in ASCII code). GRIP calls that slot the
+  stage cost.
+- **`J` is the whole objective**: `ℓ` summed over a window, plus the critic's
+  estimate of what follows.
+- **`dl_dZ` / `dl_dU` are partials** of one step and go *into* `adjoint_batch`.
+  **`dJ_dZ0` / `dJ_dU` are totals** and come *out* of it. Turning the first
+  into the second is the entire job of the adjoint.
+- **There is no `r`.** An earlier draft used `r` in prose for the same
+  quantity the code called `l`, which is how this got confusing enough to
+  need writing down.
+- **`ℓ` here holds a reward, so everything maximizes** — the opposite of the
+  usual stage-cost convention. Stated in `task.py` rather than left to be
+  discovered. If anything ever becomes a genuine cost, flip it everywhere
+  at once.
+
+One collision is **unresolved and belongs to GRIP**: its table uses `J` for
+the caller's objective *and* `Jᵢ`/`J_A` for contact Jacobians. Bare against
+subscripted is a thin separation, and it is the same class of thing
+`notation.md` already registers for `U` and `F` — but it is not registered.
+Raise it there; don't work around it here.
+
 ## Code style
 
 Pedro's preferences, the same ones GRIP uses where they carry over to Python.
