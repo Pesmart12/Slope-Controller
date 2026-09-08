@@ -70,7 +70,7 @@ Eight source files. The repository is small and should stay legible.
 |---|---|
 | `slope_control/ramp.py` | the ramp scene and its geometry conventions, shared by everything |
 | `slope_control/policy.py` | the actor and critic, and the seam where torch's autograd meets GRIP's adjoint |
-| `slope_control/task.py` | the step-2 task — action limit and frame, reward and its gradient seeds, episode and settle window, batch sampling |
+| `slope_control/task.py` | the step-2 task — action limit and frame, reward and its gradient seeds, episode and settle window, `Batch` and its two builders |
 | `experiments/drift.py` | artifact 1 — the drift measurement and its figure |
 | `figures/drift.png` | committed output, so results are visible without running anything |
 | `tests/check_task.py` | the checks step 2 rests on, chiefly the finite-difference of `dJ_dU` through GRIP |
@@ -191,6 +191,18 @@ Four things follow, and they shape most of the code here:
 - **Every environment carries its own `Scene`.** Ramp angle, masses and
   contact parameters randomize across a batch for free; only the body count
   has to match. That is what makes the task's per-episode ramp angle cheap.
+- **Batching across environments is not parallelism, in 1.0.**
+  `src/api/simulate.cpp` loops over environments serially — no OpenMP, no
+  threads — so a batch buys one crossing of the binding instead of N, and
+  the cost stays linear in N. The torch side genuinely does vectorize: an
+  `(N, features)` observation is one GEMM per layer. So the batch size is
+  chosen for **gradient quality**, not throughput — N randomized slopes,
+  starts and targets are what force the policy to be a function of the
+  observation rather than one memorized action sequence. Budget simulation
+  cost accordingly. **GRIP 2.0 is planned to parallelize this on CUDA**,
+  which is the right place for it (every environment is independent, and
+  how the physics executes is GRIP's half of the split). Revisit batch
+  sizing then; do not shape anything around it now.
 - **`rollout_batch` hands back a view of the simulator's own buffer**, not a
   copy — its own docstring says so. One rollout at a time is fine, which is
   why `drift.py` never noticed. A training loop that keeps trajectories
@@ -240,19 +252,35 @@ Pedro's preferences, the same ones GRIP uses where they carry over to Python.
   is not worth the lines.
 - **ASCII in code, Unicode in Markdown.** Python files use `--` and `alpha`;
   `.md` files use — and α. Don't mix them.
-- **Comments explain why.** The what is already on the line above.
+- **Comments explain why in ordinary code, and *what* in dense code.** The
+  old rule here was "comments explain why, the what is already on the line
+  above." That is true of code that reads plainly and false of the code
+  this repository is mostly made of. An einsum, an axis that has to be at
+  −3, a sign that flips on which side of the box a body sits, a
+  three-term chain-rule accumulation — none of those say what they do, and
+  the opening docstring does not help someone reading one specific line.
+  Comment those at the line. Name what each term of a multi-term
+  expression contributes.
+- **A docstring is not a substitute for commenting the body.** Both,
+  where the body is hard. Do not comment lines that are already obvious;
+  over-commenting simple code is the opposite failure and just as bad.
 - No commented-out code, no TODO placeholders in reviewed paths.
 
 ## Known snags
 
 Real, and each one will bite in a specific place:
 
-- **Angles and scenes travel separately.** `resting_state` and `along_ramp`
-  now take one angle per environment, but nothing structurally binds an
-  angle array to the scenes built from it, and a mismatch projects a batch
-  onto the wrong slopes with every shape still lining up. `ramp.scene_angle`
-  reads the angle back out of a scene so that failure is checkable; prefer
-  `task.sample_batch`, which hands them back together.
+- **Angles and scenes travel separately** at the `ramp.py` level.
+  `resting_state` and `along_ramp` take one angle per environment, and
+  nothing there binds an angle array to the scenes built from it — a
+  mismatch projects a batch onto the wrong slopes with every shape still
+  lining up. `ramp.scene_angle` reads the angle back out of a scene so
+  that failure is checkable. Above that level it is solved: **`task.Batch`
+  carries the scenes, the angles, the state, the targets, the substeps,
+  the observation Jacobian and the variant as one value**, built by
+  `task.fixed_batch` or `task.sample_batch`. Do not take a batch apart and
+  pass the pieces on individually; that is the failure mode reintroducing
+  itself.
 - **`along_ramp` no longer accepts a squeezed array.** It needs the
   environment axis at −3. With one angle per environment there is no way to
   infer which axis is which, so passing `trajectory[:, 0, 0, :]` raises
@@ -377,7 +405,11 @@ Three things left open on purpose, so they aren't mistaken for oversights:
   not something a learning rate absorbs. The sweep now lives in
   `policy.policy_gradient`, **not** `task.py` as originally planned: it
   needs torch, and keeping `task.py` torch-free is worth more, since
-  `drift.py` and the numpy-side checks depend on it.
+  `drift.py` and the numpy-side checks depend on it. It takes a
+  `task.Batch` and a `policy.Window` — `policy_gradient(batch, window,
+  actor, critic, shaping)` — rather than the thirteen loose arguments it
+  started with, six of which `rollout` also took. Windows chain with
+  `batch = batch._replace(state=window.states[-1])`.
 
 Steps 4 and 5 need nothing that does not already exist. The 2.0 column
 is written down so it isn't re-litigated and so nothing here forecloses it,

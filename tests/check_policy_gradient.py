@@ -36,9 +36,8 @@ def setup(variant, n_envs=2, seed=0):
     rng = np.random.default_rng(seed)
     torch.manual_seed(seed)
 
-    scenes, angles, state, targets = task.sample_batch(rng, n_envs, variant)
-    substeps = task.substeps_for(scenes[0])
-    observation_size = task.observe(state, angles, targets, variant).shape[-1]
+    batch = task.sample_batch(rng, n_envs, variant)
+    observation_size = task.observe(batch.state, batch.angles, batch.targets, variant).shape[-1]
     actor = policy.Actor(observation_size, len(variant.actuated), variant.limit)
 
     # Small but not tiny, so the network is genuinely nonlinear at the
@@ -47,21 +46,21 @@ def setup(variant, n_envs=2, seed=0):
         for parameter in actor.parameters():
             parameter.add_(0.25 * torch.randn_like(parameter))
 
-    return scenes, angles, state, targets, substeps, actor, task.observation_jacobian(angles, variant)
+    return batch, actor
 
 
-def windowed_reward(scenes, state, angles, targets, actor, variant, substeps, shaping):
+def windowed_reward(batch, actor, shaping):
     """The scalar the sweep claims to differentiate."""
-    trajectory, wrenches, _, _ = policy.rollout(scenes, state, angles, targets, actor, variant, substeps, WINDOW, deterministic=True)
-    return task.reward(trajectory, wrenches, angles, targets, variant, shaping=shaping).sum()
+    window = policy.rollout(batch, actor, WINDOW, deterministic=True)
+    return task.reward(window.states, window.wrenches, batch.angles, batch.targets, batch.variant, shaping=shaping).sum()
 
 
 def check(name, variant, shaping):
-    scenes, angles, state, targets, substeps, actor, jacobian = setup(variant)
+    batch, actor = setup(variant)
 
     policy.zero_gradients(actor)
-    trajectory, wrenches, observations, actions = policy.rollout(scenes, state, angles, targets, actor, variant, substeps, WINDOW, deterministic=True)
-    policy.policy_gradient(scenes, trajectory, wrenches, observations, actions, angles, targets, actor, variant, substeps, jacobian, critic=None, shaping=shaping)
+    window = policy.rollout(batch, actor, WINDOW, deterministic=True)
+    policy.policy_gradient(batch, window, actor, critic=None, shaping=shaping)
     analytic = policy.flat_gradients(actor).numpy()
 
     baseline = policy.flat_parameters(actor).numpy().copy()
@@ -72,7 +71,7 @@ def check(name, variant, shaping):
         shifted = baseline.copy()
         shifted[index] += delta
         policy.set_flat_parameters(actor, shifted)
-        return windowed_reward(scenes, state, angles, targets, actor, variant, substeps, shaping)
+        return windowed_reward(batch, actor, shaping)
 
     worst, scale, h = 0.0, np.abs(analytic).max(), 1e-6
     for index in indices:
@@ -83,7 +82,7 @@ def check(name, variant, shaping):
         # dominate the score for no reason.
         worst = max(worst, abs(finite - analytic[index]) / max(abs(finite), 1e-3 * scale))
 
-    print(f"  {name}: {baseline.size} parameters, {len(indices)} probed through {WINDOW * substeps} integration steps"
+    print(f"  {name}: {baseline.size} parameters, {len(indices)} probed through {WINDOW * batch.substeps} integration steps"
           f"  ->  worst relative error {worst:.2e}")
     return worst
 

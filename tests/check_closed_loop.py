@@ -43,79 +43,76 @@ STEPS = 200
 TARGET_OFFSET = 0.3
 
 
-def rollout_closed_loop(scenes, state, angles, targets, gain, substeps, steps=STEPS):
+def rollout_closed_loop(batch, gain, steps=STEPS):
     """Step one control step at a time, recomputing the action from the state.
 
     `step_batch` rather than `rollout_batch` because the control is not
     known in advance, and because it returns a fresh array per step rather
     than a view of the simulator's buffer.
     """
+    state = batch.state
     states, controls, errors = [state], [], []
     for _ in range(steps):
-        error = ramp.along_ramp(state, angles)[:, 0] - targets
-        wrench = task.to_wrench(np.stack([-gain * error, np.zeros_like(error)], axis=-1)[:, None, :], angles, task.BOX_ONLY)
+        error = ramp.along_ramp(state, batch.angles)[:, 0] - batch.targets
+        wrench = task.to_wrench(np.stack([-gain * error, np.zeros_like(error)], axis=-1)[:, None, :], batch.angles, batch.variant)
 
         errors.append(error)
         controls.append(wrench)
-        state = grip.step_batch(scenes, state, wrench[None], substeps=substeps)
+        state = grip.step_batch(batch.scenes, state, wrench[None], substeps=batch.substeps)
         states.append(state)
 
     return np.array(states), np.array(controls), np.array(errors)
 
 
-def one_call_gradient(scenes, trajectory, controls, angles, dl_dZ, dl_dU, dpi_dgain, substeps):
+def one_call_gradient(batch, trajectory, controls, dl_dZ, dl_dU, dpi_dgain):
     """The task doc's recipe: one sweep, contracted with the direct dpi/dK."""
-    _, dJ_dU = grip.adjoint_batch(scenes, trajectory, controls, substeps, dl_dZ, dl_dU)
-    return (task.to_action_gradient(dJ_dU, angles, task.BOX_ONLY)[..., 0, 0] * dpi_dgain).sum()
+    _, dJ_dU = grip.adjoint_batch(batch.scenes, trajectory, controls, batch.substeps, dl_dZ, dl_dU)
+    return (task.to_action_gradient(dJ_dU, batch.angles, batch.variant)[..., 0, 0] * dpi_dgain).sum()
 
 
-def per_step_gradient(scenes, trajectory, controls, angles, dl_dZ, dl_dU, dpi_dgain, gain, substeps):
+def per_step_gradient(batch, trajectory, controls, dl_dZ, dl_dU, dpi_dgain, gain):
     """The same sweep, one control step at a time, carrying dpi/dZ between steps."""
     adjoint = dl_dZ[-1].copy()
     total = 0.0
     for t in range(len(controls) - 1, -1, -1):
         seed = np.zeros((2,) + trajectory.shape[1:])
         seed[1] = adjoint
-        dJ_dZ0, dJ_dU = grip.adjoint_batch(scenes, trajectory[t:t + 2], controls[t:t + 1], substeps, seed, dl_dU[t:t + 1])
+        dJ_dZ0, dJ_dU = grip.adjoint_batch(batch.scenes, trajectory[t:t + 2], controls[t:t + 1], batch.substeps, seed, dl_dU[t:t + 1])
 
-        action_gradient = task.to_action_gradient(dJ_dU, angles, task.BOX_ONLY)[0, :, 0, 0]
+        action_gradient = task.to_action_gradient(dJ_dU, batch.angles, batch.variant)[0, :, 0, 0]
         total += (action_gradient * dpi_dgain[t]).sum()
 
         # The path a single call cannot see: the state feeds the policy,
         # which feeds the next state. dpi/dZ is -K * d(xi)/d(x, y).
         through_policy = np.zeros_like(adjoint)
-        through_policy[:, 0, 0:2] = (-gain * action_gradient)[:, None] * ramp.uphill(angles)
+        through_policy[:, 0, 0:2] = (-gain * action_gradient)[:, None] * ramp.uphill(batch.angles)
         adjoint = dJ_dZ0 + through_policy + dl_dZ[t]
 
     return total
 
 
 def check(gain):
-    angles = np.radians([18.0, 21.0])
-    scenes = ramp.make_scenes(angles)
-    substeps = task.substeps_for(scenes[0])
-    state = task.settle(scenes, ramp.resting_state(0.0, angles), substeps)
-    targets = ramp.along_ramp(state, angles)[:, 0] + TARGET_OFFSET
+    batch = task.fixed_batch(np.radians([18.0, 21.0]), task.BOX_ONLY, offset=TARGET_OFFSET)
 
-    trajectory, controls, errors = rollout_closed_loop(scenes, state, angles, targets, gain, substeps)
+    trajectory, controls, errors = rollout_closed_loop(batch, gain)
 
     peak = np.abs(gain * errors).max()
-    assert peak < task.BOX_ONLY.limit[0], f"the feedback law saturates at K = {gain}, so the clip is what is under test"
+    assert peak < batch.variant.limit[0], f"the feedback law saturates at K = {gain}, so the clip is what is under test"
 
     # If the recorded controls do not replay to the same trajectory, the
     # adjoint is being handed a different problem than the one measured.
-    replay = np.array(grip.rollout_batch(scenes, state, controls, substeps=substeps))
+    replay = np.array(grip.rollout_batch(batch.scenes, batch.state, controls, substeps=batch.substeps))
     assert np.abs(replay - trajectory).max() < 1e-12, "closed-loop and open-loop rollouts disagree"
 
-    dl_dZ, dl_dU = task.reward_seeds(trajectory, controls, angles, targets, task.BOX_ONLY)
+    dl_dZ, dl_dU = task.reward_seeds(trajectory, controls, batch.angles, batch.targets, batch.variant)
     dpi_dgain = -errors  # d/dK of -K*(xi - xi*), at fixed state
 
-    one_call = one_call_gradient(scenes, trajectory, controls, angles, dl_dZ, dl_dU, dpi_dgain, substeps)
-    per_step = per_step_gradient(scenes, trajectory, controls, angles, dl_dZ, dl_dU, dpi_dgain, gain, substeps)
+    one_call = one_call_gradient(batch, trajectory, controls, dl_dZ, dl_dU, dpi_dgain)
+    per_step = per_step_gradient(batch, trajectory, controls, dl_dZ, dl_dU, dpi_dgain, gain)
 
     def objective(k):
-        rolled, held, _ = rollout_closed_loop(scenes, state, angles, targets, k, substeps)
-        return task.reward(rolled, held, angles, targets, task.BOX_ONLY).sum()
+        rolled, held, _ = rollout_closed_loop(batch, k)
+        return task.reward(rolled, held, batch.angles, batch.targets, batch.variant).sum()
 
     h = 1e-3
     truth = (objective(gain + h) - objective(gain - h)) / (2.0 * h)

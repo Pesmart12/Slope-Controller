@@ -102,13 +102,29 @@ def polygon_properties(vertices):
     """
     v = np.asarray(vertices, dtype=float)
     x, y = v[:, 0], v[:, 1]
+
+    # roll(-1) pairs each vertex with the next one and wraps the last back to
+    # the first, so `cross` holds one edge cross product per edge with no
+    # special case for closing the loop.
     xn, yn = np.roll(x, -1), np.roll(y, -1)
     cross = x * yn - xn * y
 
+    # The shoelace formula. Positive area is the check that the winding is
+    # counterclockwise, which GRIP's SAT path requires.
     area = 0.5 * cross.sum()
+
+    # Standard polygon centroid: each edge contributes its midpoint weighted by
+    # its cross product, and 6*area normalizes.
     centroid = np.array([((x + xn) * cross).sum(), ((y + yn) * cross).sum()]) / (6.0 * area)
+
+    # Second moments about the ORIGIN, not the centroid. Note the axis naming
+    # is the moment-of-area convention: ixx integrates y^2.
     ixx = ((y * y + y * yn + yn * yn) * cross).sum() / 12.0
     iyy = ((x * x + x * xn + xn * xn) * cross).sum() / 12.0
+
+    # ixx + iyy is the polar moment about the origin, which is the only
+    # combination a 2D rigid body needs. The subtraction is the parallel axis
+    # theorem run backwards, shifting it from the origin to the centroid.
     return area, centroid, (ixx + iyy) - area * centroid.dot(centroid)
 
 
@@ -125,8 +141,18 @@ def pusher_vertices(width=PUSHER_WIDTH, height=PUSHER_HEIGHT, tilt=PUSHER_FACE_T
     constants above it.
     """
     half_w, half_h = 0.5 * width, 0.5 * height
+
+    # How far the BOTTOM of the +x face is pulled back to lean it by `tilt`.
+    # Only the bottom vertex moves, so the top one stays the contact point.
     trim = height * math.tan(tilt)
+
+    # Counterclockwise from the bottom-left. The second entry is the trimmed
+    # bottom-right; the third is the untouched top-right that meets the box.
     raw = [[-half_w, -half_h], [half_w - trim, -half_h], [half_w, half_h], [-half_w, half_h]]
+
+    # GRIP takes vertices in a frame centred on the centre of mass, and the
+    # trim moved the centroid ~2 mm off the rectangle's centre. Not recentring
+    # would put a standing torque offset into every contact this body makes.
     _, centroid, _ = polygon_properties(raw)
     return [[vx - centroid[0], vy - centroid[1]] for vx, vy in raw]
 
@@ -159,7 +185,13 @@ def mirrored_vertices(vertices):
     Without this the uphill pusher meets the box flat, which is exactly the
     parallel-face tie-break the tilt exists to avoid.
     """
-    reflected = [[-vx, vy] for vx, vy in reversed(vertices)]  # reversed, or the winding flips
+    # Negating x reflects the shape but also reverses the traversal direction,
+    # so the list has to be reversed to put the winding back counterclockwise.
+    reflected = [[-vx, vy] for vx, vy in reversed(vertices)]
+
+    # Positive area is the counterclockwise test -- `polygon_properties`
+    # returns a signed area, so this catches a winding mistake immediately
+    # rather than leaving GRIP's SAT path to fail obscurely.
     assert polygon_properties(reflected)[0] > 0.0, "mirrored winding came out clockwise"
     return reflected
 
@@ -190,6 +222,10 @@ TWO_PUSHER_BODIES = [PUSHER, BOX, PUSHER_MIRRORED]
 
 def contact_reach(body, toward_uphill):
     """How far a body's contact vertex extends toward the box it pushes."""
+    # Read off the vertex list rather than written down, because the 3 degree
+    # face trim moves it. Whichever extreme faces the box is the one that
+    # touches first: +x for a body reaching uphill, -x for the mirrored one,
+    # negated so both come back as a positive distance.
     xs = [vx for vx, _ in body["vertices"]]
     return max(xs) if toward_uphill else -min(xs)
 
@@ -259,7 +295,13 @@ def resting_state(xi, ramp_angles, bodies=None):
     up, out = uphill(angles), normal(angles)
     state = np.zeros((angles.size, len(bodies), 6))
     for index, body in enumerate(bodies):
+        # World position = travel along the surface + stand-off along its
+        # normal. The [:, index, None] opens an axis so a per-environment
+        # scalar multiplies a 2-vector. Velocities stay zero.
         state[:, index, 0:2] = xi[:, index, None] * up + resting_offset(body["vertices"]) * out
+
+        # Flush means the body angle IS the ramp angle, so the bottom face
+        # lies parallel to the surface.
         state[:, index, 2] = angles
     return state
 
@@ -277,6 +319,11 @@ def along_ramp(states, ramp_angles):
     wrong slopes.
     """
     states = np.asarray(states)
+
+    # "...nbi,ni->...nb": for environment n and body b, project the position
+    # 2-vector i onto that environment's own uphill direction. Leading step
+    # axes pass through untouched, which is why one state and a whole
+    # trajectory both work and only the last axis disappears.
     return np.einsum("...nbi,ni->...nb", states[..., 0:2], uphill(np.atleast_1d(ramp_angles)))
 
 

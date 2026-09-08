@@ -62,27 +62,14 @@ TARGET_OFFSET = 0.5
 APPROACH_GAP = 0.05
 
 
-def setup(variant, degrees):
-    """Scenes, a settled state and a target, for one variant."""
-    angles = np.radians(degrees)
-    bodies = task.bodies_for(variant)
-    scenes = ramp.make_scenes(angles, bodies=bodies)
-    substeps = task.substeps_for(scenes[0])
-
-    start = np.zeros(len(degrees))
-    positions = task.placement(start, APPROACH_GAP, variant)
-    state = task.settle(scenes, ramp.resting_state(positions, angles, bodies=bodies), substeps)
-    return scenes, angles, substeps, state, ramp.along_ramp(state, angles)[:, variant.box] + TARGET_OFFSET
-
-
-def total_reward(variant, scenes, state, actions, angles, targets, substeps):
+def total_reward(batch, actions):
     """Score one control sequence. Returns the per-environment reward and trajectory."""
-    wrenches = task.to_wrench(actions, angles, variant)
-    trajectory = np.array(grip.rollout_batch(scenes, state, wrenches, substeps=substeps))
-    return task.reward(trajectory, wrenches, angles, targets, variant).sum(axis=0), trajectory
+    wrenches = task.to_wrench(actions, batch.angles, batch.variant)
+    trajectory = np.array(grip.rollout_batch(batch.scenes, batch.state, wrenches, substeps=batch.substeps))
+    return task.reward(trajectory, wrenches, batch.angles, batch.targets, batch.variant).sum(axis=0), trajectory
 
 
-def optimize(variant, scenes, state, angles, targets, substeps, iterations=ITERATIONS):
+def optimize(batch, iterations=ITERATIONS):
     """Adam on the raw control sequence, projected back onto the force limit.
 
     Projected rather than penalized: `to_wrench` clips anyway, and a clipped
@@ -98,27 +85,49 @@ def optimize(variant, scenes, state, angles, targets, substeps, iterations=ITERA
     # Zero, deliberately. The shaping term is what has to lift the
     # optimizer off this point; an initialization that did it instead
     # would hide whether the term works.
-    actions = np.zeros((task.EPISODE_STEPS, len(scenes), len(variant.actuated), 2))
+    variant = batch.variant
+    actions = np.zeros((task.EPISODE_STEPS, len(batch.scenes), len(variant.actuated), 2))
     first_moment, second_moment = np.zeros_like(actions), np.zeros_like(actions)
     beta_1, beta_2, epsilon = 0.9, 0.999, 1e-8
     learning_rate = STEP_FRACTION * variant.scale
     history = []
 
     for iteration in range(1, iterations + 1):
-        wrenches = task.to_wrench(actions, angles, variant)
-        trajectory = np.array(grip.rollout_batch(scenes, state, wrenches, substeps=substeps))
-        history.append(task.reward(trajectory, wrenches, angles, targets, variant).sum(axis=0))  # unshaped, for reporting
+        wrenches = task.to_wrench(actions, batch.angles, variant)
+        trajectory = np.array(grip.rollout_batch(batch.scenes, batch.state, wrenches, substeps=batch.substeps))
+        history.append(task.reward(trajectory, wrenches, batch.angles, batch.targets, variant).sum(axis=0))  # unshaped, for reporting
 
-        dl_dZ, dl_dU = task.reward_seeds(trajectory, wrenches, angles, targets, variant, shaping=True)
-        _, dJ_dU = grip.adjoint_batch(scenes, trajectory, wrenches, substeps, dl_dZ, dl_dU)
-        gradient = task.to_action_gradient(dJ_dU, angles, variant)
+        # Optimize the SHAPED objective but record the unshaped one. A shaping
+        # term that only looked good on its own objective would show up as a
+        # good shaped score and a bad task score, which is the point of the split.
+        dl_dZ, dl_dU = task.reward_seeds(trajectory, wrenches, batch.angles, batch.targets, variant, shaping=True)
 
+        # One call for the whole episode is CORRECT here, unlike for a policy:
+        # the control sequence is a fixed set of variables, not a function of
+        # the state, so there is no Z -> a -> Z path for it to miss.
+        _, dJ_dU = grip.adjoint_batch(batch.scenes, trajectory, wrenches, batch.substeps, dl_dZ, dl_dU)
+        gradient = task.to_action_gradient(dJ_dU, batch.angles, variant)
+
+        # Adam, by hand so this file stays numpy-only. First moment is a
+        # running mean of the gradient, second an uncentred running variance.
         first_moment = beta_1 * first_moment + (1.0 - beta_1) * gradient
         second_moment = beta_2 * second_moment + (1.0 - beta_2) * gradient * gradient
+
+        # Both averages start at zero and so are biased low for the first
+        # iterations. Dividing by (1 - beta^t) undoes exactly that, and the
+        # correction decays to nothing as beta^t does.
         corrected_first = first_moment / (1.0 - beta_1 ** iteration)
         corrected_second = second_moment / (1.0 - beta_2 ** iteration)
 
+        # Dividing by the root second moment is what makes the step size
+        # roughly `learning_rate` regardless of gradient scale -- which is why
+        # this handles a trajectory whose early steps move the load and whose
+        # late steps only hold it. `+` rather than `-`: reward, not loss.
         actions += learning_rate * corrected_first / (np.sqrt(corrected_second) + epsilon)
+
+        # Project back onto the feasible box every iteration. Without this the
+        # iterate can wander far outside the limit while `to_wrench` silently
+        # clips it, reporting zero gradient from a point it can never leave.
         actions = task.clip_action(actions, variant)
 
     return actions, np.array(history)
@@ -126,14 +135,14 @@ def optimize(variant, scenes, state, angles, targets, substeps, iterations=ITERA
 
 def solve(name, variant, degrees):
     """Optimize one variant and report what the solution looks like."""
-    scenes, angles, substeps, state, targets = setup(variant, degrees)
-    idle, _ = total_reward(variant, scenes, state, np.zeros((task.EPISODE_STEPS, len(scenes), len(variant.actuated), 2)), angles, targets, substeps)
+    batch = task.fixed_batch(np.radians(degrees), variant, offset=TARGET_OFFSET, gaps=APPROACH_GAP)
+    idle, _ = total_reward(batch, np.zeros((task.EPISODE_STEPS, len(degrees), len(variant.actuated), 2)))
 
-    actions, history = optimize(variant, scenes, state, angles, targets, substeps)
-    final, trajectory = total_reward(variant, scenes, state, actions, angles, targets, substeps)
+    actions, history = optimize(batch)
+    final, trajectory = total_reward(batch, actions)
 
-    xi = ramp.along_ramp(trajectory, angles)
-    error = xi[-1, :, variant.box] - targets
+    xi = ramp.along_ramp(trajectory, batch.angles)
+    error = xi[-1, :, variant.box] - batch.targets
     saturated = (np.abs(np.abs(actions) - variant.limit).min(axis=-1) < 1e-9).mean()
 
     print(f"\n{name}: {variant.bodies} bodies, {len(variant.actuated)} actuated, target {100 * TARGET_OFFSET:.0f} cm uphill")
@@ -143,7 +152,7 @@ def solve(name, variant, degrees):
     for i, d in enumerate(degrees):
         peaks = "".join(f" {actions[:, i, slot, 0].max():>8.2f} N" for slot in range(len(variant.actuated)))
         print(f"  {d:>5.0f}d {100 * error[i]:>8.2f} cm {xi[-1, i, variant.box] - xi[0, i, variant.box]:>8.2f} m{peaks}")
-    return error, final, idle, actions, angles
+    return error, final, idle, actions, batch.angles
 
 
 def report_creep_band(actions, angles, degrees):

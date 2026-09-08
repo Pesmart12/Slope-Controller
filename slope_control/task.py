@@ -82,6 +82,23 @@ POSITION_TOLERANCE = 0.02
 # weights   position and control, derived from POSITION_TOLERANCE
 Variant = namedtuple("Variant", "bodies box actuated limit scale weights")
 
+# Everything one rollout needs, built together so no two pieces of it can
+# disagree. `scenes` and `angles` are the pairing CLAUDE.md lists as a
+# snag -- an angle array and the scenes built from it travel separately
+# and a mismatch projects onto the wrong slopes with every shape still
+# lining up. `variant` is here for the same reason: the scenes carry its
+# body count, so passing a different one to `observe` is not a thing that
+# should be expressible.
+#
+# scenes     one grip.Scene per environment, each with its own slope
+# angles     the slope those scenes were built from
+# state      where this rollout starts, already settled
+# targets    where the box should end up, in ramp coordinates
+# substeps   integration steps per control step, derived from the scenes
+# jacobian   d(observation)/d(state), constant because `observe` is affine
+# variant    which task these scenes were built for
+Batch = namedtuple("Batch", "scenes angles state targets substeps jacobian variant")
+
 
 def control_weight(scale, hold_forces, tolerance=POSITION_TOLERANCE):
     """Fix w_ctrl from a stated tolerance instead of picking a number.
@@ -192,9 +209,19 @@ def to_wrench(actions, ramp_angles, variant):
     """
     actions = clip_action(actions, variant)
     angles = np.atleast_1d(np.asarray(ramp_angles, dtype=float))
+
+    # The [:, None, :] inserts an axis for the actuated slot, so one angle per
+    # environment broadcasts across however many bodies that environment drives.
     up, out = ramp.uphill(angles)[:, None, :], ramp.normal(angles)[:, None, :]
+
+    # The rotation itself, written as a linear combination rather than a matrix
+    # product: the map's columns ARE uphill and normal. Keeping the 0:1 / 1:2
+    # slices (rather than 0 / 1) preserves the trailing axis so each scalar
+    # component broadcasts against a 2-vector.
     force = actions[..., 0:1] * up + actions[..., 1:2] * out
 
+    # Scatter each action slot onto the body it drives. Unactuated bodies keep
+    # their zero row, and column 2 -- the torque -- is never written by anything.
     wrench = np.zeros(actions.shape[:-2] + (variant.bodies, 3))
     for slot, body in enumerate(variant.actuated):
         wrench[..., body, 0:2] = force[..., slot, :]
@@ -218,8 +245,19 @@ def to_action_gradient(dJ_dU, ramp_angles, variant):
 
     gradients = []
     for body in variant.actuated:
+        # Gather this body's force gradient, dropping the torque column since
+        # no action ever wrote it.
         force = dJ_dU[..., body, 0:2]
+
+        # "...ni,ni->...n" is a per-environment dot product: contract the
+        # 2-vector axis i against that environment's basis vector, keeping any
+        # leading step axes. Two of them stacked give (tangential, normal),
+        # which is the transpose of `to_wrench`'s rotation -- correct as the
+        # pullback precisely because that map is orthogonal.
         gradients.append(np.stack([np.einsum("...ni,ni->...n", force, up), np.einsum("...ni,ni->...n", force, out)], axis=-1))
+
+    # axis=-2 rebuilds the actuated-slot axis, so this comes back shaped like
+    # the actions that went in.
     return np.stack(gradients, axis=-2)
 
 
@@ -243,8 +281,19 @@ def separations(states, ramp_angles, variant):
     xi = ramp.along_ramp(states, ramp_angles)
     gaps = []
     for body in pushing_bodies(variant):
+        # Body order is downhill-to-uphill, so a higher index means this pusher
+        # sits above the box and pushes down.
         uphill_of_box = body > variant.box
+
+        # Centre-to-centre distance at first touch: half the box plus however
+        # far this pusher's contact vertex sticks out toward it. An uphill
+        # pusher is the mirrored shape and reaches with its -x vertex, hence
+        # `toward_uphill` being the negation.
         reach = 0.5 * ramp.BOX_SIDE + ramp.contact_reach(bodies[body], toward_uphill=not uphill_of_box)
+
+        # Signed so that positive always means "still apart", whichever side
+        # the pusher is on: subtracting the touching distance from the actual
+        # separation leaves the gap.
         sign = 1.0 if uphill_of_box else -1.0
         gaps.append(sign * (xi[..., body] - xi[..., variant.box]) - reach)
     return gaps
@@ -287,12 +336,23 @@ def reward(states, controls, ramp_angles, targets, variant, weights=None, shapin
     weights = variant.weights if weights is None else weights
     controls = np.asarray(controls)
 
+    # [1:] drops the initial state: u_t is scored against the state it
+    # produces, Z_{t+1}, and no control reaches Z_0.
     xi = ramp.along_ramp(states, ramp_angles)[1:, :, variant.box]
+
+    # Normalized by the box side, so the position term is in box-widths and
+    # the two weights end up comparable rather than differing by ~1e5.
     error = (xi - np.asarray(targets)) / ramp.BOX_SIDE
+
+    # Squared force magnitude summed over actuated bodies; 0:2 drops the torque
+    # column, which no action writes.
     effort = sum((controls[..., body, 0:2] ** 2).sum(axis=-1) for body in variant.actuated)
+
     total = -weights["position"] * error ** 2 - weights["control"] * effort / variant.scale ** 2
 
     if shaping:
+        # `approach_penalty` returns a positive cost over ALL steps, so it is
+        # subtracted and sliced the same way the position term was.
         total = total - approach_penalty(states, ramp_angles, variant, weights)[1:]
     return total
 
@@ -392,11 +452,21 @@ def reward_seeds(states, controls, ramp_angles, targets, variant, weights=None, 
     angles = np.atleast_1d(np.asarray(ramp_angles, dtype=float))
 
     xi = ramp.along_ramp(states, angles)[..., variant.box]
+
+    # d/d(xi) of -w_pos*((xi - xi*)/side)^2. One side length comes from the
+    # normalization inside the square, the other from differentiating it.
     coefficient = -2.0 * weights["position"] * (xi - np.asarray(targets)) / ramp.BOX_SIDE ** 2
 
+    # Chain that through xi = position . uphill, whose derivative w.r.t. the
+    # (x, y) position is just `uphill`. [:, :, None] opens an axis for the two
+    # position components; [None, :, :] opens one for steps. [1:] again because
+    # Z_0 is fixed. Every other entry stays zero: unshaped, the objective sees
+    # no orientation, no velocity, and none of the pushers.
     dl_dZ = np.zeros(states.shape)
     dl_dZ[1:, :, variant.box, 0:2] = coefficient[1:, :, None] * ramp.uphill(angles)[None, :, :]
 
+    # d/df of -w_ctrl*|f|^2/scale^2, written straight onto each actuated body.
+    # The torque column is left at zero.
     dl_dU = np.zeros(controls.shape)
     for body in variant.actuated:
         dl_dU[..., body, 0:2] = -2.0 * weights["control"] * controls[..., body, 0:2] / variant.scale ** 2
@@ -407,7 +477,16 @@ def reward_seeds(states, controls, ramp_angles, targets, variant, weights=None, 
         up = ramp.uphill(angles)[None, :, :]
         for body, gap in zip(pushing_bodies(variant), separations(states, angles, variant)):
             sign = 1.0 if body > variant.box else -1.0
+
+            # max(0, gap) rather than gap: the one-sided term has zero
+            # derivative once the bodies touch, which is what makes the shaping
+            # vanish on contact instead of distorting the task there.
             coefficient = -2.0 * weights["position"] * np.maximum(0.0, gap) / ramp.BOX_SIDE ** 2
+
+            # A separation is a DIFFERENCE of two positions, so it writes two
+            # entries with opposite signs -- moving the pusher toward the box
+            # and moving the box toward the pusher shrink the same gap.
+            # `+=` because several pushers can score against the same box.
             dl_dZ[1:, :, body, 0:2] += (sign * coefficient[1:])[:, :, None] * up
             dl_dZ[1:, :, variant.box, 0:2] += (-sign * coefficient[1:])[:, :, None] * up
     return dl_dZ, dl_dU
@@ -447,13 +526,27 @@ def observe(states, ramp_angles, targets, variant):
     targets = np.asarray(targets)
     up, out = ramp.uphill(angles), ramp.normal(angles)
 
+    # GRIP packs a state as (x, y, theta, vx, vy, omega), so 0:2 is position
+    # and 3:5 is linear velocity.
     position, velocity = states[..., 0:2], states[..., 3:5]
+
+    # "...nbi,ni->...nb": for environment n and body b, dot the 2-vector i
+    # against that environment's own basis vector. Leading step axes ride
+    # along untouched, so a single state and a whole trajectory both work.
+    # This is the projection into the ramp frame, and it is the reason every
+    # channel below reads the same at any slope.
     xi = np.einsum("...nbi,ni->...nb", position, up)
     eta = np.einsum("...nbi,ni->...nb", position, out)
     v_up = np.einsum("...nbi,ni->...nb", velocity, up)
     v_out = np.einsum("...nbi,ni->...nb", velocity, out)
+
+    # Body angle relative to its own ramp, so a body sitting flush reads zero.
+    # angles[:, None] opens a body axis for the per-environment slope.
     tilt = states[..., 2] - angles[:, None]
 
+    # Height above the surface, measured from where each body's centre of mass
+    # sits when it rests flush -- so this is zero at rest for every shape,
+    # including the pusher whose centroid is not at half its height.
     offsets = np.array([ramp.resting_offset(body["vertices"]) for body in bodies_for(variant)])
     gap = (eta - offsets) / ramp.BOX_SIDE
 
@@ -467,9 +560,14 @@ def observe(states, ramp_angles, targets, variant):
         states[..., box, 5],
         np.broadcast_to(np.sin(angles), xi[..., box].shape),
     ]
+    # Every other body is described RELATIVE to the box, which is what makes
+    # the observation independent of where on the ramp the whole scene sits.
+    # Four channels each, against the box's seven.
     for body in range(variant.bodies):
         if body != box:
             channels += [(xi[..., body] - xi[..., box]) / ramp.BOX_SIDE, v_up[..., body], gap[..., body], tilt[..., body]]
+
+    # axis=-1 makes features the last axis, which is what torch's Linear wants.
     return np.stack(channels, axis=-1)
 
 
@@ -495,7 +593,13 @@ def observation_jacobian(ramp_angles, variant):
     shape = (angles.size, variant.bodies, 6)
     targets = np.zeros(angles.size)  # only shifts the constant term
 
+    # An affine map is f(Z) = A Z + c. Evaluating at Z = 0 isolates c...
     base = observe(np.zeros(shape), angles, targets, variant)
+
+    # ...and f(e_k) - c is then exactly column k of A. One unit state per
+    # (body, component) sweeps out the whole matrix in bodies*6 evaluations.
+    # This is NOT a finite difference: for an affine map it is exact, with no
+    # step size to choose. `check_task` asserts the affinity that licenses it.
     jacobian = np.zeros(base.shape + (variant.bodies, 6))
     for body in range(variant.bodies):
         for component in range(6):
@@ -506,7 +610,15 @@ def observation_jacobian(ramp_angles, variant):
 
 
 def state_gradient(dJ_dobs, jacobian):
-    """Pull an adjoint on the observation back to an adjoint on the state."""
+    """Pull an adjoint on the observation back to an adjoint on the state.
+
+    The chain rule dJ/dZ = (dJ/d(obs)) . (d(obs)/dZ), contracted over the
+    feature axis. Used twice in the backward sweep -- once for the critic's
+    dV/dZ and once per step for the path through the policy.
+    """
+    # "...nf,nfbc->...nbc": sum over feature f, keeping environment n and
+    # opening the state's (body, component) axes so the result is shaped like
+    # a state and can be added straight to GRIP's dJ_dZ0.
     return np.einsum("...nf,nfbc->...nbc", np.asarray(dJ_dobs), jacobian)
 
 
@@ -557,11 +669,17 @@ def placement(box_xi, gaps, variant):
     bodies = bodies_for(variant)
     pushers = pushing_bodies(variant)
     box_xi = np.asarray(box_xi, dtype=float)
+
+    # Accepts a scalar, one gap per pusher, or one per environment per pusher.
+    # Broadcasting here means the callers do not each build a full array.
     gaps = np.broadcast_to(np.asarray(gaps, dtype=float), box_xi.shape + (len(pushers),))
 
     positions = np.zeros(box_xi.shape + (variant.bodies,))
     positions[..., variant.box] = box_xi
     for slot, body in enumerate(pushers):
+        # The exact inverse of what `separations` measures: centre-to-centre
+        # at first touch, plus the standoff asked for. If these two ever
+        # disagree, a "0 cm gap" start stops being a 0 mm separation.
         uphill_of_box = body > variant.box
         reach = ramp.contact_reach(bodies[body], toward_uphill=not uphill_of_box)
         offset = 0.5 * ramp.BOX_SIDE + reach + gaps[..., slot]
@@ -569,28 +687,70 @@ def placement(box_xi, gaps, variant):
     return positions
 
 
-def sample_batch(rng, n_envs, variant):
-    """One randomized episode setup per environment, already settled.
+def build_batch(ramp_angles, start, offset, gaps, variant):
+    """Scenes, a settled state and a target, assembled into one `Batch`.
 
-    Returns scenes, angles, initial state and targets together rather than
-    separately, so the angles and the scenes built from them cannot drift
-    apart in a caller.
-
-    Targets sit a fixed distance to either side of the start, not always
-    uphill. Uphill-only would let a policy score well by learning "push
-    hard uphill" with no representation of the target at all.
+    The single place a batch is put together, so `fixed_batch` and
+    `sample_batch` differ only in where their numbers come from and cannot
+    drift on the mechanics -- which body count the scenes get, whether the
+    state was settled, or which direction the target offset is measured in.
 
     Offsets are measured from where the box actually ends up after
     settling, not from where it was placed, since everything creeps a
     millimetre or two during the window.
     """
+    angles = np.atleast_1d(np.asarray(ramp_angles, dtype=float))
+    bodies = bodies_for(variant)
+
+    scenes = ramp.make_scenes(angles, bodies=bodies)
+    substeps = substeps_for(scenes[0])
+
+    # `start` broadcasts to one box position per environment, so a scalar puts
+    # the box at the same point on every slope.
+    positions = placement(np.broadcast_to(np.asarray(start, dtype=float), angles.shape), gaps, variant)
+
+    # Flush placement, then let the contact spring ring down. Scoring through
+    # that transient would make the opening of every episode a disturbance.
+    state = settle(scenes, ramp.resting_state(positions, angles, bodies=bodies), substeps)
+
+    # Measured from the SETTLED position, not the placed one -- everything
+    # creeps a millimetre or two during the settle window.
+    targets = ramp.along_ramp(state, angles)[:, variant.box] + offset
+
+    # The Jacobian is constant because `observe` is affine, so it is built once
+    # here and never recomputed inside a backward sweep.
+    return Batch(scenes, angles, state, targets, substeps, observation_jacobian(angles, variant), variant)
+
+
+def fixed_batch(ramp_angles, variant, start=0.0, offset=0.0, gaps=0.0):
+    """A batch with every number stated rather than sampled.
+
+    The deterministic sibling of `sample_batch`, and what the checks use.
+    Each of them wants a specific slope and a specific target so its
+    printed number means the same thing run to run; three of them had
+    grown their own copy of the make-scenes-place-settle-target sequence,
+    which is exactly the code that must not differ between what is checked
+    and what is trained.
+    """
+    return build_batch(ramp_angles, start, offset, gaps, variant)
+
+
+def sample_batch(rng, n_envs, variant):
+    """One randomized episode setup per environment, already settled.
+
+    Targets sit a fixed distance to either side of the start, not always
+    uphill. Uphill-only would let a policy score well by learning "push
+    hard uphill" with no representation of the target at all.
+    """
     angles = rng.uniform(*RAMP_ANGLE_RANGE, size=n_envs)
     start = rng.uniform(*START_RANGE, size=n_envs)
+
+    # Magnitude and direction drawn separately, so the target is never closer
+    # than TARGET_OFFSET_RANGE[0] and lands on either side with equal odds.
     offset = rng.uniform(*TARGET_OFFSET_RANGE, size=n_envs) * rng.choice([-1.0, 1.0], size=n_envs)
 
+    # Width 0 for BOX_ONLY, which has no pushing bodies -- `placement` then
+    # never indexes it.
     gaps = rng.uniform(*APPROACH_GAP_RANGE, size=(n_envs, len(pushing_bodies(variant))))
-    positions = placement(start, gaps, variant)
 
-    scenes = ramp.make_scenes(angles, bodies=bodies_for(variant))
-    state = settle(scenes, ramp.resting_state(positions, angles, bodies=bodies_for(variant)), substeps_for(scenes[0]))
-    return scenes, angles, state, ramp.along_ramp(state, angles)[:, variant.box] + offset
+    return build_batch(angles, start, offset, gaps, variant)

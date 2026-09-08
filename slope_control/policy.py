@@ -12,6 +12,8 @@ Nothing here knows about ramps, rewards or contact. It is a network and a
 boundary.
 """
 
+from collections import namedtuple
+
 import numpy as np
 import torch
 
@@ -20,6 +22,18 @@ import grip
 from . import task
 
 HIDDEN = (64, 64)
+
+# What one closed-loop rollout leaves behind, which is exactly what the
+# backward sweep consumes. `observations` and `actions` are live torch
+# tensors with their graph intact, NOT logs -- they are the only reason
+# the sweep can push an adjoint back through the policy rather than
+# treating each action as an independent variable.
+#
+# states        (steps + 1, environments, bodies, 6), one per control step plus the start
+# wrenches      (steps, environments, bodies, 3), what GRIP was actually given
+# observations  per step, requires_grad, the leaf the input gradient comes back on
+# actions       per step, the network's output, seeded by GRIP on the way back
+Window = namedtuple("Window", "states wrenches observations actions")
 
 # Pre-squash noise. The action is limit*tanh(x + sigma*eps), so sigma is
 # in the units of the pre-tanh activation rather than newtons; 0.37 puts
@@ -123,10 +137,26 @@ def accumulate(module, outputs, seed, inputs):
     derivative is the sum over its steps, and the sweep visits each once.
     """
     parameters = [p for p in module.parameters() if p.requires_grad]
+
+    # `grad_outputs` IS the handoff between the two autodiff systems. Normally
+    # torch seeds a backward pass with 1.0 on a scalar loss; here the scalar
+    # lives on the far side of the simulator, so GRIP's dJ/d(action) is handed
+    # in as the seed instead. Asking for `parameters + [inputs]` walks the
+    # graph once and returns both halves: the parameter gradients, and
+    # dJ/d(observation) as the last element. `retain_graph` because the sweep
+    # comes back through this graph once per step; `allow_unused` because
+    # `log_std` never enters a deterministic pass and comes back as None.
     gradients = torch.autograd.grad(outputs, parameters + [inputs], grad_outputs=as_tensor(seed), retain_graph=True, allow_unused=True)
+
+    # Sum rather than assign: the same parameters produced the action at every
+    # step of the window, so the window's total derivative is the sum over
+    # steps and the sweep visits each step exactly once.
     for parameter, gradient in zip(parameters, gradients[:-1]):
         if gradient is not None:
             parameter.grad = gradient if parameter.grad is None else parameter.grad + gradient
+
+    # The trailing entry, dJ/d(observation) -- what carries the adjoint back
+    # one step through the policy. Detached because GRIP takes it as numpy.
     return gradients[-1].detach().numpy()
 
 
@@ -155,8 +185,8 @@ def zero_gradients(module):
         parameter.grad = None
 
 
-def rollout(scenes, state, ramp_angles, targets, actor, variant, substeps, steps, deterministic=False):
-    """Step the policy forward, keeping what the backward sweep will need.
+def rollout(batch, actor, steps, deterministic=False):
+    """Step the policy forward from `batch.state`, keeping what the sweep needs.
 
     `step_batch` rather than `rollout_batch` because the control is not
     known in advance -- that is what closed loop means -- and because it
@@ -164,26 +194,48 @@ def rollout(scenes, state, ramp_angles, targets, actor, variant, substeps, steps
     buffer, which a trajectory kept across a whole window would otherwise
     have overwritten under it.
 
-    The observation tensors are kept with their graph intact. They are the
-    only reason the sweep can push an adjoint back through the policy
-    rather than treating each action as an independent variable.
-    """
-    states, observations, actions, wrenches = [state], [], [], []
-    for _ in range(steps):
-        observation = as_tensor(task.observe(state, ramp_angles, targets, variant), grad=True)
-        action = actor(observation, deterministic=deterministic)
-        wrench = task.to_wrench(action.detach().numpy(), ramp_angles, variant)
+    Takes a whole `task.Batch` rather than the six loose pieces it needs.
+    The scenes, the slopes and the variant have to describe the same world
+    or the rollout is quietly simulating something else, and handing them
+    over as one value is what makes that unexpressible.
 
+    Windows chain by advancing the batch: `batch = batch._replace(state =
+    window.states[-1])`, which is how SHAC carries a state across a window
+    boundary without resetting the episode.
+    """
+    state = batch.state
+
+    # `states` starts with the initial state, so it ends up one longer than
+    # the other three -- the same (steps + 1) convention `rollout_batch` uses.
+    states, observations, actions, wrenches = [state], [], [], []
+
+    for _ in range(steps):
+        # grad=True marks the observation as a leaf, which is what lets
+        # `accumulate` hand dJ/d(observation) back on the return trip.
+        observation = as_tensor(task.observe(state, batch.angles, batch.targets, batch.variant), grad=True)
+        action = actor(observation, deterministic=deterministic)
+
+        # .detach() is the handoff out of torch: GRIP is numpy and knows
+        # nothing about the graph. The link is re-established by hand later,
+        # when `accumulate` seeds the backward pass with what GRIP computed.
+        wrench = task.to_wrench(action.detach().numpy(), batch.angles, batch.variant)
+
+        # observations and actions are kept as LIVE tensors with their graph
+        # attached. Storing numpy copies would make each action an independent
+        # variable with no path back to theta, which is precisely the
+        # open-loop gradient -- the one measured at 119% wrong.
         observations.append(observation)
         actions.append(action)
         wrenches.append(wrench)
-        state = grip.step_batch(scenes, state, wrench[None], substeps=substeps)
+
+        # wrench[None] adds the single-step axis `step_batch` expects.
+        state = grip.step_batch(batch.scenes, state, wrench[None], substeps=batch.substeps)
         states.append(state)
 
-    return np.array(states), np.array(wrenches), observations, actions
+    return Window(np.array(states), np.array(wrenches), observations, actions)
 
 
-def policy_gradient(scenes, trajectory, wrenches, observations, actions, ramp_angles, targets, actor, variant, substeps, jacobian, critic=None, shaping=True):
+def policy_gradient(batch, window, actor, critic=None, shaping=True):
     """dJ/d(actor parameters) for a closed-loop window, accumulated into .grad.
 
     The per-step sweep, lifted out of `tests/check_closed_loop.py` now that
@@ -207,23 +259,59 @@ def policy_gradient(scenes, trajectory, wrenches, observations, actions, ramp_an
     the objective the windowed reward alone, which is what a
     finite-difference check needs, since the check has to differentiate
     exactly the quantity it perturbs.
-    """
-    dl_dZ, dl_dU = task.reward_seeds(trajectory, wrenches, ramp_angles, targets, variant, shaping=shaping)
 
+    Takes the `task.Batch` and the `Window` whole. The two used to arrive
+    as eleven loose positional arguments, six of which were also `rollout`
+    arguments, and a swapped pair among them raises nothing -- it just
+    differentiates a different problem.
+    """
+    trajectory, wrenches = window.states, window.wrenches
+
+    # Partials of the stage cost only -- dr/dZ_t and dr/dU_t at each step,
+    # holding everything else fixed. GRIP turns them into total derivatives.
+    dl_dZ, dl_dU = task.reward_seeds(trajectory, wrenches, batch.angles, batch.targets, batch.variant, shaping=shaping)
+
+    # `adjoint` is the running quantity, dJ/dZ at whichever step the sweep has
+    # reached: "how much does the total objective move if the state is nudged
+    # right here?" It starts at the far end of the window, where the only
+    # contribution is the reward's own derivative at the final state.
     adjoint = dl_dZ[-1].copy()
+
     if critic is not None:
-        terminal = as_tensor(task.observe(trajectory[-1], ramp_angles, targets, variant), grad=True)
+        # The terminal bootstrap. Everything past the window's end is
+        # summarized by V(Z_W), so its derivative joins the seed. The critic
+        # reads observations, so dV/d(obs) has to be pulled back to dV/dZ
+        # through the observation Jacobian before it can be added.
+        terminal = as_tensor(task.observe(trajectory[-1], batch.angles, batch.targets, batch.variant), grad=True)
         value = critic(terminal)
         (dV_dobs,) = torch.autograd.grad(value.sum(), [terminal])
-        adjoint = adjoint + task.state_gradient(dV_dobs.detach().numpy(), jacobian)
+        adjoint = adjoint + task.state_gradient(dV_dobs.detach().numpy(), batch.jacobian)
 
+    # Backwards, one control step at a time. One call per WINDOW would give
+    # the open-loop gradient; the difference is the middle term below.
     for t in range(len(wrenches) - 1, -1, -1):
+        # Two-state slice, Z_t -> Z_{t+1}. The seed is zero on the first state
+        # and `adjoint` on the second, which says: only account for how the
+        # objective arrives at the downstream state.
         seed = np.zeros((2,) + trajectory.shape[1:])
         seed[1] = adjoint
-        dJ_dZ0, dJ_dU = grip.adjoint_batch(scenes, trajectory[t:t + 2], wrenches[t:t + 1], substeps, seed, dl_dU[t:t + 1])
+        dJ_dZ0, dJ_dU = grip.adjoint_batch(batch.scenes, trajectory[t:t + 2], wrenches[t:t + 1], batch.substeps, seed, dl_dU[t:t + 1])
 
-        action_gradient = task.to_action_gradient(dJ_dU, ramp_angles, variant)[0]
-        dJ_dobs = accumulate(actor, actions[t], action_gradient, observations[t])
-        adjoint = dJ_dZ0 + task.state_gradient(dJ_dobs, jacobian) + dl_dZ[t]
+        # GRIP differentiates world wrenches; the network emits ramp-frame
+        # actions. Rotate back, then drop the single-step axis with [0].
+        action_gradient = task.to_action_gradient(dJ_dU, batch.angles, batch.variant)[0]
+
+        # Push that through the network: banks dJ/d(theta) for this step and
+        # returns dJ/d(observation) for the term below.
+        dJ_dobs = accumulate(actor, window.actions[t], action_gradient, window.observations[t])
+
+        # The three paths by which Z_t reaches the objective, summed:
+        #   dJ_dZ0            Z_t -> Z_{t+1} through physics, force held fixed
+        #   state_gradient(.) Z_t -> obs_t -> a_t -> Z_{t+1}, THROUGH THE POLICY
+        #   dl_dZ[t]          the reward's own dependence on Z_t
+        # The middle term is what a single whole-window call cannot see: it
+        # treats the controls as fixed inputs, which is right for a trajectory
+        # optimizer and wrong for anything that reacts to the state.
+        adjoint = dJ_dZ0 + task.state_gradient(dJ_dobs, batch.jacobian) + dl_dZ[t]
 
     return adjoint

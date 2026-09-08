@@ -235,24 +235,18 @@ def probe_adjoint(variant):
     rng = np.random.default_rng(1)
     n_envs, steps, probes = 2, 12, 10
     angles = rng.uniform(*task.RAMP_ANGLE_RANGE, size=n_envs)
-    bodies = task.bodies_for(variant)
-    scenes = ramp.make_scenes(angles, bodies=bodies)
-    substeps = task.substeps_for(scenes[0])
+    batch = task.fixed_batch(angles, variant, start=np.array([0.1, 0.3]), offset=np.array([0.5, -0.5]))
 
-    start = np.array([0.1, 0.3])
-    positions = task.placement(start, 0.0, variant)
-    state = task.settle(scenes, ramp.resting_state(positions, angles, bodies=bodies), substeps)
-    targets = ramp.along_ramp(state, angles)[:, variant.box] + np.array([0.5, -0.5])
     # Well inside the limit, so the clip is not what is under test here.
-    wrenches = task.to_wrench(rng.uniform(-1.5, 1.5, size=(steps, n_envs, len(variant.actuated), 2)), angles, variant)
+    wrenches = task.to_wrench(rng.uniform(-1.5, 1.5, size=(steps, n_envs, len(variant.actuated), 2)), batch.angles, variant)
 
-    trajectory = np.array(grip.rollout_batch(scenes, state, wrenches, substeps=substeps))
-    dl_dZ, dl_dU = task.reward_seeds(trajectory, wrenches, angles, targets, variant)
-    _, dJ_dU = grip.adjoint_batch(scenes, trajectory, wrenches, substeps, dl_dZ, dl_dU)
+    trajectory = np.array(grip.rollout_batch(batch.scenes, batch.state, wrenches, substeps=batch.substeps))
+    dl_dZ, dl_dU = task.reward_seeds(trajectory, wrenches, batch.angles, batch.targets, variant)
+    _, dJ_dU = grip.adjoint_batch(batch.scenes, trajectory, wrenches, batch.substeps, dl_dZ, dl_dU)
 
     def total(controls):
-        rolled = grip.rollout_batch(scenes, state, controls, substeps=substeps)
-        return task.reward(rolled, controls, angles, targets, variant).sum()
+        rolled = grip.rollout_batch(batch.scenes, batch.state, controls, substeps=batch.substeps)
+        return task.reward(rolled, controls, batch.angles, batch.targets, variant).sum()
 
     indices = [(rng.integers(steps), rng.integers(n_envs), rng.integers(variant.bodies), rng.integers(3)) for _ in range(probes)]
     worst = 0.0
@@ -344,15 +338,22 @@ def check_action_limit():
 def check_batch():
     """A sampled batch has to be internally consistent."""
     rng = np.random.default_rng(7)
-    scenes, angles, state, targets = task.sample_batch(rng, 6, task.BOX_ONLY)
+    batch = task.sample_batch(rng, 6, task.BOX_ONLY)
+    scenes, angles, state, targets = batch.scenes, batch.angles, batch.state, batch.targets
     assert len(scenes) == 6 and state.shape == (6, 1, 6) and targets.shape == (6,)
     assert np.allclose([ramp.scene_angle(s) for s in scenes], angles)
     assert (angles >= task.RAMP_ANGLE_RANGE[0]).all() and (angles <= task.RAMP_ANGLE_RANGE[1]).all()
     assert (angles < ramp.friction_angle(ramp.DEFAULT_PENALTY["friction"])).all(), "a sampled slope is above the friction angle"
 
+    # The batch carries its own derived pieces, so nothing downstream can
+    # rebuild one of them against a different slope.
+    assert batch.substeps == task.substeps_for(scenes[0]) and batch.variant is task.BOX_ONLY
+    assert batch.jacobian.shape == (6, task.observe(state, angles, targets, batch.variant).shape[-1], 1, 6)
+
     offsets = targets - ramp.along_ramp(state, angles)[:, 0]
     assert (np.abs(offsets) >= task.TARGET_OFFSET_RANGE[0] - 1e-9).all()
     print(f"  6 environments, slopes {np.degrees(angles).min():.1f}-{np.degrees(angles).max():.1f} deg, {(offsets < 0).sum()} of 6 targets downhill")
+    print(f"  batch carries its own substeps ({batch.substeps}), observation jacobian {batch.jacobian.shape} and variant")
 
 
 def main():
