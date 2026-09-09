@@ -55,14 +55,16 @@ def draw_frame(axes, state, ramp_angle, target, bodies, box_index, low, high):
     """Draw one instant: the ramp surface, every body, and the target mark."""
     up, out = ramp.uphill(ramp_angle), ramp.normal(ramp_angle)
 
-    # The ramp passes through the origin along `uphill`. Extending it to
-    # the diagonal of the view guarantees it crosses the whole frame
-    # whatever the slope, so it reads as a surface and not a line segment.
+    # Draw the ramp as a line through the origin along `uphill`, running
+    # twice the view diagonal in each direction. That length guarantees it
+    # crosses the whole frame at any slope, so it reads as a surface rather
+    # than a line segment.
     reach = 2.0 * float(np.linalg.norm(high - low))
     ends = np.stack([-reach * up, reach * up])
     axes.plot(ends[:, 0], ends[:, 1], color=RAMP_COLOR, linewidth=2.0, zorder=2)
 
-    # Filled below the surface, so which side is solid is unambiguous.
+    # Fill the quad hanging below the surface, so which side is solid is
+    # unambiguous.
     depth = 2.0 * (high[1] - low[1])
     below = np.stack([ends[0], ends[1], ends[1] - depth * out, ends[0] - depth * out])
     axes.fill(below[:, 0], below[:, 1], color=RAMP_COLOR, alpha=0.13, zorder=1)
@@ -72,8 +74,8 @@ def draw_frame(axes, state, ramp_angle, target, bodies, box_index, low, high):
         color = BOX_COLOR if index == box_index else PUSHER_COLOR
         axes.fill(corners[:, 0], corners[:, 1], color=color, zorder=3, edgecolor="white", linewidth=0.9)
 
-    # The target is an arc length along the ramp, so it marks a point on
-    # the surface rather than somewhere in free space.
+    # Put the target marker on the surface by scaling `uphill` by the
+    # target's arc length, rather than leaving it somewhere in free space.
     foot = target * up
     axes.plot([foot[0]], [foot[1]], marker="v", markersize=10, color=TARGET_COLOR, zorder=4)
 
@@ -109,7 +111,8 @@ def animate(states, ramp_angle, target, bodies, box_index, path, fps=25, stride=
 
         draw_frame(axes, frames[index], ramp_angle, target, bodies, box_index, low, high)
 
-        # Elapsed time, so a viewer can tell the approach from the hold.
+        # Stamp the elapsed time in the corner, so a viewer can tell the
+        # approach from the hold.
         axes.text(0.015, 0.93, f"{index * stride / 100.0:5.2f} s", transform=axes.transAxes,
                   fontsize=9, family="monospace", color="#4a5568")
 

@@ -360,6 +360,20 @@ Pedro's preferences, the same ones GRIP uses where they carry over to Python.
     reader knows what the thing does, never before.
 - **ASCII in code, Unicode in Markdown.** Python files use `--` and `alpha`;
   `.md` files use — and α. Don't mix them.
+- **A comment says what the next line or block does. Rationale comes after
+  that, or not at all.** This is the rule Pedro has corrected three times,
+  so it is written out rather than left implied. Open in the imperative --
+  "Concatenate the per-step observations into one array of rows" -- and put
+  the shape change on its own line where there is one. A comment whose
+  first sentence explains a *choice* is the failure mode: the reader wants
+  to know what the line does before they can care why it does it. Two
+  corollaries. A comment belongs immediately above the lines it describes
+  and nowhere else; one that drifts to a neighbouring statement is worse
+  than none. And a constant is the exception, since what it is IS its
+  value, so its comment is allowed to be all rationale.
+- **`batch` means `task.Batch`.** Not a window, not the environment count,
+  not the flattened rows a network is fitted on. Say "window",
+  "environments", "rows".
 - **Comments explain why in ordinary code, and *what* in dense code.** The
   old rule here was "comments explain why, the what is already on the line
   above." That is true of code that reads plainly and false of the code

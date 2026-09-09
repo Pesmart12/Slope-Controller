@@ -762,8 +762,8 @@ def build_batch(ramp_angles, start, offset, gaps, variant):
     # creeps a millimetre or two during the settle window.
     targets = ramp.along_ramp(state, angles)[:, variant.box] + offset
 
-    # The Jacobian is constant because `observe` is affine, so it is built once
-    # here and never recomputed inside a backward sweep.
+    # Build the observation Jacobian once and hand it to the Batch. It is
+    # constant because `observe` is affine, so no backward sweep recomputes it.
     return Batch(scenes, angles, state, targets, substeps, observation_jacobian(angles, variant), variant)
 
 

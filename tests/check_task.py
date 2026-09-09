@@ -83,7 +83,9 @@ def check_body_geometry():
     # Reflection preserves the polar moment, so the two pushers must match.
     assert math.isclose(ramp.PUSHER["inertia"], ramp.PUSHER_MIRRORED["inertia"], rel_tol=1e-12)
 
-    # The claim resting_state's docstring makes, in numbers.
+    # Check the resting offsets against what `resting_state`'s docstring
+    # claims: half a side for the box, and NOT half its height for the
+    # pusher, whose centroid the face trim moved.
     offsets = {name: ramp.resting_offset(s["vertices"]) for name, s in [("box", ramp.BOX), ("pusher", ramp.PUSHER)]}
     print(f"  resting offset: box {1e3 * offsets['box']:.3f} mm (= half side), pusher {1e3 * offsets['pusher']:.3f} mm (NOT half height)")
     assert math.isclose(offsets["box"], 0.5 * ramp.BOX_SIDE, rel_tol=1e-12)
@@ -237,6 +239,7 @@ def probe_adjoint(variant):
     angles = rng.uniform(*task.RAMP_ANGLE_RANGE, size=n_envs)
     batch = task.fixed_batch(angles, variant, start=np.array([0.1, 0.3]), offset=np.array([0.5, -0.5]))
 
+    # Draw random actions in [-1.5, 1.5] N and rotate them into wrenches.
     # Well inside the limit, so the clip is not what is under test here.
     wrenches = task.to_wrench(rng.uniform(-1.5, 1.5, size=(steps, n_envs, len(variant.actuated), 2)), batch.angles, variant)
 

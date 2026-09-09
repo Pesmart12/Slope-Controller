@@ -209,13 +209,15 @@ def accumulate(module, outputs, seed, inputs):
     """
     parameters = [p for p in module.parameters() if p.requires_grad]
 
-    # `grad_outputs` IS the handoff between the two autodiff systems. Normally
-    # torch seeds a backward pass with 1.0 on a scalar loss; here the scalar
-    # lives on the far side of the simulator, so GRIP's dJ/d(action) is handed
-    # in as the seed instead. Asking for `parameters + [inputs]` walks the
-    # graph once and returns both halves: the parameter gradients, and
-    # dJ/d(observation) as the last element. `retain_graph` because the sweep
-    # comes back through this graph once per step; `allow_unused` because
+    # Differentiate the actions with respect to every parameter and the
+    # observation in one walk of the graph, returning the parameter gradients
+    # followed by dJ/d(observation) as the last element.
+    #
+    # `grad_outputs` is the handoff between the two autodiff systems. Torch
+    # normally seeds a backward pass with 1.0 on a scalar loss; here the
+    # scalar lives on the far side of the simulator, so GRIP's dJ/d(action)
+    # goes in as the seed instead. `retain_graph` because the sweep comes
+    # back through this graph once per step; `allow_unused` because
     # `log_std` never enters a deterministic pass and comes back as None.
     gradients = torch.autograd.grad(outputs, parameters + [inputs], grad_outputs=as_tensor(seed), retain_graph=True, allow_unused=True)
 
@@ -251,15 +253,47 @@ def set_flat_parameters(module, flat):
             offset += size
 
 
+def gradients(module):
+    """Every parameter's `.grad`, in parameter order, a missing one
+    materialized as zeros.
+
+    A parameter that never entered the computation has `.grad` of None --
+    `log_std` on a deterministic pass, which reaches the action only through
+    the noise term. Substituting zeros rather than dropping the entry is what
+    keeps position meaningful: the list stays one entry per parameter, so
+    nothing downstream has to know which were absent. Dropping them instead
+    would shift every later index and misalign `flat_gradients` against
+    `flat_parameters` silently.
+    """
+    return [torch.zeros_like(p) if p.grad is None else p.grad for p in module.parameters()]
+
+
 def flat_gradients(module):
     """Every parameter's `.grad` flattened into one vector, to line up with
     `flat_parameters`.
 
-    A parameter that never entered the computation has `.grad` of None.
-    Those become zeros rather than being skipped, so both vectors have the
-    same length and index i means the same parameter in each.
+    Index i means the same parameter in both vectors, which is what a
+    finite-difference check needs: it nudges parameter i and compares against
+    gradient i.
     """
-    return torch.cat([(torch.zeros_like(p) if p.grad is None else p.grad).reshape(-1) for p in module.parameters()])
+    return torch.cat([gradient.reshape(-1) for gradient in gradients(module)])
+
+
+def gradient_norm(module, error_if_nonfinite=True):
+    """The L2 norm of every gradient taken as one vector.
+
+    Raises by default if any gradient is infinite or NaN. That is worth a
+    hard failure rather than a warning: a NaN entering Adam's second-moment
+    estimate stays there, so every step after it is NaN too and the run is
+    producing nothing. Failing at the first iteration beats discovering it
+    hours in.
+
+    Torch's `get_total_norm` does the arithmetic. It sums the squared
+    per-tensor norms rather than squaring 5448 elements in one pass, which
+    can differ from `flat_gradients(module).norm()` in the last few bits and
+    never by more than about 1e-15 relative.
+    """
+    return float(torch.nn.utils.get_total_norm(gradients(module), error_if_nonfinite=error_if_nonfinite))
 
 
 def zero_gradients(module):
@@ -299,9 +333,10 @@ def rollout(batch, actor, steps, deterministic=False):
         observation = as_tensor(task.observe(state, batch.angles, batch.targets, batch.variant), grad=True)
         action = actor(observation, deterministic=deterministic)
 
-        # .detach() is the handoff out of torch: GRIP is numpy and knows
-        # nothing about the graph. The link is re-established by hand later,
-        # when `accumulate` seeds the backward pass with what GRIP computed.
+        # Rotate the action into a world wrench as numpy, cutting it off the
+        # graph on the way out. GRIP knows nothing about torch, so the link
+        # is re-established by hand later, when `accumulate` seeds the
+        # backward pass with what GRIP computed.
         wrench = task.to_wrench(action.detach().numpy(), batch.angles, batch.variant)
 
         # observations and actions are kept as LIVE tensors with their graph
@@ -384,14 +419,15 @@ def policy_gradient(batch, window, actor, critic=None, shaping=True, gamma=1.0):
     dl_dZ, dl_dU = task.reward_seeds(trajectory, wrenches, batch.angles, batch.targets, batch.variant, shaping=shaping)
 
     if gamma != 1.0:
-        # reward[t] carries gamma^t. Scaling the seeds here is equivalent to
-        # discounting the objective, and leaves the sweep below untouched.
+        # Multiply seed t by gamma^t, broadcasting the weight across the
+        # environment, body and component axes. Discounting the seeds this
+        # way discounts the objective and leaves the sweep below untouched.
         weights = gamma ** np.arange(steps)
         dl_dU = dl_dU * weights[:, None, None, None]
 
-        # dl_dZ[s] differentiates reward[s-1], so its weight is shifted by
-        # one. dl_dZ[0] is all zeros -- no control reaches Z_0 -- so it has
-        # no weight to get wrong.
+        # Apply the same weights to dl_dZ, shifted one row later, because
+        # dl_dZ[s] differentiates reward[s-1] rather than reward[s]. Row 0 is
+        # skipped and stays zero -- no control reaches Z_0.
         dl_dZ = dl_dZ.copy()
         dl_dZ[1:] *= weights[:, None, None, None]
 
@@ -402,16 +438,18 @@ def policy_gradient(batch, window, actor, critic=None, shaping=True, gamma=1.0):
     adjoint = dl_dZ[-1].copy()
 
     if critic is not None:
-        # The terminal bootstrap. Everything past the window's end is
-        # summarized by V(Z_W), so its derivative joins the seed. The critic
-        # reads observations, so dV/d(obs) has to be pulled back to dV/dZ
-        # through the observation Jacobian before it can be added.
+        # Observe the window's final state, score it with the critic, and
+        # take dV/d(observation). This is the terminal bootstrap: everything
+        # past the window's end is summarized by V(Z_W), so its derivative
+        # joins the seed.
         terminal = as_tensor(task.observe(trajectory[-1], batch.angles, batch.targets, batch.variant), grad=True)
         value = critic(terminal)
         (dV_dobs,) = torch.autograd.grad(value.sum(), [terminal])
 
-        # gamma^steps, because V estimates reward starting one step past the
-        # window's last reward.
+        # Multiply the critic's observation gradient by the observation
+        # Jacobian to get dV/dZ, weight it by gamma^steps, and add it to the
+        # seed. gamma^steps because V estimates reward starting one step past
+        # the window's last reward.
         adjoint = adjoint + gamma ** steps * task.state_gradient(dV_dobs.detach().numpy(), batch.jacobian)
 
     # Backwards, one control step at a time. One call per WINDOW would give
@@ -424,8 +462,9 @@ def policy_gradient(batch, window, actor, critic=None, shaping=True, gamma=1.0):
         seed[1] = adjoint
         dJ_dZ0, dJ_dU = grip.adjoint_batch(batch.scenes, trajectory[t:t + 2], wrenches[t:t + 1], batch.substeps, seed, dl_dU[t:t + 1])
 
-        # GRIP differentiates world wrenches; the network emits ramp-frame
-        # actions. Rotate back, then drop the single-step axis with [0].
+        # Rotate the wrench gradient back into the ramp frame and drop the
+        # single-step axis with [0]. GRIP differentiates world wrenches; the
+        # network emits ramp-frame actions.
         action_gradient = task.to_action_gradient(dJ_dU, batch.angles, batch.variant)[0]
 
         # Push that through the network: banks dJ/d(theta) for this step and

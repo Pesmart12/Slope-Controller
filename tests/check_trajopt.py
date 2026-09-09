@@ -97,14 +97,15 @@ def optimize(batch, iterations=ITERATIONS):
         first_moment = beta_1 * first_moment + (1.0 - beta_1) * gradient
         second_moment = beta_2 * second_moment + (1.0 - beta_2) * gradient * gradient
 
-        # Both averages start at zero and so are biased low for the first
-        # iterations. Dividing by (1 - beta^t) undoes exactly that, and the
-        # correction decays to nothing as beta^t does.
+        # Divide out the initialization bias. Both averages start at zero
+        # and so read low for the first iterations; (1 - beta^t) undoes
+        # exactly that, and decays to nothing as beta^t does.
         corrected_first = first_moment / (1.0 - beta_1 ** iteration)
         corrected_second = second_moment / (1.0 - beta_2 ** iteration)
 
-        # Dividing by the root second moment is what makes the step size
-        # roughly `learning_rate` regardless of gradient scale -- which is why
+        # Step by the corrected first moment over the root of the corrected
+        # second, scaled by `learning_rate`. That division is what holds the
+        # step near `learning_rate` whatever the gradient scale, which is why
         # this handles a trajectory whose early steps move the load and whose
         # late steps only hold it. `+` rather than `-`: reward, not loss.
         actions += learning_rate * corrected_first / (np.sqrt(corrected_second) + epsilon)
@@ -165,7 +166,9 @@ def report_creep_band(actions, angles, degrees):
     held = actions[settled, :, 0, 0].mean(axis=0)
     hold_force, break_free = ramp.hold_force(angles), ramp.break_free_force(angles)
 
-    # Well inside the creep regime, rather than anywhere near sliding.
+    # Locate the settled force between holding and breaking free, and read
+    # off the creep rate it implies. Both should say the converged solution
+    # sits well inside the creep regime rather than anywhere near sliding.
     margin = np.abs(held - hold_force) / (break_free - hold_force)
     creep = 100 * (held - hold_force) / (2 * ramp.DEFAULT_PENALTY["slip_damping"])
     print(f"  settled force {np.array2string(held, precision=2)} N against mg sin(a) {np.array2string(hold_force, precision=2)} N"

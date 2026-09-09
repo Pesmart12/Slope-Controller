@@ -47,6 +47,24 @@ iteration 500 and ended near 9-11 cm. Every run so far, both variants,
 peaks early and decays. That is open and the cause is not identified, so
 do not read the discount as the remedy for it.
 
+The actor's gradient is norm-clipped, and that is under test rather than
+settled. It was added because the diagnostic run below showed the policy
+losing ground on the reward it is maximizing while the critic was accurate
+and improving -- an optimizer failing at its own objective, which is not a
+reward problem or a critic problem. See `MAX_GRADIENT_NORM` for how the
+ceiling was sized. Whether it holds the policy at its peak is exactly the
+comparison the next run makes, so do not write it up as a fix yet.
+
+Measured, two pushers, 2000 iterations, 64 environments, seed 0, gamma 0.99,
+no clipping. The policy peaks early and decays; the critic does not:
+
+    iteration   300     err 1.11 cm    bias -14.73   rmse 16.43   corr 0.971
+    iteration  2000     err 6.49 cm    bias   0.89   rmse  8.55   corr 0.967
+
+Shaped and unshaped reward degrade together over that span, -178.71 to
+-193.41 and -178.44 to -192.46, so `approach_penalty` is not steering the
+policy away from the task objective either.
+
 The critic is fitted in NORMALIZED units. Returns are still a badly scaled
 target for a network starting near zero, so `policy.Critic` keeps a
 running mean and standard deviation, fits in those units, and converts
@@ -85,6 +103,18 @@ POLYAK = 0.005
 # window of 32 steps.
 CRITIC_EPOCHS = 4
 
+# Ceiling on the actor's gradient norm. Applied after `ascend` divides by
+# the environment count, so one value holds however many environments run.
+#
+# Sized off a measured run. Over 2000 iterations at 64 environments the
+# post-division norm had a median near 1.2 and a tail at 4.4, 7.7, 13.9 and
+# 22.5. 2.0 sits above the bulk and cuts that tail.
+#
+# Adam does not absorb those on its own: a spike enters the numerator at
+# once and the second-moment denominator only over the following
+# iterations, so the outsized step lands before the correction does.
+MAX_GRADIENT_NORM = 2.0
+
 
 def window_returns(batch, window, target_critic, shaping, gamma=GAMMA, bootstrap=True):
     """The return from each state in the window: discounted reward to the end
@@ -106,9 +136,11 @@ def window_returns(batch, window, target_critic, shaping, gamma=GAMMA, bootstrap
 
     returns = torch.zeros((steps + 1, n_envs), dtype=torch.float64)
     if bootstrap:
-        # No graph. This is a regression target, and a target has to be a
-        # constant -- otherwise fitting the critic would push gradients into
-        # the target network, which is the one thing it exists to avoid.
+        # Observe the window's final state, score it with the target critic,
+        # and write that into the last row. Under no_grad because this is a
+        # regression target, and a target has to be a constant -- otherwise
+        # fitting the critic would push gradients into the target network,
+        # which is the one thing it exists to avoid.
         with torch.no_grad():
             terminal = policy.as_tensor(task.observe(window.states[-1], batch.angles, batch.targets, batch.variant))
             returns[-1] = target_critic(terminal)
@@ -123,24 +155,42 @@ def window_returns(batch, window, target_critic, shaping, gamma=GAMMA, bootstrap
 
 
 def fit_critic(critic, optimizer, observations, returns, epochs=CRITIC_EPOCHS):
-    """Regress the critic onto the window's returns. Returns the final loss.
+    """Regress the critic onto the window's returns. Returns the final loss,
+    or nan if `epochs` is zero.
 
-    Fitted in normalized units, so the statistics are updated first and
-    both sides of the loss are then in the same scale.
+    `observations` is a list of (environments, features), one per control
+    step; `returns` is (steps + 1, environments). Both are flattened to one
+    row per (step, environment) pair and fitted as independent samples --
+    the critic reads an observation and nothing else, so the order the rows
+    were produced in carries no information.
+
+    Fitted in normalized units. `update_statistics` runs first so the
+    predictions and the targets are on the same scale.
     """
     critic.update_statistics(returns)
 
-    # One flat batch of (state, return) pairs. The graph is dropped -- the
-    # critic is fitted to numbers, and letting the actor's graph reach into
-    # the critic's loss would tie two independent updates together.
+    # Concatenate the per-step observations into one array of rows, cutting
+    # each off the actor's autograd graph on the way:
+    #   steps x (environments, features) -> (steps * environments, features)
+    # Without the detach, loss.backward() would continue through the physics
+    # and into the actor.
     features = torch.cat([observation.detach() for observation in observations], dim=0)
+
+    # Drop the last return, flatten to one value per row of `features`, and
+    # convert to the units the network predicts in:
+    #   (steps + 1, environments) -> (steps * environments,)
+    # The dropped row holds the bootstrap, which has no observation to pair
+    # with.
     targets = critic.normalize(returns[:-1].reshape(-1)).detach()
 
-    # .item() rather than float(), which would warn about converting a
-    # tensor that still carries a graph.
     final_loss = float("nan")
     for _ in range(epochs):
+        # Clear the gradients the previous epoch left on the parameters.
         optimizer.zero_grad()
+
+        # Mean squared error between the network's raw output and the
+        # normalized returns. `normalized` rather than `forward`, which
+        # would un-normalize and put the two sides on different scales.
         loss = torch.nn.functional.mse_loss(critic.normalized(features), targets)
         loss.backward()
         optimizer.step()
@@ -175,8 +225,13 @@ def soft_update(target, source, tau=POLYAK):
             target_buffer.mul_(1.0 - tau).add_(buffer, alpha=tau)
 
 
-def ascend(module, optimizer, n_envs):
-    """Take one Adam step UPHILL on the accumulated gradient.
+def ascend(module, optimizer, n_envs, max_norm=MAX_GRADIENT_NORM):
+    """Take one Adam step UPHILL on the accumulated gradient, norm-clipped.
+
+    Returns the gradient norm measured before clipping, so a caller can
+    count how often the ceiling actually binds. Compare it against
+    `max_norm`, not against the norm `train` logs, which is measured before
+    the division below and so is larger by `n_envs`.
 
     `policy_gradient` accumulates dJ/d(weights) where J is a reward to be
     maximized, and torch optimizers minimize, so every gradient is negated
@@ -184,12 +239,32 @@ def ascend(module, optimizer, n_envs):
     one place it has to be acted on.
 
     Also divides by the environment count, so the step size means the same
-    thing whether the batch holds 8 environments or 64.
+    thing whether the batch holds 8 environments or 64. Clipping happens
+    after that division, which is why `MAX_GRADIENT_NORM` does not have to
+    be resized when the environment count is.
+
+    Pass `max_norm=None` to skip clipping entirely, which is what reproduces
+    the runs taken before it existed.
     """
     for parameter in module.parameters():
         if parameter.grad is not None:
             parameter.grad.neg_().div_(n_envs)
+
+    # Measure the length of the flattened gradient, which is the length the
+    # step would have without a ceiling. Raises here if anything went NaN or
+    # infinite. Same quantity `train` logs as |grad|, differing only by the
+    # division above.
+    total = policy.gradient_norm(module)
+
+    if max_norm is not None:
+        # Multiply every gradient by the ratio max_norm / total, whenever
+        # total is the larger. The ratio is then below 1, so the flattened
+        # gradient comes out with length exactly max_norm and its direction
+        # unchanged.
+        torch.nn.utils.clip_grad_norm_(module.parameters(), max_norm)
+
     optimizer.step()
+    return total
 
 
 def evaluate(actor, variant, batch=None, n_envs=8, seed=1000, shaping=False):
@@ -207,19 +282,71 @@ def evaluate(actor, variant, batch=None, n_envs=8, seed=1000, shaping=False):
     if batch is None:
         batch = task.sample_batch(np.random.default_rng(seed), n_envs, variant)
 
-    # No graph. `rollout` normally keeps 400 live autograd graphs so the
-    # sweep can walk back through them; nothing here differentiates, so
-    # building them would be 400 steps of bookkeeping thrown away.
+    # Roll a whole episode with the noise off and no autograd graph.
+    # `rollout` normally keeps 400 live graphs so the sweep can walk back
+    # through them; nothing here differentiates, so building them would be
+    # 400 steps of bookkeeping thrown away.
     with torch.no_grad():
         rolled = policy.rollout(batch, actor, task.EPISODE_STEPS, deterministic=True)
 
     reward = task.reward(rolled.states, rolled.wrenches, batch.angles, batch.targets, variant, shaping=shaping).sum(axis=0)
 
+    # Score the same rollout again with the shaping term switched on.
+    # Training maximizes this one; every reported number is the other.
+    shaped = task.reward(rolled.states, rolled.wrenches, batch.angles, batch.targets, variant, shaping=True).sum(axis=0)
+
     final = ramp.along_ramp(rolled.states[-1], batch.angles)[:, variant.box] - batch.targets
-    return reward, final
+    return reward, final, shaped
 
 
-def train(variant, iterations, n_envs=N_ENVS, window=WINDOW, gamma=GAMMA, seed=0, shaping=True, eval_every=100, eval_envs=8, log=print):
+def calibration(actor, critic, variant, n_envs=8, seed=1000, gamma=GAMMA, shaping=True):
+    """Measure the critic against the discounted return it is meant to predict.
+
+    Returns a dict: `bias` (mean V - mean true return), `rmse`, `correlation`,
+    and `initial` / `initial_true`, the two numbers for the episode's first
+    state.
+
+    The critic's own training loss cannot answer this. With a 32-step window
+    at gamma = 0.99 the regression target is 32 real rewards plus
+    gamma^32 = 0.725 times the target critic's output, so roughly 72% of what
+    the critic is fitted to is a lagged copy of itself. A loss near 1e-4 says
+    those two agree, not that either is right. This runs whole episodes to
+    termination instead, where the discounted return is a fact and needs no
+    bootstrap.
+
+    Scored on SHAPED reward by default, because that is what the critic was
+    trained on. Passing shaping=False measures it against a return it was
+    never asked to predict.
+    """
+    batch = task.sample_batch(np.random.default_rng(seed), n_envs, variant)
+    with torch.no_grad():
+        rolled = policy.rollout(batch, actor, task.EPISODE_STEPS, deterministic=True)
+
+    rewards = task.reward(rolled.states, rolled.wrenches, batch.angles, batch.targets, variant, shaping=shaping)
+    steps = len(rewards)
+
+    # Accumulate the discounted return to go, walking backwards from a
+    # terminal value of zero. Zero because the episode really ends here, so
+    # there is no "after" to estimate -- this is the quantity the training
+    # bootstrap stands in for.
+    true = np.zeros((steps + 1, n_envs))
+    for t in range(steps - 1, -1, -1):
+        true[t] = rewards[t] + gamma * true[t + 1]
+
+    observations = task.observe(rolled.states, batch.angles, batch.targets, variant)
+    with torch.no_grad():
+        # (steps + 1, environments, features) -> one row per (step,
+        # environment) for the forward pass, then back to the original shape.
+        flat = policy.as_tensor(observations.reshape(-1, observations.shape[-1]))
+        predicted = critic(flat).numpy().reshape(steps + 1, n_envs)
+
+    error = predicted - true
+    return dict(bias=float(error.mean()), rmse=float(np.sqrt((error ** 2).mean())),
+                correlation=float(np.corrcoef(predicted.reshape(-1), true.reshape(-1))[0, 1]),
+                initial=float(predicted[0].mean()), initial_true=float(true[0].mean()))
+
+
+def train(variant, iterations, n_envs=N_ENVS, window=WINDOW, gamma=GAMMA, max_norm=MAX_GRADIENT_NORM, seed=0, shaping=True, eval_every=100, eval_envs=8, log=print):
     """Run SHAC. Returns the actor, the critic, and the evaluation log.
 
     Episodes advance in lockstep: every environment starts together, runs
@@ -254,21 +381,30 @@ def train(variant, iterations, n_envs=N_ENVS, window=WINDOW, gamma=GAMMA, seed=0
     critic_optimizer = torch.optim.Adam(critic.parameters(), lr=CRITIC_LR)
 
     history, steps_done = [], 0
+    clipped = 0
     for iteration in range(1, iterations + 1):
         # Shorten rather than overrun, so an episode ends exactly at
         # EPISODE_STEPS. 400 is not a multiple of 32.
         steps = min(window, task.EPISODE_STEPS - steps_done)
 
-        # The last window of an episode has no future to estimate, so both
-        # the actor's objective and the critic's target stop at its end.
+        # Flag whether this window runs to the end of the episode. The last
+        # one has no future to estimate, so both the actor's objective and
+        # the critic's target stop at its end.
         ends_episode = steps_done + steps >= task.EPISODE_STEPS
 
         policy.zero_gradients(actor)
         rolled = policy.rollout(batch, actor, steps)
         policy.policy_gradient(batch, rolled, actor, critic=None if ends_episode else target_critic,
                                shaping=shaping, gamma=gamma)
-        gradient_norm = float(policy.flat_gradients(actor).norm())
-        ascend(actor, actor_optimizer, n_envs)
+        gradient_norm = policy.gradient_norm(actor)
+
+        # Step the actor, and count the iterations where the ceiling bound.
+        # A count of zero means the clip is inert and a comparison run says
+        # nothing; a count near every iteration means it is a learning-rate
+        # change wearing a disguise.
+        stepped = ascend(actor, actor_optimizer, n_envs, max_norm=max_norm)
+        if max_norm is not None and stepped > max_norm:
+            clipped += 1
 
         returns = window_returns(batch, rolled, target_critic, shaping, gamma=gamma, bootstrap=not ends_episode)
         critic_loss = fit_critic(critic, critic_optimizer, rolled.observations, returns)
@@ -281,14 +417,24 @@ def train(variant, iterations, n_envs=N_ENVS, window=WINDOW, gamma=GAMMA, seed=0
             batch = batch._replace(state=rolled.states[-1])
 
         if eval_every and (iteration % eval_every == 0 or iteration == 1):
-            reward, error = evaluate(actor, variant, n_envs=eval_envs)
-            record = dict(iteration=iteration, reward=float(reward.mean()),
+            reward, error, shaped = evaluate(actor, variant, n_envs=eval_envs)
+            calibrated = calibration(actor, critic, variant, n_envs=eval_envs, gamma=gamma)
+            record = dict(iteration=iteration, reward=float(reward.mean()), shaped=float(shaped.mean()),
                           error=float(np.abs(error).mean()), worst=float(np.abs(error).max()),
                           critic_loss=critic_loss, gradient_norm=gradient_norm,
-                          noise=float(torch.exp(actor.log_std.detach()).mean()))
+                          noise=float(torch.exp(actor.log_std.detach()).mean()), clipped=clipped, **calibrated)
             history.append(record)
-            log(f"  {iteration:>6}  reward {record['reward']:>9.2f}  err {100 * record['error']:>7.2f} cm"
-                f"  worst {100 * record['worst']:>7.2f} cm  critic {critic_loss:>8.4f}"
+
+            # Print two lines per evaluation: the policy, then the critic.
+            # The critic line compares V(s_0) against the return the episode
+            # actually paid, which is what `critic_loss` cannot report.
+            log(f"  {iteration:>6}  reward {record['reward']:>9.2f}  shaped {record['shaped']:>9.2f}"
+                f"  err {100 * record['error']:>7.2f} cm  worst {100 * record['worst']:>7.2f} cm"
                 f"  |grad| {gradient_norm:>8.1f}  sigma {record['noise']:.3f}")
+            log(f"          critic loss {critic_loss:>8.4f}  V(s0) {record['initial']:>9.2f}"
+                f"  true {record['initial_true']:>9.2f}  bias {record['bias']:>8.2f}"
+                f"  rmse {record['rmse']:>8.2f}  corr {record['correlation']:>6.3f}"
+                f"  clipped {record['clipped']:>4}")
+            clipped = 0
 
     return actor, critic, history

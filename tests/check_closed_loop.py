@@ -75,8 +75,9 @@ def per_step_gradient(batch, trajectory, controls, dl_dZ, dl_dU, dpi_dgain, gain
         action_gradient = task.to_action_gradient(dJ_dU, batch.angles, batch.variant)[0, :, 0, 0]
         total += (action_gradient * dpi_dgain[t]).sum()
 
-        # The path a single call cannot see: the state feeds the policy,
-        # which feeds the next state. dpi/dZ is -K * d(xi)/d(x, y).
+        # Build the term a single call cannot see, where the state feeds the
+        # policy which feeds the next state. dpi/dZ is -K * d(xi)/d(x, y),
+        # written onto the position columns of body 0.
         through_policy = np.zeros_like(adjoint)
         through_policy[:, 0, 0:2] = (-gain * action_gradient)[:, None] * ramp.uphill(batch.angles)
         adjoint = dJ_dZ0 + through_policy + dl_dZ[t]
@@ -92,8 +93,9 @@ def check(gain):
     peak = np.abs(gain * errors).max()
     assert peak < batch.variant.limit[0], f"the feedback law saturates at K = {gain}, so the clip is what is under test"
 
-    # If the recorded controls do not replay to the same trajectory, the
-    # adjoint is being handed a different problem than the one measured.
+    # Replay the recorded controls open-loop and check they reproduce the
+    # closed-loop trajectory. If they do not, the adjoint is being handed a
+    # different problem than the one measured.
     replay = np.array(grip.rollout_batch(batch.scenes, batch.state, controls, substeps=batch.substeps))
     assert np.abs(replay - trajectory).max() < 1e-12, "closed-loop and open-loop rollouts disagree"
 

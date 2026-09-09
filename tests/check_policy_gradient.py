@@ -52,8 +52,9 @@ def setup(variant, n_envs=2, seed=0):
     observation_size = task.observe(batch.state, batch.angles, batch.targets, variant).shape[-1]
     actor = policy.Actor(observation_size, len(variant.actuated), variant.limit)
 
-    # Small but not tiny, so the network is genuinely nonlinear at the
-    # operating point rather than sitting in tanh's linear region.
+    # Jitter every weight by 0.25 * N(0, 1). Small but not tiny, so the
+    # network is genuinely nonlinear at the operating point rather than
+    # sitting in tanh's linear region.
     with torch.no_grad():
         for parameter in actor.parameters():
             parameter.add_(0.25 * torch.randn_like(parameter))
@@ -95,9 +96,9 @@ def check(name, variant, shaping):
     for index in indices:
         finite = (perturbed_reward(index, h) - perturbed_reward(index, -h)) / (2.0 * h)
         policy.set_flat_parameters(actor, baseline)
-        # Relative to the gradient's own scale, not to this component --
-        # a component that happens to be near zero would otherwise
-        # dominate the score for no reason.
+        # Divide the error by the gradient's overall scale rather than by
+        # this component, so a component that happens to sit near zero
+        # cannot dominate the score for no reason.
         worst = max(worst, abs(finite - analytic[index]) / max(abs(finite), 1e-3 * scale))
 
     print(f"  {name}: {baseline.size} parameters, {len(indices)} probed through {WINDOW * batch.substeps} integration steps"

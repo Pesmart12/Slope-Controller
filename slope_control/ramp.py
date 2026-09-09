@@ -158,9 +158,10 @@ def pusher_vertices(width=PUSHER_WIDTH, height=PUSHER_HEIGHT, tilt=PUSHER_FACE_T
     # bottom-right; the third is the untouched top-right that meets the box.
     raw = [[-half_w, -half_h], [half_w - trim, -half_h], [half_w, half_h], [-half_w, half_h]]
 
-    # GRIP takes vertices in a frame centred on the centre of mass, and the
-    # trim moved the centroid ~2 mm off the rectangle's centre. Not recentring
-    # would put a standing torque offset into every contact this body makes.
+    # Shift every vertex so the centroid lands on the origin. GRIP takes
+    # vertices in a frame centred on the centre of mass, and the trim moved
+    # the centroid ~2 mm off the rectangle's centre; leaving it there would
+    # put a standing torque offset into every contact this body makes.
     _, centroid, _ = polygon_properties(raw)
     return [[vx - centroid[0], vy - centroid[1]] for vx, vy in raw]
 
@@ -217,8 +218,9 @@ def body(vertices, mass):
 
 BOX = body(square_vertices(BOX_SIDE), BOX_MASS)
 PUSHER = body(pusher_vertices(), PUSHER_MASS)
-# Reflection preserves both the centroid at the origin and the polar moment
-# about it, so this rebuilds to the same inertia rather than assuming so.
+# Build the mirrored pusher, deriving its mass properties again rather than
+# copying them. Reflection preserves both the centroid at the origin and the
+# polar moment about it, so the rebuild returns the same inertia.
 PUSHER_MIRRORED = body(mirrored_vertices(PUSHER["vertices"]), PUSHER_MASS)
 
 # Pusher, box, pusher. The box is unactuated and sits between them, which
@@ -230,10 +232,11 @@ TWO_PUSHER_BODIES = [PUSHER, BOX, PUSHER_MIRRORED]
 
 def contact_reach(body, toward_uphill):
     """How far a body's contact vertex extends toward the box it pushes."""
-    # Read off the vertex list rather than written down, because the 3 degree
-    # face trim moves it. Whichever extreme faces the box is the one that
-    # touches first: +x for a body reaching uphill, -x for the mirrored one,
-    # negated so both come back as a positive distance.
+    # Take the extreme vertex on whichever side faces the box, since that is
+    # the one that touches first: +x for a body reaching uphill, -x for the
+    # mirrored one, negated so both come back as a positive distance. Read
+    # off the vertex list rather than written down, because the 3 degree face
+    # trim moves it.
     xs = [vx for vx, _ in body["vertices"]]
     return max(xs) if toward_uphill else -min(xs)
 
@@ -290,9 +293,10 @@ def resting_state(xi, ramp_angles, bodies=None):
     bodies = BOX_ONLY_BODIES if bodies is None else bodies
     angles = np.atleast_1d(np.asarray(ramp_angles, dtype=float))
 
-    # A bare (environments,) means one position per environment, shared by
-    # every body -- not one per body. Numpy would align it to the trailing
-    # axis and get that backwards, so say which axis it is.
+    # Open a body axis on a bare (environments,) input, giving
+    # (environments, 1) so it broadcasts across bodies. Such an input means
+    # one position per environment shared by every body, and numpy would
+    # otherwise align it to the trailing axis and read it as one per body.
     xi = np.asarray(xi, dtype=float)
     if xi.ndim == 1 and xi.size == angles.size:
         xi = xi[:, None]
@@ -306,8 +310,8 @@ def resting_state(xi, ramp_angles, bodies=None):
         # scalar multiplies a 2-vector. Velocities stay zero.
         state[:, index, 0:2] = xi[:, index, None] * up + resting_offset(body["vertices"]) * out
 
-        # Flush means the body angle IS the ramp angle, so the bottom face
-        # lies parallel to the surface.
+        # Set every body's angle to the ramp angle, which lays its bottom
+        # face flush against the surface.
         state[:, index, 2] = angles
     return state
 
