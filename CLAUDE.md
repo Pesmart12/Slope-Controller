@@ -234,7 +234,10 @@ so a session knows where it is.
    their best evaluations. What is not done is holding that: **every run
    so far peaks early and then degrades**, which is the open problem
    described under the standing reminder. The column is not complete until
-   a run ends near its best rather than well past it.
+   a run ends near its best rather than well past it. **The immediate next
+   action is the gradient-clipping comparison run** — see "THE NEXT STEP"
+   in the standing reminder for the config, the baseline to beat and how
+   to read the result.
 6. Wait for GRIP 2.0, rerun the column, fill in the cross-eval table.
 
 Steps 2–5 need nothing from GRIP that does not already exist. **Do not build
@@ -535,8 +538,58 @@ The third run **crashed at iteration 3500 with exit code 4 and no
 traceback**, six hours in. It was also running about six times slower per
 iteration than the two runs before it — 6.4 s against 1.03 s — both of
 which finished 8000 iterations in about 8250 s. Unexplained; it ran
-overnight, so the machine's own power state is not ruled out. If a long
-run is left unattended again, log to a file and checkpoint the actor.
+overnight, so the machine's own power state is not ruled out. A later
+2000-iteration run went at 0.93 s, so the slowdown was not the code. If a
+long run is left unattended again, log to a file and checkpoint the actor.
+
+### THE NEXT STEP: run the clipping comparison
+
+**Everything it needs is committed and nothing has been run.** `ascend`
+clips at `MAX_GRADIENT_NORM = 2.0` and `train` counts how often the ceiling
+binds, but no training run has used it. Do not write clipping up as
+anything until this happens.
+
+Run two pushers, 2000 iterations, 64 environments, seed 0, `eval_every=100`
+— which is exactly the instrumented baseline already measured:
+
+```
+  iter    err     reward    shaped   |  bias    rmse    corr
+   300   1.11    -178.44  -178.71   | -14.73   16.43   0.971   <- best
+  2000   6.49    -192.46  -193.41   |   0.89    8.55   0.967
+```
+
+**Read the `clipped` count first, before the error.** It decides whether
+the run means anything:
+
+- **0** — the ceiling never bound, the run is a re-run of the baseline and
+  says nothing about clipping. Lower `MAX_GRADIENT_NORM` and go again.
+- **near every iteration** — this is a learning-rate change wearing a
+  disguise. The honest control is a third run at lower `ACTOR_LR` with
+  `max_norm=None`; if that holds the policy too, it was never the spikes.
+- **somewhere in between** — the intended regime, and the error curve is
+  then worth reading.
+
+**If clipping does not hold the policy, measure the critic's SLOPE.** The
+diagnostic ruled out the two obvious suspects and left one unexamined.
+Shaping is not it: shaped and unshaped reward degrade together, −178.71 to
+−193.41 against −178.44 to −192.46, so the policy is not being pulled off
+the task objective. The critic's *values* are not it either: bias goes
+−14.73 → 0.89 and correlation holds at 0.97 while the policy decays, so it
+gets better as the policy gets worse. But what enters the actor's objective
+is `dV/dobs`, not V, and **nothing has ever checked it**. A network can fit
+values to 0.98 correlation and still have noisy local derivatives,
+especially fitted on 2048 on-policy rows for 4 epochs with no buffer.
+
+The one-line statement of the problem, worth keeping in front: **SHAC is
+losing ground on the objective it is maximizing, with a gradient verified
+correct to 9e-06 and a critic that is close to unbiased.** That is not a
+reward problem and not a critic-accuracy problem.
+
+Two smaller things this run should also do, since the last long one lost
+everything: **log to a file and checkpoint the actor and critic.** There is
+still no committed experiment that trains — every number so far came from a
+scratchpad script, which is why none of them is reproducible from the
+repository. `experiments/` needs that entry.
 
 One finding from step 4, now fixed rather than merely flagged:
 **gradients cannot discover a contact that does not exist.** With the task
