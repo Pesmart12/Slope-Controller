@@ -32,7 +32,7 @@ check runs discounted rather than at gamma = 1.
 import numpy as np
 import torch
 
-from slope_control import policy, task
+from slope_control import policy, sweep, task
 
 WINDOW = 24
 PROBES = 12
@@ -69,7 +69,7 @@ def windowed_reward(batch, actor, shaping, gamma=GAMMA):
     reward[t] weighted by gamma^t, with the first reward undiscounted. If
     the exponents in the sweep were off by one, this is what would catch it.
     """
-    window = policy.rollout(batch, actor, WINDOW, deterministic=True)
+    window = sweep.rollout(batch, actor, WINDOW, deterministic=True)
     rewards = task.reward(window.states, window.wrenches, batch.angles, batch.targets, batch.variant, shaping=shaping)
     return (gamma ** np.arange(len(rewards))[:, None] * rewards).sum()
 
@@ -78,8 +78,8 @@ def check(name, variant, shaping):
     batch, actor = setup(variant)
 
     policy.zero_gradients(actor)
-    window = policy.rollout(batch, actor, WINDOW, deterministic=True)
-    policy.policy_gradient(batch, window, actor, critic=None, shaping=shaping, gamma=GAMMA)
+    window = sweep.rollout(batch, actor, WINDOW, deterministic=True)
+    sweep.policy_gradient(batch, window, actor, critic=None, shaping=shaping, gamma=GAMMA)
     analytic = policy.flat_gradients(actor).numpy()
 
     baseline = policy.flat_parameters(actor).numpy().copy()

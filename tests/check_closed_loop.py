@@ -21,7 +21,7 @@ price is Python round trips, not physics.
 None of this is something to ask GRIP for. A state-dependent control is a
 policy, and policies belong on this side of the split.
 
-The sweep itself lives in `policy.policy_gradient`. What is here is a
+The sweep itself lives in `sweep.policy_gradient`. What is here is a
 second implementation of it against a hand-differentiated feedback law,
 which is a cross-check but also a copy that can drift.
 `check_policy_gradient.py` is what tests the shipped one.

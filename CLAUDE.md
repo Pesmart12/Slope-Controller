@@ -123,12 +123,13 @@ would produce something worse, say so.
 
 ## What exists
 
-Ten source files. The repository is small and should stay legible.
+Eleven source files. The repository is small and should stay legible.
 
 | | |
 |---|---|
 | `slope_control/ramp.py` | the ramp scene and its geometry conventions, shared by everything |
-| `slope_control/policy.py` | the actor and critic, and the seam where torch's autograd meets GRIP's adjoint |
+| `slope_control/policy.py` | the actor and critic, and the tensor plumbing they need |
+| `slope_control/sweep.py` | the closed-loop gradient — `rollout` forward, `accumulate` at the torch/GRIP seam, `policy_gradient` back |
 | `slope_control/task.py` | the step-2 task — action limit and frame, reward and its gradient seeds, episode and settle window, `Batch` and its two builders |
 | `slope_control/shac.py` | the training loop — windowed rollout, actor step, critic fit, target update |
 | `slope_control/render.py` | draws a scene and animates an episode to a GIF; pure presentation, computes nothing |
@@ -140,6 +141,18 @@ Ten source files. The repository is small and should stay legible.
 | `tests/check_policy_gradient.py` | the same statement for a real network — `dJ/d(theta)` against central differences |
 | `docs/ramp_manipulation_task.md` | the task definition; the authority on scene numbers, reward and episode structure |
 | `pyproject.toml` | the editable install, so nothing reaches the package by patching `sys.path` |
+
+**`policy.py` and `sweep.py` split on what a policy IS versus what running
+and differentiating one takes.** The boundary is checkable rather than
+aesthetic: `tests/check_policy_gradient.py` validates the whole gradient
+path importing `policy` and `sweep` and never `shac`, so verifying a
+derivative does not drag in the training loop. `Window` moving with them is
+the tell that the seam is real — only those three functions touch it.
+
+Two things sit on the wrong side of that line and are left there on
+purpose, being small: `ascend` is a generic optimizer step but lives in
+`shac.py` because only `train` calls it and its default is a SHAC-tuned
+constant, and `evaluate` and `calibration` would serve any algorithm.
 
 `slope_control/task.py` carries two variants, `BOX_ONLY` and `TWO_PUSHERS`,
 which differ in body count, which body is scored, which are actuated, and
@@ -216,7 +229,7 @@ so a session knows where it is.
    on. Every check now runs both variants; the adjoint holds through
    body-body contact at 2e-5 relative.
 5. **In progress.** SHAC on penalty — `slope_control/shac.py`, built on the
-   per-step adjoint sweep in `policy.policy_gradient`. **Both variants
+   per-step adjoint sweep in `sweep.policy_gradient`. **Both variants
    learn the task**, box-only to 0.73 cm and two pushers to 2.37 cm at
    their best evaluations. What is not done is holding that: **every run
    so far peaks early and then degrades**, which is the open problem
@@ -562,7 +575,7 @@ Three things left open on purpose, so they aren't mistaken for oversights:
   gradient, right for the baseline's fixed control sequence and **119%
   wrong** for a policy at one gain, 11% at another — state-dependent, so
   not something a learning rate absorbs. The sweep now lives in
-  `policy.policy_gradient`, **not** `task.py` as originally planned: it
+  `sweep.policy_gradient`, **not** `task.py` as originally planned: it
   needs torch, and keeping `task.py` torch-free is worth more, since
   `drift.py` and the numpy-side checks depend on it. It takes a
   `task.Batch` and a `policy.Window` — `policy_gradient(batch, window,

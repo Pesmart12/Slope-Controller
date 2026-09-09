@@ -12,7 +12,7 @@ The loop, one iteration:
 
 What makes this SHAC rather than a policy-gradient method is step 2. The
 gradient is computed, not estimated: GRIP differentiates the contact and
-`policy.policy_gradient` carries that through the network. No sampling, no
+`sweep.policy_gradient` carries that through the network. No sampling, no
 score function, no advantage estimate.
 
 The window is short because differentiating a whole 400-step episode
@@ -79,7 +79,7 @@ import copy
 import numpy as np
 import torch
 
-from . import policy, ramp, task
+from . import policy, ramp, sweep, task
 
 WINDOW = 32
 N_ENVS = 64
@@ -287,7 +287,7 @@ def evaluate(actor, variant, batch=None, n_envs=8, seed=1000, shaping=False):
     # through them; nothing here differentiates, so building them would be
     # 400 steps of bookkeeping thrown away.
     with torch.no_grad():
-        rolled = policy.rollout(batch, actor, task.EPISODE_STEPS, deterministic=True)
+        rolled = sweep.rollout(batch, actor, task.EPISODE_STEPS, deterministic=True)
 
     reward = task.reward(rolled.states, rolled.wrenches, batch.angles, batch.targets, variant, shaping=shaping).sum(axis=0)
 
@@ -320,7 +320,7 @@ def calibration(actor, critic, variant, n_envs=8, seed=1000, gamma=GAMMA, shapin
     """
     batch = task.sample_batch(np.random.default_rng(seed), n_envs, variant)
     with torch.no_grad():
-        rolled = policy.rollout(batch, actor, task.EPISODE_STEPS, deterministic=True)
+        rolled = sweep.rollout(batch, actor, task.EPISODE_STEPS, deterministic=True)
 
     rewards = task.reward(rolled.states, rolled.wrenches, batch.angles, batch.targets, variant, shaping=shaping)
     steps = len(rewards)
@@ -393,8 +393,8 @@ def train(variant, iterations, n_envs=N_ENVS, window=WINDOW, gamma=GAMMA, max_no
         ends_episode = steps_done + steps >= task.EPISODE_STEPS
 
         policy.zero_gradients(actor)
-        rolled = policy.rollout(batch, actor, steps)
-        policy.policy_gradient(batch, rolled, actor, critic=None if ends_episode else target_critic,
+        rolled = sweep.rollout(batch, actor, steps)
+        sweep.policy_gradient(batch, rolled, actor, critic=None if ends_episode else target_critic,
                                shaping=shaping, gamma=gamma)
         gradient_norm = policy.gradient_norm(actor)
 

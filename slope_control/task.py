@@ -483,7 +483,7 @@ def reward_seeds(states, controls, ramp_angles, targets, variant, weights=None, 
     These seeds are not the whole gradient for a policy. Contracting them
     with one `adjoint_batch` call over a window gives the open-loop
     gradient, which is correct for a fixed control sequence and wrong for
-    state feedback. See `policy.policy_gradient`.
+    state feedback. See `sweep.policy_gradient`.
     """
     weights = variant.weights if weights is None else weights
     states, controls = np.asarray(states), np.asarray(controls)
