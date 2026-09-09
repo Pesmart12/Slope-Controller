@@ -21,6 +21,12 @@ would differ by noise far larger than the perturbation.
 The critic is left out for the same reason. It would be a legitimate part
 of the objective, but the check has to differentiate exactly what it
 perturbs, and what it perturbs is the window's reward.
+
+The discount IS in, at a gamma of its own. Discounting is applied by
+scaling the two seed arrays before the sweep, and their exponents differ
+by one because control u_t is scored against the state it produces. That
+is an easy thing to get wrong and a silent thing to be wrong about, so the
+check runs discounted rather than at gamma = 1.
 """
 
 import numpy as np
@@ -30,6 +36,12 @@ from slope_control import policy, task
 
 WINDOW = 24
 PROBES = 12
+
+# Deliberately not 1.0. The discount is applied by scaling the seeds before
+# the backward sweep, and the exponents on the two seed arrays differ by
+# one, so an undiscounted check would pass while the thing training uses
+# was wrong.
+GAMMA = 0.97
 
 
 def setup(variant, n_envs=2, seed=0):
@@ -49,10 +61,16 @@ def setup(variant, n_envs=2, seed=0):
     return batch, actor
 
 
-def windowed_reward(batch, actor, shaping):
-    """The scalar the sweep claims to differentiate."""
+def windowed_reward(batch, actor, shaping, gamma=GAMMA):
+    """The scalar the sweep claims to differentiate.
+
+    Discounted the same way `policy_gradient` claims to discount it:
+    reward[t] weighted by gamma^t, with the first reward undiscounted. If
+    the exponents in the sweep were off by one, this is what would catch it.
+    """
     window = policy.rollout(batch, actor, WINDOW, deterministic=True)
-    return task.reward(window.states, window.wrenches, batch.angles, batch.targets, batch.variant, shaping=shaping).sum()
+    rewards = task.reward(window.states, window.wrenches, batch.angles, batch.targets, batch.variant, shaping=shaping)
+    return (gamma ** np.arange(len(rewards))[:, None] * rewards).sum()
 
 
 def check(name, variant, shaping):
@@ -60,7 +78,7 @@ def check(name, variant, shaping):
 
     policy.zero_gradients(actor)
     window = policy.rollout(batch, actor, WINDOW, deterministic=True)
-    policy.policy_gradient(batch, window, actor, critic=None, shaping=shaping)
+    policy.policy_gradient(batch, window, actor, critic=None, shaping=shaping, gamma=GAMMA)
     analytic = policy.flat_gradients(actor).numpy()
 
     baseline = policy.flat_parameters(actor).numpy().copy()
@@ -89,7 +107,7 @@ def check(name, variant, shaping):
 
 def main():
     print(__doc__.strip().splitlines()[0])
-    print(f"\n  MLP actor, deterministic, {WINDOW}-step window, per-step adjoint sweep\n")
+    print(f"\n  MLP actor, deterministic, {WINDOW}-step window, per-step adjoint sweep, gamma = {GAMMA}\n")
 
     worst = 0.0
     for name, variant, shaping in [("box only,  unshaped", task.BOX_ONLY, False),

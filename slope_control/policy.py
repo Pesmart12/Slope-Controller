@@ -319,7 +319,7 @@ def rollout(batch, actor, steps, deterministic=False):
     return Window(np.array(states), np.array(wrenches), observations, actions)
 
 
-def policy_gradient(batch, window, actor, critic=None, shaping=True):
+def policy_gradient(batch, window, actor, critic=None, shaping=True, gamma=1.0):
     """Differentiate a window's reward with respect to the actor's weights.
 
     Adds the result into each parameter's `.grad`, ready for an optimizer
@@ -359,18 +359,41 @@ def policy_gradient(batch, window, actor, critic=None, shaping=True):
 
     `critic`, when given, estimates the reward after the window ends and
     its derivative joins the seed at the window's final state. Pass None to
-    make the objective the window's reward alone. A finite-difference check
-    needs that, because it perturbs the weights and remeasures the window's
-    reward -- if this function included the critic's contribution and the
-    check did not, the two would differ for a legitimate reason and the
-    check would prove nothing. Training always passes a critic.
+    make the objective the window's reward alone. Two callers need that: a
+    finite-difference check, which has to differentiate exactly what it
+    perturbs, and the last window of an episode, where there is genuinely
+    no future to estimate.
+
+    `gamma` discounts. The objective is
+
+        sum over t of gamma^t * reward[t]  +  gamma^steps * V(final state)
+
+    applied by scaling the seeds before the sweep rather than inside it.
+    The backward recursion then carries the weights on its own, because
+    each reward's contribution enters through its own seed. Note the two
+    exponents differ by one: `dl_dU[t]` differentiates reward[t], but
+    `dl_dZ[s]` differentiates reward[s-1], since control u_t is scored
+    against the state it produces.
     """
     trajectory, wrenches = window.states, window.wrenches
+    steps = len(wrenches)
 
     # Partials of one step's reward -- dl/dZ_t and dl/dU_t, holding
     # everything else fixed. `adjoint_batch` turns them into total
     # derivatives of the objective, which is the l-to-J step.
     dl_dZ, dl_dU = task.reward_seeds(trajectory, wrenches, batch.angles, batch.targets, batch.variant, shaping=shaping)
+
+    if gamma != 1.0:
+        # reward[t] carries gamma^t. Scaling the seeds here is equivalent to
+        # discounting the objective, and leaves the sweep below untouched.
+        weights = gamma ** np.arange(steps)
+        dl_dU = dl_dU * weights[:, None, None, None]
+
+        # dl_dZ[s] differentiates reward[s-1], so its weight is shifted by
+        # one. dl_dZ[0] is all zeros -- no control reaches Z_0 -- so it has
+        # no weight to get wrong.
+        dl_dZ = dl_dZ.copy()
+        dl_dZ[1:] *= weights[:, None, None, None]
 
     # `adjoint` is the running quantity, dJ/dZ at whichever step the sweep has
     # reached: "how much does the total objective move if the state is nudged
@@ -386,7 +409,10 @@ def policy_gradient(batch, window, actor, critic=None, shaping=True):
         terminal = as_tensor(task.observe(trajectory[-1], batch.angles, batch.targets, batch.variant), grad=True)
         value = critic(terminal)
         (dV_dobs,) = torch.autograd.grad(value.sum(), [terminal])
-        adjoint = adjoint + task.state_gradient(dV_dobs.detach().numpy(), batch.jacobian)
+
+        # gamma^steps, because V estimates reward starting one step past the
+        # window's last reward.
+        adjoint = adjoint + gamma ** steps * task.state_gradient(dV_dobs.detach().numpy(), batch.jacobian)
 
     # Backwards, one control step at a time. One call per WINDOW would give
     # the open-loop gradient; the difference is the middle term below.

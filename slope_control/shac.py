@@ -20,20 +20,37 @@ through stiff contact is badly conditioned. The critic is what makes a
 short window sound -- it estimates the reward after the window ends, so
 the actor is not optimizing 0.32 s in isolation.
 
-Two conventions that differ from the published recipe, both deliberate:
+Discounted at gamma = 0.99, which is a training device and not a claim
+about what the task wants. Everything reported is the plain undiscounted
+reward -- `evaluate` sees no gamma at all.
 
-    No discounting. gamma = 1, so this maximizes the same undiscounted
-    sum that `check_trajopt` optimizes and that gets reported. The episode
-    is finite, so nothing diverges. Discounting at 0.99 would weight step
-    400 at 0.018, and step 400 is inside the hold -- which is exactly
-    where penalty contact and a rigid solve differ, so it is the last part
-    of the episode worth shrinking.
+An earlier version ran undiscounted, on the reasoning that the episode is
+finite so nothing diverges and the whole 4 s should count. Two things are
+wrong with that:
 
-    The critic is fitted in NORMALIZED units. Undiscounted returns here
-    run from about -1200 to -70, which is a badly scaled target for a
-    network initialized near zero. `policy.Critic` keeps a running mean
-    and standard deviation, fits in those units, and converts back on the
-    way out, so callers and the actor's gradient see real reward.
+    At gamma = 1 the Bellman operator is not a contraction, so the
+    bootstrap has no unique fixed point and no reason to converge. It
+    drifted to one: against episode returns near -180 the critic settled
+    at -53.87.
+
+    The value of a state under gamma = 1 also depends on how many steps
+    remain, and `observe` carries no clock. So the critic was being asked
+    to fit "-180 early in the episode" and "-0.5 late in it" with one
+    number and no way to tell them apart. Discounting makes the far future
+    irrelevant, which is most of why it is standard for episodic tasks.
+
+Both of those stand on their own, which is why the discount stays. What it
+did NOT do is fix training. Two pushers peaked at 2.37 cm on iteration 500
+and then degraded monotonically to 13.12 cm by 3500 -- earlier and more
+steadily than the undiscounted runs it replaced, which peaked at the same
+iteration 500 and ended near 9-11 cm. Every run so far, both variants,
+peaks early and decays. That is open and the cause is not identified, so
+do not read the discount as the remedy for it.
+
+The critic is fitted in NORMALIZED units. Returns are still a badly scaled
+target for a network starting near zero, so `policy.Critic` keeps a
+running mean and standard deviation, fits in those units, and converts
+back on the way out. Callers and the actor's gradient see real reward.
 
 The reward is MAXIMIZED, following the sign convention `task.py`
 documents. Adam minimizes, so the gradient is negated before every step.
@@ -49,6 +66,12 @@ from . import policy, ramp, task
 WINDOW = 32
 N_ENVS = 64
 
+# Effective horizon 1/(1 - gamma) = 100 control steps, one second, against
+# a four-second episode. Long enough to cover the approach and the arrival,
+# short enough that the bootstrap is a contraction. Raise toward 0.997 if a
+# longer horizon is ever wanted; it still contracts.
+GAMMA = 0.99
+
 ACTOR_LR = 1e-3
 CRITIC_LR = 1e-3
 
@@ -63,30 +86,39 @@ POLYAK = 0.005
 CRITIC_EPOCHS = 4
 
 
-def window_returns(batch, window, target_critic, shaping):
-    """The return from each state in the window: reward from here to the end
+def window_returns(batch, window, target_critic, shaping, gamma=GAMMA, bootstrap=True):
+    """The return from each state in the window: discounted reward to the end
     of the window, plus the target critic's estimate of everything after it.
 
     Returns (steps + 1, environments), lined up with `window.states`.
 
-    Undiscounted, so this is a plain reverse cumulative sum. The bootstrap
-    comes from the TARGET critic rather than the critic being trained, so
-    the regression target does not move every time the critic does.
+    `bootstrap=False` for the window that ends an episode. There is no
+    "after" there, so the correct terminal value is zero. Bootstrapping
+    anyway teaches the critic that reward keeps arriving past step 400,
+    which is a bias with nothing to correct it.
+
+    The bootstrap comes from the TARGET critic rather than the critic being
+    trained, so the regression target does not move every time the critic
+    does.
     """
     rewards = task.reward(window.states, window.wrenches, batch.angles, batch.targets, batch.variant, shaping=shaping)
     steps, n_envs = rewards.shape
 
-    with torch.no_grad():
-        terminal = policy.as_tensor(task.observe(window.states[-1], batch.angles, batch.targets, batch.variant))
-        returns = torch.zeros((steps + 1, n_envs), dtype=torch.float64)
-        returns[-1] = target_critic(terminal)
+    returns = torch.zeros((steps + 1, n_envs), dtype=torch.float64)
+    if bootstrap:
+        # No graph. This is a regression target, and a target has to be a
+        # constant -- otherwise fitting the critic would push gradients into
+        # the target network, which is the one thing it exists to avoid.
+        with torch.no_grad():
+            terminal = policy.as_tensor(task.observe(window.states[-1], batch.angles, batch.targets, batch.variant))
+            returns[-1] = target_critic(terminal)
 
-    # Walk backwards: the value of being at step t is this step's reward
-    # plus the value of where it lands. rewards[t] is the reward for the
-    # transition out of state t, which is why the indices line up.
+    # Walk backwards: the value of being at step t is this step's reward plus
+    # the discounted value of where it lands. rewards[t] is the reward for
+    # the transition out of state t, which is why the indices line up.
     rewards = policy.as_tensor(rewards)
     for t in range(steps - 1, -1, -1):
-        returns[t] = rewards[t] + returns[t + 1]
+        returns[t] = rewards[t] + gamma * returns[t + 1]
     return returns
 
 
@@ -187,7 +219,7 @@ def evaluate(actor, variant, batch=None, n_envs=8, seed=1000, shaping=False):
     return reward, final
 
 
-def train(variant, iterations, n_envs=N_ENVS, window=WINDOW, seed=0, shaping=True, eval_every=100, eval_envs=8, log=print):
+def train(variant, iterations, n_envs=N_ENVS, window=WINDOW, gamma=GAMMA, seed=0, shaping=True, eval_every=100, eval_envs=8, log=print):
     """Run SHAC. Returns the actor, the critic, and the evaluation log.
 
     Episodes advance in lockstep: every environment starts together, runs
@@ -227,13 +259,18 @@ def train(variant, iterations, n_envs=N_ENVS, window=WINDOW, seed=0, shaping=Tru
         # EPISODE_STEPS. 400 is not a multiple of 32.
         steps = min(window, task.EPISODE_STEPS - steps_done)
 
+        # The last window of an episode has no future to estimate, so both
+        # the actor's objective and the critic's target stop at its end.
+        ends_episode = steps_done + steps >= task.EPISODE_STEPS
+
         policy.zero_gradients(actor)
         rolled = policy.rollout(batch, actor, steps)
-        policy.policy_gradient(batch, rolled, actor, critic=target_critic, shaping=shaping)
+        policy.policy_gradient(batch, rolled, actor, critic=None if ends_episode else target_critic,
+                               shaping=shaping, gamma=gamma)
         gradient_norm = float(policy.flat_gradients(actor).norm())
         ascend(actor, actor_optimizer, n_envs)
 
-        returns = window_returns(batch, rolled, target_critic, shaping)
+        returns = window_returns(batch, rolled, target_critic, shaping, gamma=gamma, bootstrap=not ends_episode)
         critic_loss = fit_critic(critic, critic_optimizer, rolled.observations, returns)
         soft_update(target_critic, critic)
 

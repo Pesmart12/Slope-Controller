@@ -123,13 +123,15 @@ would produce something worse, say so.
 
 ## What exists
 
-Eight source files. The repository is small and should stay legible.
+Ten source files. The repository is small and should stay legible.
 
 | | |
 |---|---|
 | `slope_control/ramp.py` | the ramp scene and its geometry conventions, shared by everything |
 | `slope_control/policy.py` | the actor and critic, and the seam where torch's autograd meets GRIP's adjoint |
 | `slope_control/task.py` | the step-2 task — action limit and frame, reward and its gradient seeds, episode and settle window, `Batch` and its two builders |
+| `slope_control/shac.py` | the training loop — windowed rollout, actor step, critic fit, target update |
+| `slope_control/render.py` | draws a scene and animates an episode to a GIF; pure presentation, computes nothing |
 | `experiments/drift.py` | artifact 1 — the drift measurement and its figure |
 | `figures/drift.png` | committed output, so results are visible without running anything |
 | `tests/check_task.py` | the checks step 2 rests on, chiefly the finite-difference of `dJ_dU` through GRIP |
@@ -179,9 +181,12 @@ departs at 19°, 48% low at 26°
 
 `tests/check_task.py` is not a result and produces no figure — it is what
 makes the step-2 machinery trustworthy, and `python tests/check_task.py`
-should stay at 9/9.
+should stay at 11/11.
 
-Still not built: no policy, no planner, no training loop, no packaging.
+Still not built: no planner, no packaging, and no committed experiment that
+produces a SHAC figure. Training runs so far have been driven from
+scratchpad scripts, which is why none of their numbers are reproducible by
+anything in the repository. That is the next thing `experiments/` needs.
 
 ## Build order
 
@@ -210,8 +215,13 @@ so a session knows where it is.
    solves it to 0.2–1.2 cm — so the manipulation task is worth training
    on. Every check now runs both variants; the adjoint holds through
    body-body contact at 2e-5 relative.
-5. **Next.** SHAC on penalty. Completes the 1.0 column. Use the per-step
-   adjoint sweep from `check_closed_loop.py`, not one call per window.
+5. **In progress.** SHAC on penalty — `slope_control/shac.py`, built on the
+   per-step adjoint sweep in `policy.policy_gradient`. **Both variants
+   learn the task**, box-only to 0.73 cm and two pushers to 2.37 cm at
+   their best evaluations. What is not done is holding that: **every run
+   so far peaks early and then degrades**, which is the open problem
+   described under the standing reminder. The column is not complete until
+   a run ends near its best rather than well past it.
 6. Wait for GRIP 2.0, rerun the column, fill in the cross-eval table.
 
 Steps 2–5 need nothing from GRIP that does not already exist. **Do not build
@@ -461,8 +471,45 @@ check did not catch that and could not have — a correct gradient on an
 impossible objective is still correct. When something is checked and still
 doesn't work, suspect the task before the machinery.
 
-**Step 5, SHAC, is next.** Everything it needs exists: a solvable task, a
-verified closed-loop gradient, and a baseline to be measured against.
+**Step 5, SHAC, is running and half-done.** Both variants learn the task.
+The open problem is that **no run has yet held its best result.**
+
+Measured, two pushers, 8000 iterations, 64 environments, seed 0, the same
+budget in all three:
+
+```
+                                        best      at it.   end of run
+undiscounted, buffers copied            2.48 cm     500      8.95 cm
+undiscounted, buffers blended           5.29 cm     500     11.26 cm
+gamma = 0.99, no terminal bootstrap     2.37 cm     500     13.12 cm at it. 3500
+```
+
+Box-only does the same thing over 14000 iterations: 0.73 cm at iteration
+5000, then up to 2.3–3.5 cm and staying there. An earlier 4000-iteration
+box-only run peaked at iteration 250.
+
+**The discount did not fix this**, and that is the thing to carry forward
+rather than rediscover. It was added for a reason that stands on its own —
+at gamma = 1 the Bellman operator is not a contraction, and `observe`
+carries no clock, so the critic is asked to fit early and late states with
+one number and no way to tell them apart. Both true, and the critic did
+settle at −53.87 against episode returns near −180. But the degradation
+outlived the fix: under gamma = 0.99 it is *monotonic from iteration 500*
+rather than starting at 4500. **Do not write the discount up as the
+remedy.** Whatever drives the decay is not identified.
+
+Two things a next session should know before chasing it. The exploration
+noise decays on its own — sigma 0.368 to 0.116 by iteration 3500 — so late
+training is nearly deterministic and the reported error is not a noise
+floor. And the degradation is smooth and monotonic, not a collapse, which
+is not the shape of a diverging gradient.
+
+The third run **crashed at iteration 3500 with exit code 4 and no
+traceback**, six hours in. It was also running about six times slower per
+iteration than the two runs before it — 6.4 s against 1.03 s — both of
+which finished 8000 iterations in about 8250 s. Unexplained; it ran
+overnight, so the machine's own power state is not ruled out. If a long
+run is left unattended again, log to a file and checkpoint the actor.
 
 One finding from step 4, now fixed rather than merely flagged:
 **gradients cannot discover a contact that does not exist.** With the task
