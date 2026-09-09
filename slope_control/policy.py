@@ -113,14 +113,56 @@ class Critic(torch.nn.Module):
     ends. Without it the policy would optimize a third of a second and
     know nothing about the 3.7 s hold that follows, which is exactly where
     penalty contact and a rigid solve differ.
+
+    Predicts in NORMALIZED units and reports real reward. Undiscounted
+    returns on this task run from about -1200 to -70, which is a badly
+    scaled regression target for a network whose output starts near zero.
+    The running mean and standard deviation come from the returns actually
+    seen, and live in buffers, so they travel with the model and the
+    optimizer never touches them.
+
+        forward       real reward units, what `policy_gradient` reads
+        normalized    the raw output, what the critic's own loss uses
     """
 
     def __init__(self, observation_size, hidden=HIDDEN):
         super().__init__()
         self.net = mlp(observation_size, 1, hidden, output_gain=1e-2).double()
+        self.register_buffer("mean", torch.zeros((), dtype=torch.float64))
+        self.register_buffer("std", torch.ones((), dtype=torch.float64))
+        self.register_buffer("count", torch.zeros((), dtype=torch.float64))
 
     def forward(self, observation):
+        return self.normalized(observation) * self.std + self.mean
+
+    def normalized(self, observation):
         return self.net(observation).squeeze(-1)
+
+    def normalize(self, values):
+        """Put returns into the units `normalized` predicts in."""
+        return (values - self.mean) / self.std
+
+    def update_statistics(self, returns):
+        """Fold a batch of returns into the running mean and standard deviation.
+
+        Chan's parallel formula, so a whole window folds in at once and the
+        result does not depend on how the samples were grouped.
+        """
+        returns = returns.reshape(-1)
+        batch_count = float(returns.numel())
+        batch_mean, batch_var = returns.mean(), returns.var(unbiased=False)
+
+        total = self.count + batch_count
+        delta = batch_mean - self.mean
+
+        # Each part's variance, weighted, plus the spread between the two
+        # means. That last term is what a naive weighted average would miss.
+        combined = (self.std ** 2 * self.count + batch_var * batch_count
+                    + delta ** 2 * self.count * batch_count / total) / total
+
+        self.mean = self.mean + delta * batch_count / total
+        self.std = torch.sqrt(torch.clamp(combined, min=1e-8))
+        self.count = total
 
 
 def as_tensor(array, grad=False):

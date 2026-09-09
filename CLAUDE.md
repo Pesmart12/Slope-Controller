@@ -38,6 +38,65 @@ penalty-trained policy misbehaves in NCP, show it. If it doesn't, say that.
 **No hypotheses, no predicted results written as expectations, no defending a
 claim.** GRIP's `CLAUDE.md` carries the same rule for the same reason.
 
+### The point of this repo is not penalty vs NCP
+
+**Say it in full: the point is to build and train an RL control stack on
+GRIP.** The contact comparison is a thing that falls out at the end, and
+it is loose by design.
+
+Written down twice over, because a session drifted past the rule above
+once by treating trajopt as a bar to clear, then drifted again an hour
+later by calling the contact comparison "the whole point of this repo".
+The pull toward framing this as a comparison study is strong. Two
+specific corrections, both from Pedro, both in one session:
+
+> "My focus was not 'is RL better at control than a trad control?' that's
+> a bad question for a simple task like ramp."
+
+> "again the whole point of this repo is not ncp vs penalty."
+
+**If a sentence you are about to write positions this as a study of
+anything, delete it.** The deliverables are: did it learn the task, was
+it efficient, a demo, and a loose look at how behaviour differs between
+1.0 and 2.0.
+
+**"Is RL better at control than classical control?" is not the question,
+and it is a bad question for a task this simple.** The point is to build
+and train an RL stack on GRIP. What is worth reporting:
+
+- **Did it learn the task?**
+- **Was it efficient?** — the baseline is informative here, and only here.
+- **A demo.** Show the trained policy doing the thing.
+- **A loose comparison of behaviour under 1.0 and 2.0.** Loose is the
+  design, not a shortfall. See the paragraph above about rigor nobody
+  asked for.
+
+`tests/check_trajopt.py` is a **check**, not a baseline. Its job is to say
+the reward is solvable and its gradients navigable, and 800 iterations
+answers that. **Its numbers are not converged** — measured, box-only at
+0.5 m uphill:
+
+```
+  800 iterations   reward −68.76   error [ 0.59  0.22 −0.10] cm
+ 3000 iterations   reward −58.60   error [−0.39 −0.62 −0.88] cm
+ 8000 iterations   reward −56.34   error [−0.92 −1.22 −1.34] cm   still improving
+```
+
+So do not read −68.76 as the optimum, and do not gate anything on beating
+it. The check's own "ended at its best: yes" line means *still improving*,
+which is the opposite of the reassurance it reads as.
+
+One real finding fell out of that measurement and is worth keeping: **as
+trajopt converges it parks further downhill of the target**, +0.59 → −0.92
+at 15°. SHAC does the same thing more strongly, −2.5 to −3.7 cm. Two
+optimizers, one of them not using gradients at all, drifting the same way.
+The reward appears to be pricing penalty contact correctly — closing the
+last centimetres needs force above `break_free_force`, which costs more per
+step than the position error it saves, and at that force the box only
+creeps. **Under an NCP solve that arithmetic should reverse**, since
+nothing creeps and holding after arrival is free. Not chased yet; recorded
+so it is not rediscovered.
+
 The eventual comparison is also loose by design — these numbers will sit
 next to other projects' numbers someday, informally. That is not a reason to
 build experimental rigor nobody asked for. It is a reason to keep the
