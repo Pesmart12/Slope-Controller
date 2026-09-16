@@ -65,7 +65,8 @@ and it is a bad question for a task this simple.** The point is to build
 and train an RL stack on GRIP. What is worth reporting:
 
 - **Did it learn the task?**
-- **Was it efficient?** — the baseline is informative here, and only here.
+- **Was it efficient?** — trajectory optimization is informative here, and
+  only here.
 - **A demo.** Show the trained policy doing the thing.
 - **A loose comparison of behaviour under 1.0 and 2.0.** Loose is the
   design, not a shortfall. See the paragraph above about rigor nobody
@@ -73,29 +74,21 @@ and train an RL stack on GRIP. What is worth reporting:
 
 `tests/check_trajopt.py` is a **check**, not a baseline. Its job is to say
 the reward is solvable and its gradients navigable, and 800 iterations
-answers that. **Its numbers are not converged** — measured, box-only at
-0.5 m uphill:
+answers that. **Its numbers are not converged**, and the check's own
+"ended at its best: yes" line means *still improving* — the opposite of
+the reassurance it reads as. So do not read −82.37 as the optimum, and do
+not gate anything on beating it. Running it longer keeps improving the
+reward and walks the parked position further downhill of the target; that
+was measured on the box-only variant before it was removed, so there is no
+table of it here any more.
 
-```
-  800 iterations   reward −68.76   error [ 0.59  0.22 −0.10] cm
- 3000 iterations   reward −58.60   error [−0.39 −0.62 −0.88] cm
- 8000 iterations   reward −56.34   error [−0.92 −1.22 −1.34] cm   still improving
-```
-
-So do not read −68.76 as the optimum, and do not gate anything on beating
-it. The check's own "ended at its best: yes" line means *still improving*,
-which is the opposite of the reassurance it reads as.
-
-One real finding fell out of that measurement and is worth keeping: **as
-trajopt converges it parks further downhill of the target**, +0.59 → −0.92
-at 15°. SHAC does the same thing more strongly, −2.5 to −3.7 cm. Two
-optimizers, one of them not using gradients at all, drifting the same way.
-The reward appears to be pricing penalty contact correctly — closing the
-last centimetres needs force above `break_free_force`, which costs more per
-step than the position error it saves, and at that force the box only
-creeps. **Under an NCP solve that arithmetic should reverse**, since
-nothing creeps and holding after arrival is free. Not chased yet; recorded
-so it is not rediscovered.
+**Both optimizers park downhill of the target**, and that is worth
+keeping. Trajopt lands at +0.76 / −0.09 / −0.32 cm across the sampled
+slopes, and SHAC at −3.14 cm uphill and −1.44 cm downhill. The reward
+prices penalty contact correctly: closing the last centimetres needs force
+above `break_free_force`, which costs more per step than the position
+error it saves, and inside that band nothing slides. The standing reminder
+has the full measurement.
 
 The eventual comparison is also loose by design — these numbers will sit
 next to other projects' numbers someday, informally. That is not a reason to
@@ -123,20 +116,26 @@ would produce something worse, say so.
 
 ## What exists
 
-Eleven source files. The repository is small and should stay legible.
+The repository is small and should stay legible.
 
 | | |
 |---|---|
 | `slope_control/ramp.py` | the ramp scene and its geometry conventions, shared by everything |
 | `slope_control/policy.py` | the actor and critic, and the tensor plumbing they need |
 | `slope_control/sweep.py` | the closed-loop gradient — `rollout` forward, `accumulate` at the torch/GRIP seam, `policy_gradient` back |
-| `slope_control/task.py` | the step-2 task — action limit and frame, reward and its gradient seeds, episode and settle window, `Batch` and its two builders |
+| `slope_control/task.py` | what the other three task modules share — body layout, action limit and frame, episode length |
+| `slope_control/objective.py` | the reward, its shaping term, and their gradient seeds; defines `ℓ` and `J` |
+| `slope_control/observation.py` | what the policy sees, and its constant Jacobian |
+| `slope_control/batches.py` | `Batch` and its two builders — scenes, placement, settle window, targets |
 | `slope_control/shac.py` | the training loop — windowed rollout, actor step, critic fit, target update |
 | `slope_control/render.py` | draws a scene and animates an episode to a GIF; pure presentation, computes nothing |
 | `experiments/drift.py` | artifact 1 — the drift measurement and its figure |
-| `figures/drift.png` | committed output, so results are visible without running anything |
-| `tests/check_task.py` | the checks step 2 rests on, chiefly the finite-difference of `dJ_dU` through GRIP |
-| `tests/check_trajopt.py` | the baseline — Adam on the raw control sequence, which is what says the reward is solvable at all |
+| `experiments/train_shac.py` | the experiment that trains — three arms, file logging, two checkpoints per arm |
+| `experiments/demo.py` | the trained policy rendered — two GIFs, the creep figure, and the JSON the interactive page embeds |
+| `figures/` | committed output, so results are visible without running anything |
+| `runs/` | training logs, evaluation histories and checkpoints, one directory per run |
+| `tests/check_task.py` | the checks the task rests on, chiefly the finite-difference of `dJ_dU` through GRIP |
+| `tests/check_trajopt.py` | Adam on the raw control sequence, which is what says the reward is solvable at all |
 | `tests/check_closed_loop.py` | why SHAC needs a per-step adjoint sweep and not one call per window |
 | `tests/check_policy_gradient.py` | the same statement for a real network — `dJ/d(theta)` against central differences |
 | `docs/ramp_manipulation_task.md` | the task definition; the authority on scene numbers, reward and episode structure |
@@ -149,57 +148,56 @@ path importing `policy` and `sweep` and never `shac`, so verifying a
 derivative does not drag in the training loop. `Window` moving with them is
 the tell that the seam is real — only those three functions touch it.
 
+**The task is four modules split by job.** `objective`, `observation` and
+the action conversions in `task` share constants and never call each
+other; `batches` calls into `observation` and `task`, and nothing calls
+into it. Constants with one user live with that user, so `WEIGHTS` is in
+`objective` and `RESTING_OFFSETS` in `observation`. `TOUCHING` stays in
+`task` because `objective.separations` and `batches.placement` both read
+it, which is what keeps those two exact inverses. The module names avoid
+`reward` and `episode`, which are already local names in callers.
+
 Two things sit on the wrong side of that line and are left there on
 purpose, being small: `ascend` is a generic optimizer step but lives in
 `shac.py` because only `train` calls it and its default is a SHAC-tuned
 constant, and `evaluate` and `calibration` would serve any algorithm.
 
-`slope_control/task.py` carries two variants, `BOX_ONLY` and `TWO_PUSHERS`,
-which differ in body count, which body is scored, which are actuated, and
-the force limits. Everything else — reward, seeds, observation frame,
-settle — is shared, and every check runs both.
+**`BOX_ONLY` is gone, and this is the record so it is not reintroduced.**
+It was a second variant of the task with one directly actuated box —
+physically fictional, since nothing reaches into a box and pushes from its
+centre — kept while SHAC was brought up so that "does it learn on
+box-only?" could separate a policy bug from a contact bug. SHAC learns on
+two pushers, so that job is finished. With it went `Variant`, `bodies_for`
+and the `variant` argument every task function threaded; body count, the
+scored body, the actuated set and the limit are module constants in
+`task.py` now, and the scale and weights in `objective.py`.
 
-**`BOX_ONLY` is scheduled for deletion, and this is the decision record so
-it does not become permanent by nobody remembering.** It is physically
-fictional by its own docstring — nothing reaches into a box and pushes
-from its centre — and it is the sole reason `Variant` exists at all.
-Remove it and `bodies`, `box`, `actuated`, `limit`, `scale` and `weights`
-all become module constants, `bodies_for` disappears, and `pushing_bodies`
-becomes `[0, 2]`.
+One consequence worth knowing: **`tests/check_closed_loop.py` builds its
+own one-box scene**, with a local wrench builder, reward and seeds. Its
+subject is adjoint bookkeeping rather than contact, and a one-parameter
+feedback law on the box's own position is not expressible against an
+unactuated box. The fictional scene is a fixture there, not a task the
+package offers. Keeping it that way is what preserved the 119% figure
+exactly.
 
-It stays **through SHAC bring-up only**. Its remaining value is as a
-strictly easier version of the same problem — same reward, same
-observation frame, same gradient path, no body-body contact — so if SHAC
-does not learn on two pushers, "does it learn on box-only?" separates a
-policy bug from a contact bug at no cost. **Delete it once step 5 lands.**
-
-Two things need rework when it goes, and both would move recorded numbers:
-`tests/check_closed_loop.py` is entirely box-only, so the 119% figure cited
-here and in the task doc would have to be re-derived against pushers; and
-`check_trajopt.report_creep_band` reads the settled force straight off the
-action array, which only works when the action *is* the force.
-
-Nothing takes a default variant. Every task function requires it
-explicitly, so a caller that forgets cannot silently get the fictional
-task — which is what the defaults used to do, `BOX_ONLY` everywhere
-except `placement`.
-
-The one **result** so far, reproducible by `python experiments/drift.py`:
+The two **results**, both reproducible:
 
 ```
-20° ramp, zero controls, 5 s   ->   4.75 cm of drift, where rigid physics says 0
-closed form mg·sin α / (2·b_slip) exact to five figures up to 18°
-departs at 19°, 48% low at 26°
+python experiments/drift.py
+  20° ramp, zero controls, 5 s   ->   4.75 cm of drift, where rigid physics says 0
+  closed form mg·sin α / (2·b_slip) exact to five figures up to 18°
+  departs at 19°, 48% low at 26°
+
+python experiments/train_shac.py  then  python experiments/demo.py
+  74.92 cm to within a box side in 0.30 s, and exactly on target downhill
+  then creep takes it back off, which is the standing reminder's subject
 ```
 
 `tests/check_task.py` is not a result and produces no figure — it is what
-makes the step-2 machinery trustworthy, and `python tests/check_task.py`
+makes the task machinery trustworthy, and `python tests/check_task.py`
 should stay at 11/11.
 
-Still not built: no planner, no packaging, and no committed experiment that
-produces a SHAC figure. Training runs so far have been driven from
-scratchpad scripts, which is why none of their numbers are reproducible by
-anything in the repository. That is the next thing `experiments/` needs.
+Still not built: no planner, and no packaging.
 
 ## Build order
 
@@ -208,36 +206,33 @@ so a session knows where it is.
 
 1. **Done.** Box on a 20° tilted `HalfPlane`, five seconds of zero controls,
    plot `ξ` against time.
-2. **Substrate done.** Minimal task — box alone, wrench applied directly to
-   the box, no pusher. `slope_control/task.py` plus `tests/check_task.py`.
-   The reward and the gradient path are de-risked: `dJ_dU` matches central
-   differences to 3e-7 relative through GRIP. The **observation space is
-   not** — nothing consumes an observation until SHAC, so `observe` is
-   fixed but unvalidated, and step 2's original claim to de-risk it was
-   never achievable before step 5.
-3. **Done.** Trajectory-optimization baseline — `tests/check_trajopt.py`.
-   Adam on the raw control sequence reaches the target to 1.4 cm at every
-   sampled slope, so the reward is solvable and its gradients are
+2. **Substrate done.** The task — `task.py`, `objective.py`,
+   `observation.py` and `batches.py`, plus `tests/check_task.py`. The reward and the gradient path are de-risked:
+   `dJ_dU` matches central differences to 1.9e-5 relative through GRIP,
+   across a body-body contact. Built first against a single directly
+   actuated box, which has since been removed.
+3. **Done.** Trajectory optimization — `tests/check_trajopt.py`. Adam on
+   the raw control sequence reaches the target to within a centimetre at
+   every sampled slope, so the reward is solvable and its gradients are
    navigable across 8000 integration steps, not merely correct at a point.
    **This replaces the MPPI step**, which was dropped: being zeroth order
    it never calls the adjoint, so it could only ever answer half the
    question it was there for. It keeps one job in reserve — if trajopt
    ever fails, gradient-free is what separates "bad reward" from "correct
    but unusable gradients."
-4. **Done.** Two pushers, box between them, box unactuated. Trajopt
-   solves it to 0.2–1.2 cm — so the manipulation task is worth training
-   on. Every check now runs both variants; the adjoint holds through
-   body-body contact at 2e-5 relative.
-5. **In progress.** SHAC on penalty — `slope_control/shac.py`, built on the
-   per-step adjoint sweep in `sweep.policy_gradient`. **Both variants
-   learn the task**, box-only to 0.73 cm and two pushers to 2.37 cm at
-   their best evaluations. What is not done is holding that: **every run
-   so far peaks early and then degrades**, which is the open problem
-   described under the standing reminder. The column is not complete until
-   a run ends near its best rather than well past it. **The immediate next
-   action is the gradient-clipping comparison run** — see "THE NEXT STEP"
-   in the standing reminder for the config, the baseline to beat and how
-   to read the result.
+4. **Done.** Two pushers, box between them, box unactuated. Trajopt solves
+   it to 0.76 / −0.09 / −0.32 cm, so the manipulation task is worth
+   training on.
+5. **Substantially done, and the open problem turned out not to be one.**
+   SHAC on penalty — `slope_control/shac.py`, built on the per-step
+   adjoint sweep in `sweep.policy_gradient`, run by
+   `experiments/train_shac.py`. **The policy learns the task**: 74.92 cm
+   to within a box side in 0.30 s, and exactly on target when the target
+   is downhill. What no policy can do is *stay* there, because penalty
+   creep will not allow it. Clipping and the critic's slope were both
+   investigated and neither is the cause; see the standing reminder.
+   **What is left is presentation**, not more training —
+   `experiments/demo.py` is that, and the interactive page it feeds.
 6. Wait for GRIP 2.0, rerun the column, fill in the cross-eval table.
 
 Steps 2–5 need nothing from GRIP that does not already exist. **Do not build
@@ -323,7 +318,7 @@ is the cheap check that the signs are right; keep it working.
 anything shared. Don't reuse one of its symbols for something else here.
 
 Two of its symbols are ours to fill in — it says so: **`ℓ` and `J` are the
-consumer's, not GRIP's.** `slope_control/task.py`'s module docstring is
+consumer's, not GRIP's.** `slope_control/objective.py`'s module docstring is
 where they are defined, and the definitions are:
 
 - **`ℓ` is one step's reward** (`l` in ASCII code). GRIP calls that slot the
@@ -337,7 +332,7 @@ where they are defined, and the definitions are:
   quantity the code called `l`, which is how this got confusing enough to
   need writing down.
 - **`ℓ` here holds a reward, so everything maximizes** — the opposite of the
-  usual stage-cost convention. Stated in `task.py` rather than left to be
+  usual stage-cost convention. Stated in `objective.py` rather than left to be
   discovered. If anything ever becomes a genuine cost, flip it everywhere
   at once.
 
@@ -387,7 +382,7 @@ Pedro's preferences, the same ones GRIP uses where they carry over to Python.
   and nowhere else; one that drifts to a neighbouring statement is worse
   than none. And a constant is the exception, since what it is IS its
   value, so its comment is allowed to be all rationale.
-- **`batch` means `task.Batch`.** Not a window, not the environment count,
+- **`batch` means `batches.Batch`.** Not a window, not the environment count,
   not the flattened rows a network is fitted on. Say "window",
   "environments", "rows".
 - **Comments explain why in ordinary code, and *what* in dense code.** The
@@ -413,10 +408,10 @@ Real, and each one will bite in a specific place:
   nothing there binds an angle array to the scenes built from it — a
   mismatch projects a batch onto the wrong slopes with every shape still
   lining up. `ramp.scene_angle` reads the angle back out of a scene so
-  that failure is checkable. Above that level it is solved: **`task.Batch`
-  carries the scenes, the angles, the state, the targets, the substeps,
-  the observation Jacobian and the variant as one value**, built by
-  `task.fixed_batch` or `task.sample_batch`. Do not take a batch apart and
+  that failure is checkable. Above that level it is solved: **`batches.Batch`
+  carries the scenes, the angles, the state, the targets, the substeps
+  and the observation Jacobian as one value**, built by
+  `batches.fixed_batch` or `batches.sample_batch`. Do not take a batch apart and
   pass the pieces on individually; that is the failure mode reintroducing
   itself.
 - **`along_ramp` no longer accepts a squeezed array.** It needs the
@@ -430,16 +425,27 @@ Real, and each one will bite in a specific place:
   command.
 - **An editable install of GRIP does not rebuild on C++ changes.** Reinstall
   after touching its `src/`. This has already cost time once.
-- **The toolchain lives behind `vcvars`.** The import incantation is in the
-  README's Setup section; a `pip install -e ../GRIP` without it fails
-  confusingly.
-- **The conda environment must be activated, not addressed by path.**
-  Calling `envs/slope-control/python.exe` directly runs GRIP, numpy and
-  torch perfectly and then kills the process on `savefig` with
-  `0xC06D007F` and **no traceback** — a delay-load failure for a DLL that
-  only activation puts on `PATH`. Every symptom points at matplotlib and
-  none of them point at the environment. Use `conda run -n slope-control
-  python ...` in scripts.
+- **`cmake` and `ninja` come from conda-forge**, not from the system, so
+  the build needs nothing installed system-wide on either platform. This
+  does not replace `vcvars64.bat` on Windows — that is still needed, for
+  the MSVC compiler itself.
+- **The project builds on Windows and Linux, and each has one snag the
+  other does not.** Both are live; neither is legacy.
+- **Windows: the toolchain lives behind `vcvars`,** and the conda
+  environment must be **activated, not addressed by path**. Calling
+  `envs/slope-control/python.exe` directly runs GRIP, numpy and torch
+  perfectly and then kills the process on `savefig` with `0xC06D007F` and
+  **no traceback** — a delay-load failure for a DLL that only activation
+  puts on `PATH`. Every symptom points at matplotlib and none point at the
+  environment.
+- **Linux: GRIP's `grip_core` needs `POSITION_INDEPENDENT_CODE`.** It is a
+  static library linked into a shared Python module, and ELF linkers reject
+  non-PIC objects in a shared object outright — `recompile with -fPIC`, at
+  link time. Set in GRIP's `src/CMakeLists.txt`. Windows draws no such
+  distinction, which is why the bindings built there for months and failed
+  on the first Linux build.
+- **`conda run -n slope-control python ...` is the safer form in scripts**
+  on either platform.
 - **Parallel faces sit on a tie-break degeneracy.** A flat pusher pressed
   squarely against a flat box is exactly the configuration GRIP's
   `pair_detection.md` flags: both bodies report identical penetration, so
@@ -494,18 +500,20 @@ done too, and checked — but it is **machinery, not a result**, and it was
 deliberately landed without a figure. Don't go looking for the artifact it
 didn't produce.
 
-The baseline is done too, and it earned its place immediately: it caught a
+Trajectory optimization is done too, and it earned its place immediately: it caught a
 force limit that made the task **unsolvable**, sized against the force to
 *hold* the box and never against the force to *move* it. A passing gradient
 check did not catch that and could not have — a correct gradient on an
 impossible objective is still correct. When something is checked and still
 doesn't work, suspect the task before the machinery.
 
-**Step 5, SHAC, is running and half-done.** Both variants learn the task.
-The open problem is that **no run has yet held its best result.**
+**Step 5, SHAC, trains and the policy learns the task.** For a long time
+the open problem was recorded as "no run has yet held its best result",
+read as a training pathology. That framing was wrong; the section below
+replaces it.
 
-Measured, two pushers, 8000 iterations, 64 environments, seed 0, the same
-budget in all three:
+The runs that produced it still stand as measurements. Two pushers, 8000
+iterations, 64 environments, seed 0, same budget in all three:
 
 ```
                                         best      at it.   end of run
@@ -514,82 +522,110 @@ undiscounted, buffers blended           5.29 cm     500     11.26 cm
 gamma = 0.99, no terminal bootstrap     2.37 cm     500     13.12 cm at it. 3500
 ```
 
-Box-only does the same thing over 14000 iterations: 0.73 cm at iteration
-5000, then up to 2.3–3.5 cm and staying there. An earlier 4000-iteration
-box-only run peaked at iteration 250.
-
-**The discount did not fix this**, and that is the thing to carry forward
-rather than rediscover. It was added for a reason that stands on its own —
-at gamma = 1 the Bellman operator is not a contraction, and `observe`
-carries no clock, so the critic is asked to fit early and late states with
-one number and no way to tell them apart. Both true, and the critic did
-settle at −53.87 against episode returns near −180. But the degradation
-outlived the fix: under gamma = 0.99 it is *monotonic from iteration 500*
-rather than starting at 4500. **Do not write the discount up as the
-remedy.** Whatever drives the decay is not identified.
-
-Two things a next session should know before chasing it. The exploration
-noise decays on its own — sigma 0.368 to 0.116 by iteration 3500 — so late
+Two things from that era are worth carrying forward. **The discount is not
+a remedy and was never added as one** — it earned its place because at
+gamma = 1 the Bellman operator is not a contraction, and the critic did
+settle at −53.87 against episode returns near −180. And **the exploration
+noise decays on its own**, sigma 0.368 to 0.116 by iteration 3500, so late
 training is nearly deterministic and the reported error is not a noise
-floor. And the degradation is smooth and monotonic, not a collapse, which
-is not the shape of a diverging gradient.
+floor.
 
-The third run **crashed at iteration 3500 with exit code 4 and no
-traceback**, six hours in. It was also running about six times slower per
-iteration than the two runs before it — 6.4 s against 1.03 s — both of
-which finished 8000 iterations in about 8250 s. Unexplained; it ran
-overnight, so the machine's own power state is not ruled out. A later
-2000-iteration run went at 0.93 s, so the slowdown was not the code. If a
-long run is left unattended again, log to a file and checkpoint the actor.
+One run **crashed at iteration 3500 with exit code 4 and no traceback**,
+six hours in, while running six times slower per iteration than its
+predecessors. Never explained. `experiments/train_shac.py` logs to a file
+and checkpoints at every evaluation because of it.
 
-### THE NEXT STEP: run the clipping comparison
+### WHAT THE LIMIT ACTUALLY IS: penalty creep, not training
 
-**Everything it needs is committed and nothing has been run.** `ascend`
-clips at `MAX_GRADIENT_NORM = 2.0` and `train` counts how often the ceiling
-binds, but no training run has used it. Do not write clipping up as
-anything until this happens.
-
-Run two pushers, 2000 iterations, 64 environments, seed 0, `eval_every=100`
-— which is exactly the instrumented baseline already measured:
+The limit is penalty creep, and it bites in two opposite ways depending on
+which side of the box the target sits. Measured on the trained policy, one
+fixed episode per row:
 
 ```
-  iter    err     reward    shaped   |  bias    rmse    corr
-   300   1.11    -178.44  -178.71   | -14.73   16.43   0.971   <- best
-  2000   6.49    -192.46  -193.41   |   0.89    8.55   0.967
+   target              best cm   final cm   drift cm/s   hold N   break-free
+   50 cm uphill          -3.14      -3.14       +0.27     20.76      23.89
+   50 cm downhill        -0.00      -1.44       -0.49     15.13      23.89
 ```
 
-**Read the `clipped` count first, before the error.** It decides whether
-the run means anything:
+**Uphill, creep is too slow to finish.** Closest approach equals final
+error, so the error never stops improving — the policy pushes at or just
+under break-free and creeps *toward* the target at 0.27–0.50 cm/s, and the
+episode ends first. Parking short is running out of time, not being
+dragged.
 
-- **0** — the ceiling never bound, the run is a re-run of the baseline and
-  says nothing about clipping. Lower `MAX_GRADIENT_NORM` and go again.
-- **near every iteration** — this is a learning-rate change wearing a
-  disguise. The honest control is a third run at lower `ACTOR_LR` with
-  `max_norm=None`; if that holds the policy too, it was never the spikes.
-- **somewhere in between** — the intended regime, and the error curve is
-  then worth reading.
+**Downhill, it arrives and then loses it.** The box reaches −0.00 cm, dead
+on target, and slides to −1.44 cm while the policy holds at ~15 N, below
+break-free. Driving downhill is about nine times cheaper than uphill, so
+getting there is easy and staying there is what costs.
 
-**If clipping does not hold the policy, measure the critic's SLOPE.** The
-diagnostic ruled out the two obvious suspects and left one unexamined.
-Shaping is not it: shaped and unshaped reward degrade together, −178.71 to
-−193.41 against −178.44 to −192.46, so the policy is not being pulled off
-the task objective. The critic's *values* are not it either: bias goes
-−14.73 → 0.89 and correlation holds at 0.97 while the policy decays, so it
-gets better as the policy gets worse. But what enters the actor's objective
-is `dV/dobs`, not V, and **nothing has ever checked it**. A network can fit
-values to 0.98 correlation and still have noisy local derivatives,
-especially fitted on 2048 on-policy rows for 4 epochs with no buffer.
+Both are the same artifact with opposite signs, and **every episode ends
+downhill of the target** either way.
 
-The one-line statement of the problem, worth keeping in front: **SHAC is
-losing ground on the objective it is maximizing, with a gradient verified
-correct to 9e-06 and a critic that is close to unbiased.** That is not a
-reward problem and not a critic-accuracy problem.
+**Do not average `|error|` across target directions.** An earlier pass
+here did, over eight sampled episodes, and produced an arrive-then-drift
+curve that describes neither case — the mean is dominated by the downhill
+minority. That error is what this section originally recorded.
 
-Two smaller things this run should also do, since the last long one lost
-everything: **log to a file and checkpoint the actor and critic.** There is
-still no committed experiment that trains — every number so far came from a
-scratchpad script, which is why none of them is reproducible from the
-repository. `experiments/` needs that entry.
+**This is why the ablations barely moved the endpoint.** Two runs with
+completely different critic arrangements ended at 6.69 and 6.72 cm on the
+sampled batch, because the number is set by physics against a fixed
+episode length, not by the optimizer.
+
+**Did it learn the task? Yes** — it reaches the target within a box side
+in 0.30 s, and hits it exactly when the target is downhill. What no policy
+can do under penalty contact is *stay* there.
+
+Recorded as measurement, not interpretation. One inference is **not**
+measured: that the pusher's force goes mostly into holding itself, its mass
+being twice the box's and so creeping twice as fast. Checkable, not
+checked.
+
+This is the thread already open above about trajopt parking downhill, and
+it turned out to be the dominant term in the 1.0 column rather than a
+footnote about the last millimetres. **Do not chase it under 1.0.** It has
+a closed form behind it and it is what the 2.0 column exists to sit next
+to. Do not write up what 2.0 will show either; measure it when there is a
+solver.
+
+#### Answered, so they are not re-run
+
+**Clipping does not hold the policy, and it is worse.** Two arms, two
+pushers, 2000 iterations, 64 environments, seed 0:
+
+```
+                best      at it.   end      gave up   clipped
+  unclipped     1.39 cm     400    6.69 cm   5.30 cm    0/2000
+  clipped       3.48 cm     300    9.19 cm   5.71 cm  610/2000
+```
+
+`clipped = 610` is the intended regime — neither inert nor binding every
+iteration — so the comparison is real. Worse peak, worse end.
+
+**The critic's slope is unreliable, and it is not the cause.** It was the
+one unexamined suspect and it is genuinely bad: `dV/dξ` swings between
+−184 and +129 and changes sign eight times across thirteen evaluations,
+while the true slope drifts smoothly 8 to 48 and V itself holds at 0.97
+correlation with bias near 1. But it is wrong at the policy's *best*
+iteration too, not only late, and an ablation with `actor_bootstrap=False`
+— the critic fitted and measured but never reaching the actor — still
+ended at 6.72 cm. So the decay does not need it.
+
+What the slope does cost is reward without position: that arm's reward
+*improves* to the end, −186.92, where the bootstrapped arm's degrades to
+−191.07 at the same error. **`observe` carrying no clock is the candidate
+explanation** — the critic must fit return-to-go from an observation that
+cannot tell early from late, which can leave V accurate on average and its
+derivative incoherent. Not worth fixing under 1.0: it cannot move a
+creep-bound endpoint, and it would change the observation space every
+recorded number was measured against. Revisit when 2.0 removes creep and
+the horizon becomes the binding constraint.
+
+**`slope_calibration`'s delta was wrong and is fixed.** It was sized at
+5 mm for physical plausibility — inside `POSITION_TOLERANCE`, above the
+settle drift — when the binding criterion is where the difference quotient
+converges. That is below about 0.1 mm here, and the two criteria disagreed
+by 50×. Every slope number taken before the fix is void. `SLOPE_DELTA`
+records the convergence table.
 
 One finding from step 4, now fixed rather than merely flagged:
 **gradients cannot discover a contact that does not exist.** With the task
@@ -597,7 +633,7 @@ objective alone the two-pusher case does not converge slowly — the driving
 pusher's action stays at exactly 0.00 N forever, because with no contact
 `d(box position)/d(pusher action)` is identically zero.
 
-The fix is **reward shaping**, `task.approach_penalty`, named as shaping
+The fix is **reward shaping**, `objective.approach_penalty`, named as shaping
 and off by default: `reward(..., shaping=True)` for training,
 `shaping=False` for anything reported. It is one-sided so it vanishes on
 contact, reuses `w_pos` so it adds no tunable, and works because the
@@ -612,33 +648,30 @@ silent and makes numbers incomparable across columns.
 
 Three things left open on purpose, so they aren't mistaken for oversights:
 
-- `observe` finally has a consumer: `policy.Actor` reads it, and
-  `check_policy_gradient` differentiates through it. It is exercised for
-  *shape and gradient*, not for whether it contains the right channels —
-  that only training can say.
+- **`observe`'s channels are still unvalidated as a set.** Training says
+  they are sufficient — the policy learns the task from them — but nothing
+  says any one of them earns its place, and no channel has been ablated.
+  Its shape and its gradient are checked; its content is not.
 - `clip_action` is a hard clip with zero gradient once saturated, and the
-  converged baseline sits on its limit **2.1%** of steps on box-only and
-  **5.9%** on two pushers. The actor sidesteps it: it emits
+  converged trajopt solution sits on its limit **5.9%** of steps. The
+  actor sidesteps it: it emits
   `limit * tanh(...)`, so every action is feasible by construction and the
   derivative survives everywhere. `clip_action` still runs downstream,
   where it is now a no-op that documents the guarantee. **Never widen the
   limit instead** — it is what keeps the bodies on the ramp.
 - **SHAC needs a per-step adjoint sweep, not one call per window.**
   Measured in `tests/check_closed_loop.py`: one call gives the open-loop
-  gradient, right for the baseline's fixed control sequence and **119%
+  gradient, right for a fixed control sequence and **119%
   wrong** for a policy at one gain, 11% at another — state-dependent, so
-  not something a learning rate absorbs. The sweep now lives in
-  `sweep.policy_gradient`, **not** `task.py` as originally planned: it
-  needs torch, and keeping `task.py` torch-free is worth more, since
-  `drift.py` and the numpy-side checks depend on it. It takes a
-  `task.Batch` and a `policy.Window` — `policy_gradient(batch, window,
-  actor, critic, shaping)` — rather than the thirteen loose arguments it
-  started with, six of which `rollout` also took. Windows chain with
+  not something a learning rate absorbs. The sweep lives in
+  `sweep.policy_gradient` rather than `objective.py`, because it needs torch
+  and keeping the four task modules torch-free is worth more — `drift.py`
+  and the numpy-side checks depend on that. It takes a `batches.Batch` and a
+  `policy.Window`, and windows chain with
   `batch = batch._replace(state=window.states[-1])`.
 
-Steps 4 and 5 need nothing that does not already exist. The 2.0 column
-is written down so it isn't re-litigated and so nothing here forecloses it,
-**not** so it gets built early.
+The 2.0 column is written down so it isn't re-litigated and so nothing
+here forecloses it, **not** so it gets built early.
 
 Keep this file current as steps land. GRIP's went stale once by claiming a
 step was next while four more shipped, which is the kind of drift that makes

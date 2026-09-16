@@ -37,9 +37,8 @@ force between the corners until the lightly loaded one saturates on its
 cone.
 
 That is the physics half, and it needed no policy to produce. The other
-half is what a learned controller does with it — whether one trained
-against a phantom drag still behaves when the drag disappears. That is for
-the measurements to answer, not for this README.
+half is what a learned controller runs into: the same creep is what stops
+a trained policy holding the box once it gets there. See Status.
 
 Full task definition, scene numbers, reward and what gets measured:
 [`docs/ramp_manipulation_task.md`](docs/ramp_manipulation_task.md).
@@ -49,7 +48,7 @@ Full task definition, scene numbers, reward and what gets measured:
 | | |
 |---|---|
 | Task | push a box up a ramp to a target and hold it |
-| Baseline | Trajectory optimization — Adam on the raw control sequence. Confirms the task is solvable and the gradients navigable, with no policy in the way. |
+| Check | Trajectory optimization — Adam on the raw control sequence. Confirms the task is solvable and the gradients navigable, with no policy in the way. Not a baseline: it produces no number that means anything without an NCP column to set it against. |
 | First-order | SHAC, consuming GRIP's analytic gradients through `adjoint_batch` |
 | Scoring | NCP, whichever simulator a policy trained in — the more accurate of the two. |
 
@@ -67,10 +66,10 @@ the end reports whatever the numbers turn out to say.
 | | |
 |---|---|
 | Drift measurement | **done** — `experiments/drift.py`, the plot above |
-| Ramp task, reward and gradient path | **done** — `slope_control/task.py`, `tests/check_task.py` |
-| Trajectory-optimization baseline | **done** — `tests/check_trajopt.py`, 1.4 cm to target |
-| Two-pusher manipulation task | **done** — solved by trajopt to 0.2–1.2 cm |
-| SHAC | not started |
+| Ramp task, reward and gradient path | **done** — `slope_control/task.py`, `objective.py`, `observation.py`, `batches.py`, `tests/check_task.py` |
+| Trajectory optimization | **done** — `tests/check_trajopt.py`, within a centimetre at every sampled slope |
+| Two-pusher manipulation task | **done** — the box is unactuated, so every newton crossing it crosses a contact |
+| SHAC | **done** — `experiments/train_shac.py`, 1365 s for 2000 iterations at 64 environments |
 | NCP half of every comparison | waiting on GRIP 2.0 |
 
 The first milestone needed no policy and no training, which is why it came
@@ -78,39 +77,56 @@ first: place a box on a tilted half-plane, roll out five seconds of zero
 controls, and measure. The other half of that plot is the same figure with
 a solve in place of a spring.
 
+**What the policy does, and what it cannot do.** It drives the box 74.92 cm
+to within a box width in 0.30 s, and lands exactly on target when the
+target is downhill. Then it loses it. Penalty creep pulls the box off the
+target for the rest of the episode, and arresting that needs force above
+break-free, which the reward prices as not worth the centimetres it buys.
+Every episode ends downhill of its target.
+
+That is not a training failure — two runs with completely different critic
+arrangements ended within 0.03 cm of each other, because the number is set
+by the contact model against a fixed episode length. Under a rigid solve
+none of it happens: the box sticks, and holding after arrival is free.
+Which is what the 2.0 column is for.
+
 ## Setup
 
+The project has been built on both Windows and Linux. The environment is
+the same on either; only the step that compiles GRIP differs.
+
 A conda environment, because PyTorch arrives that way and the CPU build
-from conda-forge matches the Python the rest of the stack already uses:
+from conda-forge matches the Python the rest of the stack already uses.
+`cmake` and `ninja` come from conda-forge as well, so the build needs
+nothing installed system-wide. The two forms differ only in the
+line-continuation character — PowerShell:
 
 ```powershell
 conda create -n slope-control -c conda-forge --override-channels `
-    python=3.13 numpy matplotlib "pytorch=*=cpu*"
+    python=3.13 numpy matplotlib "pytorch=*=cpu*" cmake ninja
 ```
 
-GRIP is then built into it. On a machine where the C++ toolchain is not on
-`PATH`, import the build environment first:
+and bash:
+
+```bash
+conda create -n slope-control -c conda-forge --override-channels \
+    python=3.13 numpy matplotlib "pytorch=*=cpu*" cmake ninja
+```
+
+### Building GRIP — Windows
+
+The MSVC toolchain has to be on `PATH` first, which `vcvars64.bat`
+arranges. conda-forge supplies `cmake` and `ninja`, so only the compiler
+itself comes from Visual Studio:
 
 ```powershell
 $vs = "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools"
 cmd /c "`"$vs\VC\Auxiliary\Build\vcvars64.bat`" && set" |
   Where-Object { $_ -match '^(PATH|INCLUDE|LIB|LIBPATH)=' } |
   ForEach-Object { $n, $v = $_ -split '=', 2; Set-Item -Path "env:$n" -Value $v }
-$env:PATH = "$vs\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin;" +
-            "$vs\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja;$env:PATH"
 
 conda activate slope-control
 pip install -e ..\GRIP
-```
-
-An editable install of GRIP does **not** rebuild on C++ changes — reinstall
-after touching its `src/`.
-
-Then this package, so `slope_control` imports from anywhere rather than
-only from the repository root. `--no-deps` because numpy, matplotlib and
-torch already came from conda and pip should not pull wheels over them:
-
-```powershell
 pip install -e . --no-deps
 ```
 
@@ -119,19 +135,60 @@ puts its own DLLs on `PATH` at activation, and matplotlib's PNG writer
 delay-loads one of them. Without activation `savefig` dies with
 `0xC06D007F` and *no Python traceback at all* — every other part of the
 stack, GRIP included, keeps working, so it reads as a matplotlib bug
-rather than a missing path. `conda run -n slope-control python ...` works
-too and is the safer form in scripts.
+rather than a missing path.
+
+### Building GRIP — Linux
+
+The system compiler is enough, and nothing needs root:
+
+```bash
+conda activate slope-control
+pip install -e ../GRIP
+pip install -e . --no-deps
+```
+
+**GRIP's `grip_core` must be compiled with `POSITION_INDEPENDENT_CODE`.**
+It is a static library linked into a shared Python module, and ELF linkers
+reject non-PIC objects inside a shared object outright, so the bindings
+fail to link with a `recompile with -fPIC` error. Set in GRIP's
+`src/CMakeLists.txt`. Windows draws no such distinction, which is why this
+only appeared on the first Linux build.
+
+### Both platforms
+
+`pip install -e . --no-deps` installs this package so `slope_control`
+imports from anywhere rather than only from the repository root.
+`--no-deps` because numpy, matplotlib and torch already came from conda
+and pip should not pull wheels over them.
+
+An editable install of GRIP does **not** rebuild on C++ changes — reinstall
+after touching its `src/`.
+
+`conda run -n slope-control python ...` is the safer form in scripts, and
+is what `conda activate` replaces interactively.
+
+Verify against numbers that are already recorded, rather than against
+"it imported":
+
+```
+python tests/check_task.py        # 11/11
+python experiments/drift.py       # 4.75 cm at 20 degrees
+python tests/check_trajopt.py     # reward -82.37, within a centimetre
+```
+
+If those three disagree with what is written here, the environment is
+wrong and nothing measured in it is worth reading.
 
 ## Layout
 
 ```
-slope_control/   the scene, the task and the policy
+slope_control/   the scene, the task, the policy and the training loop
 experiments/     one script per artifact, each runnable on its own
 figures/         their output, committed so the results are visible here
+runs/            training logs, evaluation histories and checkpoints
 tests/           the checks the build order rests on
 docs/            task definition and experiment design
 ```
 
-Policies, planners and training loops will join `slope_control/`. None of
-it goes into GRIP — that repository holds physics and derivatives, and
-this one holds everything that decides what to do with them.
+None of it goes into GRIP — that repository holds physics and derivatives,
+and this one holds everything that decides what to do with them.

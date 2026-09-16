@@ -30,10 +30,71 @@ which is a cross-check but also a copy that can drift.
 import numpy as np
 
 import grip
-from slope_control import ramp, task
+from slope_control import batches, objective, ramp, task
 
 STEPS = 200
 TARGET_OFFSET = 0.3
+
+# This check builds its own scene: one box, driven by a wrench at its centre
+# of mass. Physically fictional, and deliberately so. The subject here is
+# adjoint bookkeeping rather than contact, and one directly actuated body is
+# the smallest fixture that exposes the Z -> a -> Z path a single call cannot
+# see. The task's scene has three bodies and an unactuated box, where a
+# one-parameter feedback law on the box's own position is not expressible.
+#
+# The reward, weights and scale below mirror what the package used to carry
+# for this scene, so the percentages this file reports stay comparable to the
+# ones recorded against it.
+BODIES = [ramp.BOX]
+SCALE = 12.0
+LIMIT = 12.0
+WEIGHTS = dict(position=1.0, control=objective.control_weight(SCALE, [ramp.hold_force(ramp.DEFAULT_RAMP_ANGLE)]))
+
+
+def fixture(angles, offset=TARGET_OFFSET):
+    """A settled one-box batch per angle. Returns a `batches.Batch`.
+
+    `jacobian` is None: nothing here observes, so there is no observation to
+    differentiate.
+    """
+    scenes = ramp.make_scenes(angles, bodies=BODIES)
+    substeps = task.substeps_for(scenes[0])
+    state = batches.settle(scenes, ramp.resting_state(np.zeros(len(angles)), angles, bodies=BODIES), substeps)
+    targets = ramp.along_ramp(state, angles)[:, 0] + offset
+    return batches.Batch(scenes, angles, state, targets, substeps, None)
+
+
+def to_wrench(force, angles):
+    """One tangential force per environment -> (environments, 1, 3) wrench."""
+    wrench = np.zeros((len(angles), 1, 3))
+    wrench[:, 0, 0:2] = np.clip(force, -LIMIT, LIMIT)[:, None] * ramp.uphill(angles)
+    return wrench
+
+
+def to_action_gradient(dJ_dU, angles):
+    """dJ/d(wrench) -> dJ/d(tangential force), the dot with uphill."""
+    return np.einsum("...ni,ni->...n", dJ_dU[..., 0, 0:2], ramp.uphill(angles))
+
+
+def reward(states, controls, angles, targets):
+    """Position error and control effort, the same pair the task scores."""
+    xi = ramp.along_ramp(states, angles)[1:, :, 0]
+    error = (xi - targets) / ramp.BOX_SIDE
+    effort = (controls[..., 0, 0:2] ** 2).sum(axis=-1)
+    return -WEIGHTS["position"] * error ** 2 - WEIGHTS["control"] * effort / SCALE ** 2
+
+
+def reward_seeds(states, controls, angles, targets):
+    """Differentiate `reward`, giving the two seed arrays `adjoint_batch` wants."""
+    xi = ramp.along_ramp(states, angles)[..., 0]
+    coefficient = -2.0 * WEIGHTS["position"] * (xi - targets) / ramp.BOX_SIDE ** 2
+
+    dl_dZ = np.zeros(states.shape)
+    dl_dZ[1:, :, 0, 0:2] = coefficient[1:, :, None] * ramp.uphill(angles)[None, :, :]
+
+    dl_dU = np.zeros(controls.shape)
+    dl_dU[..., 0, 0:2] = -2.0 * WEIGHTS["control"] * controls[..., 0, 0:2] / SCALE ** 2
+    return dl_dZ, dl_dU
 
 
 def rollout_closed_loop(batch, gain, steps=STEPS):
@@ -47,7 +108,7 @@ def rollout_closed_loop(batch, gain, steps=STEPS):
     states, controls, errors = [state], [], []
     for _ in range(steps):
         error = ramp.along_ramp(state, batch.angles)[:, 0] - batch.targets
-        wrench = task.to_wrench(np.stack([-gain * error, np.zeros_like(error)], axis=-1)[:, None, :], batch.angles, batch.variant)
+        wrench = to_wrench(-gain * error, batch.angles)
 
         errors.append(error)
         controls.append(wrench)
@@ -60,7 +121,7 @@ def rollout_closed_loop(batch, gain, steps=STEPS):
 def one_call_gradient(batch, trajectory, controls, dl_dZ, dl_dU, dpi_dgain):
     """The task doc's recipe: one sweep, contracted with the direct dpi/dK."""
     _, dJ_dU = grip.adjoint_batch(batch.scenes, trajectory, controls, batch.substeps, dl_dZ, dl_dU)
-    return (task.to_action_gradient(dJ_dU, batch.angles, batch.variant)[..., 0, 0] * dpi_dgain).sum()
+    return (to_action_gradient(dJ_dU, batch.angles) * dpi_dgain).sum()
 
 
 def per_step_gradient(batch, trajectory, controls, dl_dZ, dl_dU, dpi_dgain, gain):
@@ -72,7 +133,7 @@ def per_step_gradient(batch, trajectory, controls, dl_dZ, dl_dU, dpi_dgain, gain
         seed[1] = adjoint
         dJ_dZ0, dJ_dU = grip.adjoint_batch(batch.scenes, trajectory[t:t + 2], controls[t:t + 1], batch.substeps, seed, dl_dU[t:t + 1])
 
-        action_gradient = task.to_action_gradient(dJ_dU, batch.angles, batch.variant)[0, :, 0, 0]
+        action_gradient = to_action_gradient(dJ_dU, batch.angles)[0]
         total += (action_gradient * dpi_dgain[t]).sum()
 
         # Build the term a single call cannot see, where the state feeds the
@@ -86,12 +147,12 @@ def per_step_gradient(batch, trajectory, controls, dl_dZ, dl_dU, dpi_dgain, gain
 
 
 def check(gain):
-    batch = task.fixed_batch(np.radians([18.0, 21.0]), task.BOX_ONLY, offset=TARGET_OFFSET)
+    batch = fixture(np.radians([18.0, 21.0]))
 
     trajectory, controls, errors = rollout_closed_loop(batch, gain)
 
     peak = np.abs(gain * errors).max()
-    assert peak < batch.variant.limit[0], f"the feedback law saturates at K = {gain}, so the clip is what is under test"
+    assert peak < LIMIT, f"the feedback law saturates at K = {gain}, so the clip is what is under test"
 
     # Replay the recorded controls open-loop and check they reproduce the
     # closed-loop trajectory. If they do not, the adjoint is being handed a
@@ -99,7 +160,7 @@ def check(gain):
     replay = np.array(grip.rollout_batch(batch.scenes, batch.state, controls, substeps=batch.substeps))
     assert np.abs(replay - trajectory).max() < 1e-12, "closed-loop and open-loop rollouts disagree"
 
-    dl_dZ, dl_dU = task.reward_seeds(trajectory, controls, batch.angles, batch.targets, batch.variant)
+    dl_dZ, dl_dU = reward_seeds(trajectory, controls, batch.angles, batch.targets)
     dpi_dgain = -errors  # d/dK of -K*(xi - xi*), at fixed state
 
     one_call = one_call_gradient(batch, trajectory, controls, dl_dZ, dl_dU, dpi_dgain)
@@ -107,7 +168,7 @@ def check(gain):
 
     def objective(k):
         rolled, held, _ = rollout_closed_loop(batch, k)
-        return task.reward(rolled, held, batch.angles, batch.targets, batch.variant).sum()
+        return reward(rolled, held, batch.angles, batch.targets).sum()
 
     h = 1e-3
     truth = (objective(gain + h) - objective(gain - h)) / (2.0 * h)

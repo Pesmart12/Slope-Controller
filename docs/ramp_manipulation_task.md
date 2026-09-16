@@ -299,53 +299,52 @@ physical counterparts: a full second of maximum outward push leaves the box
 still in contact, and a full episode of maximum uphill push moves it far
 enough to reach any target and brake.
 
-### What the baseline solution looks like
+### What the solved trajectory looks like
 
 `tests/check_trajopt.py` optimizes the raw 400-step control sequence with
 Adam, from a **zero** initialization and a 5 cm approach gap:
 
 ```
-                 final error per slope        unshaped reward
- box only      0.59 / 0.22 / −0.10 cm         −1195 -> −69
- two pushers   0.76 / −0.09 / −0.32 cm        −1195 -> −82
+   final error, 15 / 20 / 22 deg        unshaped reward
+   0.76 / −0.09 / −0.32 cm              −1195 -> −82
 ```
 
-Sub-centimetre on both, so the reward is solvable and its gradients are
-navigable across 8000 integration steps — the thing that had to be true
-before SHAC was worth writing. The two-pusher case is the one that matters:
-the box is unactuated, so every newton reaching it crosses a body-body
-contact.
+Sub-centimetre at every slope, so the reward is solvable and its gradients
+are navigable across 8000 integration steps — the thing that had to be true
+before SHAC was worth writing. The box is unactuated, so every newton
+reaching it crosses a body-body contact.
 
 The *shape* of the solution is worth recording. A shove of a few tenths of
 a second does essentially all the travel — friction has no gentle setting,
 so there is no other way to move — then friction brakes it, and the endgame
-runs entirely inside the **creep regime**: the force settles near
-`mg·sin α` and the residual, of either sign, trims the last millimetres at
-`(f − mg·sin α)/2b_slip`.
+runs entirely inside the **creep regime**, where nothing can slide and can
+only ooze. The driving pusher's settled force sits well short of what would
+break it and the box free:
 
 ```
-                settled force    mg·sin α    residual creep
- 15 deg              3.79 N        2.54 N       +0.31 cm/s
- 20 deg              4.02 N        3.36 N       +0.17 cm/s
- 22 deg              3.42 N        3.67 N       −0.06 cm/s
+           settled force    mg·sin α    fraction of the way to break-free
+ 15 deg        14.15 N        7.62 N                 46%
+ 20 deg        15.13 N       10.07 N                 37%
+ 22 deg        13.54 N       11.02 N                 18%
 ```
+
+Both bounds are for the pusher *and* the box, since that is what slot 0
+drives. No creep rate is quoted: the pusher and the box each rest on two
+corners, so the four contacts do not reduce to the single-body closed form,
+and a number there would be invented rather than derived.
 
 **That endgame is penalty contact only.** Below the friction bound a rigid
-box does not move at all, so under an NCP solve the creep regime does not
-exist and the last millimetre has to be closed some other way. It is the
-first concrete instance of the thing this project exists to measure, and it
-turned up in the baseline before any policy was trained. What a learned
-controller does with it is for the measurements to say.
+body does not move at all, so under an NCP solve the creep regime does not
+exist and the last millimetre has to be closed some other way. It turned up
+here before any policy was trained, and the trained policy later ran into
+the same wall.
 
 **A correction, recorded rather than quietly fixed.** An earlier run
-reported the settled force sitting strictly *between* `hold_force` and
-`break_free_force`, creeping uphill at 0.67 cm/s at every slope, and
-described the optimizer as using creep as a fine-positioning mechanism.
-That run was under-converged — still travelling the last centimetre. With
-the approach term and more iterations it parks at the balance point
-instead, and the residual creep drops to ±0.3 cm/s with either sign. The
-mechanism was right; the number was measuring how far the solution still
-had to go.
+described the optimizer as using creep as a fine-positioning mechanism,
+trimming the last millimetres uphill at a steady rate. That run was
+under-converged — still travelling the last centimetre. Converged, it parks
+inside the band instead. The mechanism was right; the number was measuring
+how far the solution still had to go.
 
 ---
 
@@ -478,21 +477,20 @@ Training and evaluating in the same simulator is an advantage, so the two
 matched cells are partly self-fulfilling. Worth saying alongside the numbers
 rather than waiting to be asked.
 
-### What to instrument for
+### What to log
 
-Two mechanisms are plausible enough to measure deliberately, without assuming
-either turns up:
+Position across the whole hold window, not just the final error. Under
+penalty the box does not stay where it is put, so a single endpoint hides
+the shape of what happened — the 1.0 column's whole result is in that
+window. Log it per environment and keep the sign: the two failure modes
+point in opposite directions and averaging across them describes neither.
 
-**A feedback law tuned against constant drag.** Under penalty, letting go
-always means losing ground. The same law in NCP, where the box sticks, has no
-reason to stop pushing on arrival — so log position across the hold window,
-and whether the box leaves the top of the ramp.
+Contact velocity at first touch, and whether the box tips. Penalty absorbs
+an impact over many timesteps where a solve resolves it at once, so this is
+the other place the two formulations can differ visibly.
 
-**Approach speed.** Penalty absorbs impacts over many timesteps, so a fast
-approach is cheap. A solve resolves them at once. Log contact velocity at
-first touch, and whether the box tips.
-
-Instrument both. Report whichever shows up.
+Whether the box stays on the ramp, which is what the normal force limit
+exists to guarantee and is cheap to assert.
 
 ---
 
@@ -503,7 +501,7 @@ GRIP uniquely provides, and the sample budget is brutal — at `dt = 5e-4`,
 one simulated second is 2000 integration steps. Not a judgement about PPO;
 it is just not what this project is for.
 
-### Trajectory optimization — the baseline
+### Trajectory optimization — the check
 
 **MPPI is dropped.** It was here to remove an ambiguity — if SHAC
 struggles, is it the gradients or the task? — but being zeroth order it
@@ -583,17 +581,20 @@ training configuration.**
 1. **The drift plot.** Box released on the ramp, no policy, no RL.
    Displacement against time: penalty drifts 4.7 cm in 5 s, NCP sits at
    zero, and Coulomb's law says zero. **Done** — `experiments/drift.py`.
-2. **SHAC on both** — the learned result.
-3. **The cross-eval table.**
-4. **A video** of whichever cell turns out to be the interesting one.
+2. **SHAC.** The penalty half is **done** — `experiments/train_shac.py`
+   trains it and `experiments/demo.py` renders it. The NCP half waits on
+   2.0.
+3. **The cross-eval table.** Waits on 2.0; there is nothing to cross yet.
+4. **A demo.** **Done for penalty** — two GIFs, the creep figure, and an
+   interactive page that plays the hold window back in slow motion.
 
 (1) is a measurement against a closed form and stands on its own whatever
 the rest do. The rest are the build, and they are allowed to be modest.
 
-The trajectory-optimization baseline is deliberately **not** on this list.
-It is machinery — it produces no number that means anything without an NCP
-column to set it against, and unlike the drift plot it has no closed form
-standing behind it. It lives in `tests/`, not `experiments/`.
+Trajectory optimization is deliberately **not** on this list. It is a
+check — it produces no number that means anything without an NCP column to
+set it against, and unlike the drift plot it has no closed form standing
+behind it. It lives in `tests/`, not `experiments/`.
 
 ---
 
@@ -660,18 +661,19 @@ rectangle formula.
 1. **Done.** Place a box on a 20° tilted `HalfPlane`, roll out five seconds
    of zero controls, plot `ξ` against time. It drifts 4.7 cm —
    `experiments/drift.py`.
-2. **Done.** Minimal task: box alone on the ramp, wrench applied directly,
-   no pusher — `slope_control/task.py`, `tests/check_task.py`. De-risked
-   the reward and the gradient path. It did **not** de-risk the observation
-   space, which nothing consumes before SHAC.
-3. **Done.** Trajectory-optimization baseline —
-   `tests/check_trajopt.py`. Confirms the reward is solvable and its
-   gradients navigable, and it is what caught the unsolvable force limit.
-   Replaces the MPPI step.
-4. **Next.** Add the pushers. Body-body contact and friction join the
-   critical path, and it starts looking like manipulation rather than a
-   physics test. **Two** pushers, not one — see below.
-5. SHAC on penalty. Completes the 1.0 column.
+2. **Done.** The task — `slope_control/task.py`, `objective.py`, `observation.py`, `batches.py`, `tests/check_task.py`.
+   De-risked the reward and the gradient path. Built first against a
+   single directly actuated box, since removed.
+3. **Done.** Trajectory optimization — `tests/check_trajopt.py`. Confirms
+   the reward is solvable and its gradients navigable, and it is what
+   caught the unsolvable force limit. Replaces the MPPI step.
+4. **Done.** The pushers. Body-body contact and friction join the critical
+   path, and it starts looking like manipulation rather than a physics
+   test. **Two** pushers, not one — see below.
+5. **Done.** SHAC on penalty, completing the 1.0 column. The policy
+   learns the task; what it cannot do is hold, and that is penalty creep
+   rather than a training failure. CLAUDE.md's standing reminder has the
+   measurement.
 6. Wait for GRIP 2.0, rerun the whole column, fill in the cross-eval matrix.
 
 Steps 1–5 need nothing from GRIP that does not already exist.

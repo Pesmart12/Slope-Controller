@@ -28,7 +28,7 @@ import torch
 
 import grip
 
-from . import policy, task
+from . import objective, observation, policy, task
 
 
 # What one closed-loop rollout leaves behind, which is exactly what the
@@ -126,20 +126,20 @@ def rollout(batch, actor, steps, deterministic=False):
     for _ in range(steps):
         # grad=True marks the observation as a leaf, which is what lets
         # `accumulate` hand dJ/d(observation) back on the return trip.
-        observation = policy.as_tensor(task.observe(state, batch.angles, batch.targets, batch.variant), grad=True)
-        action = actor(observation, deterministic=deterministic)
+        obs = policy.as_tensor(observation.observe(state, batch.angles, batch.targets), grad=True)
+        action = actor(obs, deterministic=deterministic)
 
         # Rotate the action into a world wrench as numpy, cutting it off the
         # graph on the way out. GRIP knows nothing about torch, so the link
         # is re-established by hand later, when `accumulate` seeds the
         # backward pass with what GRIP computed.
-        wrench = task.to_wrench(action.detach().numpy(), batch.angles, batch.variant)
+        wrench = task.to_wrench(action.detach().numpy(), batch.angles)
 
         # observations and actions are kept as LIVE tensors with their graph
         # attached. Storing numpy copies would make each action an independent
         # variable with no path back to theta, which is precisely the
         # open-loop gradient -- the one measured at 119% wrong.
-        observations.append(observation)
+        observations.append(obs)
         actions.append(action)
         wrenches.append(wrench)
 
@@ -212,7 +212,7 @@ def policy_gradient(batch, window, actor, critic=None, shaping=True, gamma=1.0):
     # Partials of one step's reward -- dl/dZ_t and dl/dU_t, holding
     # everything else fixed. `adjoint_batch` turns them into total
     # derivatives of the objective, which is the l-to-J step.
-    dl_dZ, dl_dU = task.reward_seeds(trajectory, wrenches, batch.angles, batch.targets, batch.variant, shaping=shaping)
+    dl_dZ, dl_dU = objective.reward_seeds(trajectory, wrenches, batch.angles, batch.targets, shaping=shaping)
 
     if gamma != 1.0:
         # Multiply seed t by gamma^t, broadcasting the weight across the
@@ -238,7 +238,7 @@ def policy_gradient(batch, window, actor, critic=None, shaping=True, gamma=1.0):
         # take dV/d(observation). This is the terminal bootstrap: everything
         # past the window's end is summarized by V(Z_W), so its derivative
         # joins the seed.
-        terminal = policy.as_tensor(task.observe(trajectory[-1], batch.angles, batch.targets, batch.variant), grad=True)
+        terminal = policy.as_tensor(observation.observe(trajectory[-1], batch.angles, batch.targets), grad=True)
         value = critic(terminal)
         (dV_dobs,) = torch.autograd.grad(value.sum(), [terminal])
 
@@ -246,7 +246,7 @@ def policy_gradient(batch, window, actor, critic=None, shaping=True, gamma=1.0):
         # Jacobian to get dV/dZ, weight it by gamma^steps, and add it to the
         # seed. gamma^steps because V estimates reward starting one step past
         # the window's last reward.
-        adjoint = adjoint + gamma ** steps * task.state_gradient(dV_dobs.detach().numpy(), batch.jacobian)
+        adjoint = adjoint + gamma ** steps * observation.state_gradient(dV_dobs.detach().numpy(), batch.jacobian)
 
     # Backwards, one control step at a time. One call per WINDOW would give
     # the open-loop gradient; the difference is the middle term below.
@@ -261,7 +261,7 @@ def policy_gradient(batch, window, actor, critic=None, shaping=True, gamma=1.0):
         # Rotate the wrench gradient back into the ramp frame and drop the
         # single-step axis with [0]. GRIP differentiates world wrenches; the
         # network emits ramp-frame actions.
-        action_gradient = task.to_action_gradient(dJ_dU, batch.angles, batch.variant)[0]
+        action_gradient = task.to_action_gradient(dJ_dU, batch.angles)[0]
 
         # Push that through the network: banks dJ/d(theta) for this step and
         # returns dJ/d(observation) for the term below.
@@ -274,6 +274,6 @@ def policy_gradient(batch, window, actor, critic=None, shaping=True, gamma=1.0):
         # The middle term is what a single whole-window call cannot see: it
         # treats the controls as fixed inputs, which is right for a trajectory
         # optimizer and wrong for anything that reacts to the state.
-        adjoint = dJ_dZ0 + task.state_gradient(dJ_dobs, batch.jacobian) + dl_dZ[t]
+        adjoint = dJ_dZ0 + observation.state_gradient(dJ_dobs, batch.jacobian) + dl_dZ[t]
 
     return adjoint

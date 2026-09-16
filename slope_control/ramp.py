@@ -65,6 +65,18 @@ def friction_angle(mu):
     return math.atan(mu)
 
 
+def as_angles(ramp_angles):
+    """One angle per environment, as a float array, whatever form came in.
+
+    Every function that takes a slope accepts either a scalar or one angle
+    per environment, and all of them need the array form before they can
+    index or broadcast it. Named `as_angles` rather than `angles` because
+    several callers already use `angles` as a local variable, and a
+    module-level function of that name would be shadowed by it.
+    """
+    return np.atleast_1d(np.asarray(ramp_angles, dtype=float))
+
+
 def uphill(ramp_angle):
     """(cos a, sin a). A scalar gives (2,), an array of N gives (N, 2)."""
     a = np.asarray(ramp_angle, dtype=float)
@@ -266,7 +278,7 @@ def make_scenes(ramp_angles, bodies=None, dt=DEFAULT_TIMESTEP, penalty=None):
     ramp angle randomizes for free. That is the whole reason the task's
     per-episode slope costs nothing.
     """
-    return [make_scene(ramp_angle=a, bodies=bodies, dt=dt, penalty=penalty) for a in np.atleast_1d(ramp_angles)]
+    return [make_scene(ramp_angle=a, bodies=bodies, dt=dt, penalty=penalty) for a in as_angles(ramp_angles)]
 
 
 def resting_state(xi, ramp_angles, bodies=None):
@@ -288,10 +300,10 @@ def resting_state(xi, ramp_angles, bodies=None):
     Flush is not where penalty contact wants the body -- that is about half
     a millimetre lower. Starting there instead was rejected: it is a fact
     about penalty contact, so it would give the two columns different
-    initial conditions. Start flush and let `task.settle` handle it.
+    initial conditions. Start flush and let `batches.settle` handle it.
     """
     bodies = BOX_ONLY_BODIES if bodies is None else bodies
-    angles = np.atleast_1d(np.asarray(ramp_angles, dtype=float))
+    angles = as_angles(ramp_angles)
 
     # Open a body axis on a bare (environments,) input, giving
     # (environments, 1) so it broadcasts across bodies. Such an input means
@@ -334,7 +346,7 @@ def along_ramp(states, ramp_angles):
     # 2-vector i onto that environment's own uphill direction. Leading step
     # axes pass through untouched, which is why one state and a whole
     # trajectory both work and only the last axis disappears.
-    return np.einsum("...nbi,ni->...nb", states[..., 0:2], uphill(np.atleast_1d(ramp_angles)))
+    return np.einsum("...nbi,ni->...nb", states[..., 0:2], uphill(as_angles(ramp_angles)))
 
 
 def creep_rate(ramp_angle=DEFAULT_RAMP_ANGLE, penalty=None, mass=BOX_MASS):

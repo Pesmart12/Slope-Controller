@@ -10,8 +10,8 @@ requires-python = ">=3.10"
 
 # GRIP is deliberately NOT listed. It is not on PyPI -- the name there
 # belongs to an unrelated README renderer, so resolving it would install
-# the wrong thing silently. It is a local editable install built behind
-# vcvars; see the README's Setup section.
+# the wrong thing silently. It is a local editable install compiled from
+# source; see the README's Setup section.
 dependencies = ["numpy", "matplotlib", "torch"]
 
 [tool.setuptools]

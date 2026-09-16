@@ -32,7 +32,7 @@ check runs discounted rather than at gamma = 1.
 import numpy as np
 import torch
 
-from slope_control import policy, sweep, task
+from slope_control import batches, objective, observation, policy, sweep, task
 
 WINDOW = 24
 PROBES = 12
@@ -44,13 +44,13 @@ PROBES = 12
 GAMMA = 0.97
 
 
-def setup(variant, n_envs=2, seed=0):
+def setup(n_envs=2, seed=0):
     rng = np.random.default_rng(seed)
     torch.manual_seed(seed)
 
-    batch = task.sample_batch(rng, n_envs, variant)
-    observation_size = task.observe(batch.state, batch.angles, batch.targets, variant).shape[-1]
-    actor = policy.Actor(observation_size, len(variant.actuated), variant.limit)
+    batch = batches.sample_batch(rng, n_envs)
+    observation_size = observation.observe(batch.state, batch.angles, batch.targets).shape[-1]
+    actor = policy.Actor(observation_size, len(task.ACTUATED), task.LIMIT)
 
     # Jitter every weight by 0.25 * N(0, 1). Small but not tiny, so the
     # network is genuinely nonlinear at the operating point rather than
@@ -70,12 +70,12 @@ def windowed_reward(batch, actor, shaping, gamma=GAMMA):
     the exponents in the sweep were off by one, this is what would catch it.
     """
     window = sweep.rollout(batch, actor, WINDOW, deterministic=True)
-    rewards = task.reward(window.states, window.wrenches, batch.angles, batch.targets, batch.variant, shaping=shaping)
+    rewards = objective.reward(window.states, window.wrenches, batch.angles, batch.targets, shaping=shaping)
     return (gamma ** np.arange(len(rewards))[:, None] * rewards).sum()
 
 
-def check(name, variant, shaping):
-    batch, actor = setup(variant)
+def check(name, shaping):
+    batch, actor = setup()
 
     policy.zero_gradients(actor)
     window = sweep.rollout(batch, actor, WINDOW, deterministic=True)
@@ -111,10 +111,8 @@ def main():
     print(f"\n  MLP actor, deterministic, {WINDOW}-step window, per-step adjoint sweep, gamma = {GAMMA}\n")
 
     worst = 0.0
-    for name, variant, shaping in [("box only,  unshaped", task.BOX_ONLY, False),
-                                   ("box only,  shaped  ", task.BOX_ONLY, True),
-                                   ("2 pushers, shaped  ", task.TWO_PUSHERS, True)]:
-        worst = max(worst, check(name, variant, shaping))
+    for name, shaping in [("unshaped", False), ("shaped  ", True)]:
+        worst = max(worst, check(name, shaping))
 
     failed = worst > 1e-4
     print(f"\n{'FAIL' if failed else 'PASS'} -- the policy gradient matches central differences to {worst:.2e}")
