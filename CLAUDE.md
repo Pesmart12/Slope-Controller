@@ -131,7 +131,6 @@ The repository is small and should stay legible.
 | `experiments/drift.py` | artifact 1 — the drift measurement and its figure |
 | `experiments/train_shac.py` | the experiment that trains — one run, file logging, the latest and the best checkpoint |
 | `experiments/diagnose_shac.py` | why training loses its best policy — every checkpoint rescored against the reported reward, SHAC's own objective, and fixed critics |
-| `experiments/restart_shac.py` | restarts training from the iteration-400 checkpoint and changes one thing per arm, to find what drives the decline |
 | `figures/` | committed output, so results are visible without running anything |
 | `runs/` | training logs, evaluation histories and checkpoints, one directory per run |
 | `tests/check_task.py` | the checks the task rests on, chiefly the finite-difference of `dJ_dU` through GRIP |
@@ -588,10 +587,12 @@ Split by direction, as `diagnose_shac.py` does.
 ### WHAT DRIVES IT: the critic
 
 Everything fixed about the task was fixed at iteration 400 too, so the
-cause has to be something that changes during training.
-`experiments/restart_shac.py` restarts from the iteration-400 checkpoint
-and runs 400 more iterations in four arms, each changing one thing, all on
-the same seed. Hold reward, 1–4 s, on the diagnosis environments;
+cause has to be something that changes during training. A restart
+experiment, measured at `f65892f` and since removed along with the
+`train` options it needed, restarted from the iteration-400 checkpoint
+and ran 400 more iterations in four arms, each changing one thing, all on
+the same seed. `shac.train(initial=...)` still restarts from any saved
+state. Hold reward, 1–4 s, on the diagnosis environments;
 iteration 400 is −2.99:
 
 ```
@@ -619,6 +620,54 @@ toward the target starts out overstated and falls behind the truth, and
 the actor relaxes as it does. Freezing the critic is a diagnostic, not a
 fix — it works because iteration 400's critic happened to overstate the
 pull. The fix is a critic that tracks the policy.
+
+### NEXT: move to the reference SHAC configuration
+
+Decided with Pedro: stop differing from the paper. Our SHAC was a mix of
+settings, most never chosen for this task — the target update came from a
+DDPG habit, Adam's betas were torch's defaults, the critic's 4 epochs were
+a guess. Reference SHAC's settings are co-adapted. Alpha 0.2 works
+because the critic gets 64 gradient steps per iteration on smooth TD(λ)
+targets, so they are adopted together, never piecemeal. Values follow
+NVlabs/DiffRL's Ant and Cheetah configs:
+
+```
+   target critic alpha      0.2          (ours was 0.995, Humanoid's value)
+   critic targets           TD(lambda = 0.95), target critic at every step
+   critic fitting           16 iterations x 4 minibatches
+   actor and critic lr      2e-3, linear decay to 1e-5 over the run
+   Adam betas               (0.7, 0.95)
+   gradient clipping        norm 1.0, actor and critic
+   return normalization     off
+```
+
+Already the same: gamma 0.99, window 32, 64 environments, `log_std`
+learned from −1.0.
+
+**Two deliberate exceptions, kept on purpose:**
+
+- **Observation normalization stays fixed.** The reference normalizes with
+  a running mean and standard deviation. Ours is a hand-designed affine
+  map whose Jacobian `sweep.policy_gradient` relies on being constant —
+  `batches.Batch` carries it precomputed and the gradient checks validate
+  it. A running normalizer would change it every iteration and touch the
+  checked gradient path. The observation is already well scaled.
+- **Episode handling stays as it is.** Fixed-length episodes with no early
+  termination, so the reference's done-mask logic reduces to "no bootstrap
+  on the last window", which `train` already does.
+
+**Clipping comes back as part of the package.** It measured worse here,
+but in a setup that differed from the paper in six other ways, so that
+measurement does not transfer.
+
+**The learning-rate schedule ties a run to its length.** It decays to
+1e-5 at the last iteration. A longer run is a different schedule, not
+more iterations of the same one — lengthen it deliberately if a run
+needs it.
+
+Every SHAC number recorded above becomes history once the defaults
+change. They were measured on the old configuration, which the commits
+they came from still reproduce.
 
 #### Answered, so they are not re-run
 

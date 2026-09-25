@@ -416,7 +416,7 @@ def training_state(iteration, actor, critic, target_critic, actor_optimizer, cri
                 actor_optimizer=actor_optimizer.state_dict(), critic_optimizer=critic_optimizer.state_dict())
 
 
-def train(iterations, n_envs=N_ENVS, window=WINDOW, gamma=GAMMA, seed=0, shaping=True, eval_every=100, eval_envs=EVAL_ENVS, log=print, slope_at=SLOPE_AT_STEP, checkpoint=None, trace=None, initial=None, actor_lr=ACTOR_LR, train_critic=True, train_noise=True):
+def train(iterations, n_envs=N_ENVS, window=WINDOW, gamma=GAMMA, seed=0, shaping=True, eval_every=100, eval_envs=EVAL_ENVS, log=print, slope_at=SLOPE_AT_STEP, checkpoint=None, trace=None, initial=None):
     """Run SHAC. Returns the actor, the critic, and the evaluation log.
 
     Episodes advance in lockstep: every environment starts together, runs
@@ -449,11 +449,6 @@ def train(iterations, n_envs=N_ENVS, window=WINDOW, gamma=GAMMA, seed=0, shaping
     which changes its first steps, so compare a restart against a restart
     rather than against the original run.
 
-    `actor_lr`, `train_critic` and `train_noise` exist to change one thing
-    at a time in a restart. `train_critic=False` stops fitting the critic
-    and moving the target critic, so the actor bootstraps from the same
-    network throughout. `train_noise=False` freezes the actor's `log_std`.
-
     `trace`, if given, is called every iteration with (iteration, window
     index within the episode, window objective, gradient norm). The window
     objective is the mean over environments of J at the window's first
@@ -470,7 +465,7 @@ def train(iterations, n_envs=N_ENVS, window=WINDOW, gamma=GAMMA, seed=0, shaping
     critic = policy.Critic(observation_size)
     target_critic = copy.deepcopy(critic)
 
-    actor_optimizer = torch.optim.Adam(actor.parameters(), lr=actor_lr)
+    actor_optimizer = torch.optim.Adam(actor.parameters(), lr=ACTOR_LR)
     critic_optimizer = torch.optim.Adam(critic.parameters(), lr=CRITIC_LR)
 
     first = 1
@@ -481,18 +476,7 @@ def train(iterations, n_envs=N_ENVS, window=WINDOW, gamma=GAMMA, seed=0, shaping
         if "actor_optimizer" in initial:
             actor_optimizer.load_state_dict(initial["actor_optimizer"])
             critic_optimizer.load_state_dict(initial["critic_optimizer"])
-
-            # Reapply the requested learning rate, since loading an
-            # optimizer's state also loads the rate it was saved with.
-            for group in actor_optimizer.param_groups:
-                group["lr"] = actor_lr
         first = initial["iteration"] + 1
-
-    # Take `log_std` out of the gradient. `sweep.accumulate` skips
-    # parameters that do not require one, and Adam skips parameters whose
-    # gradient is None, so the noise stays where it is.
-    if not train_noise:
-        actor.log_std.requires_grad_(False)
 
     history, steps_done = [], 0
     for iteration in range(first, first + iterations):
@@ -515,10 +499,8 @@ def train(iterations, n_envs=N_ENVS, window=WINDOW, gamma=GAMMA, seed=0, shaping
         ascend(actor, actor_optimizer, n_envs)
 
         returns = window_returns(batch, rolled, target_critic, shaping, gamma=gamma, bootstrap=not ends_episode)
-        critic_loss = float("nan")
-        if train_critic:
-            critic_loss = fit_critic(critic, critic_optimizer, rolled.observations, returns)
-            soft_update(target_critic, critic)
+        critic_loss = fit_critic(critic, critic_optimizer, rolled.observations, returns)
+        soft_update(target_critic, critic)
 
         if trace is not None:
             # Report the window's objective, averaged over environments.
