@@ -58,8 +58,7 @@ def run(iterations, n_envs, seed, eval_every, directory):
         # it got.
         handle.flush()
 
-    def checkpoint(iteration, actor, critic, target_critic, history):
-        state = dict(iteration=iteration, actor=actor.state_dict(), critic=critic.state_dict())
+    def checkpoint(iteration, state, history):
         torch.save(state, directory / f"{NAME}.pt")
         (directory / f"{NAME}.json").write_text(json.dumps(history, indent=2))
 

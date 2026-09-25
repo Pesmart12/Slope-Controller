@@ -82,9 +82,9 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 def train_run(directory, iterations, n_envs, seed, eval_every):
     """Rerun `train_shac.py`'s training, saving a checkpoint at every evaluation.
 
-    Writes `checkpoints/<iteration>.pt` with the actor, critic and target
-    critic, `history.json` with the evaluation log, `trace.json` with one
-    row per iteration, and `train.log`.
+    Writes `checkpoints/<iteration>.pt` with `shac.training_state`,
+    `history.json` with the evaluation log, `trace.json` with one row per
+    iteration, and `train.log`.
     """
     (directory / "checkpoints").mkdir(parents=True, exist_ok=True)
     handle = (directory / "train.log").open("w")
@@ -98,8 +98,7 @@ def train_run(directory, iterations, n_envs, seed, eval_every):
     def trace(iteration, phase, objective_value, gradient_norm):
         rows.append(dict(iteration=iteration, phase=phase, objective=objective_value, gradient_norm=gradient_norm))
 
-    def checkpoint(iteration, actor, critic, target_critic, history):
-        state = dict(iteration=iteration, actor=actor.state_dict(), critic=critic.state_dict(), target_critic=target_critic.state_dict())
+    def checkpoint(iteration, state, history):
         torch.save(state, directory / "checkpoints" / f"{iteration:05d}.pt")
         (directory / "history.json").write_text(json.dumps(history, indent=2))
         (directory / "trace.json").write_text(json.dumps(rows))

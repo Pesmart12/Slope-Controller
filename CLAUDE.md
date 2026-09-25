@@ -131,6 +131,7 @@ The repository is small and should stay legible.
 | `experiments/drift.py` | artifact 1 — the drift measurement and its figure |
 | `experiments/train_shac.py` | the experiment that trains — one run, file logging, the latest and the best checkpoint |
 | `experiments/diagnose_shac.py` | why training loses its best policy — every checkpoint rescored against the reported reward, SHAC's own objective, and fixed critics |
+| `experiments/restart_shac.py` | restarts training from the iteration-400 checkpoint and changes one thing per arm, to find what drives the decline |
 | `figures/` | committed output, so results are visible without running anything |
 | `runs/` | training logs, evaluation histories and checkpoints, one directory per run |
 | `tests/check_task.py` | the checks the task rests on, chiefly the finite-difference of `dJ_dU` through GRIP |
@@ -583,6 +584,41 @@ what the critic would have to carry.
 **Do not average `|error|` across target directions.** The mean is
 dominated by whichever direction has more error and describes neither.
 Split by direction, as `diagnose_shac.py` does.
+
+### WHAT DRIVES IT: the critic
+
+Everything fixed about the task was fixed at iteration 400 too, so the
+cause has to be something that changes during training.
+`experiments/restart_shac.py` restarts from the iteration-400 checkpoint
+and runs 400 more iterations in four arms, each changing one thing, all on
+the same seed. Hold reward, 1–4 s, on the diagnosis environments;
+iteration 400 is −2.99:
+
+```
+   arm                      500      600      700      800
+   original run           -4.35    -6.43   -12.29    -9.54
+   control (restart)      -4.77    -5.95   -10.30    -9.06
+   frozen noise           -3.44    -6.95   -11.09    -8.83
+   actor lr x0.1          -5.50    -6.75    -8.29    -8.65
+   frozen critic          -3.88    -4.63    -4.67    -3.96
+```
+
+**The restart is valid:** the control arm reproduces the decline, although
+every arm restarts Adam from scratch, since the iteration-400 checkpoint
+carries no optimizer state. **Noise decay is not the cause.** **Step size
+is not the cause:** ten times smaller actor steps decline more slowly but
+nearly as far, so the actor's gradient points consistently toward
+relaxing the hold. **The critic's evolution is the cause:** with the
+actor reading iteration 400's target critic throughout, the hold stays
+near −4. Every arm, the frozen critic included, loses about 1.5 cm between
+400 and 500, most likely the fresh-Adam kick.
+
+Consistent with it, not tested by it: at iteration 400 the target critic's
+slope is 3.0× the true slope, at 700 1.8×, at 900 0.7×. The critic's pull
+toward the target starts out overstated and falls behind the truth, and
+the actor relaxes as it does. Freezing the critic is a diagnostic, not a
+fix — it works because iteration 400's critic happened to overstate the
+pull. The fix is a critic that tracks the policy.
 
 #### Answered, so they are not re-run
 

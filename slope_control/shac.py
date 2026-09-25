@@ -409,7 +409,14 @@ def log_evaluation(record, log):
         f"  corr {record['slope_correlation']:>6.3f}  sign {record['slope_agreement']:>5.2f}")
 
 
-def train(iterations, n_envs=N_ENVS, window=WINDOW, gamma=GAMMA, seed=0, shaping=True, eval_every=100, eval_envs=EVAL_ENVS, log=print, slope_at=SLOPE_AT_STEP, checkpoint=None, trace=None):
+def training_state(iteration, actor, critic, target_critic, actor_optimizer, critic_optimizer):
+    """Everything `train` needs to restart exactly, as a dict of state
+    dicts plus the iteration."""
+    return dict(iteration=iteration, actor=actor.state_dict(), critic=critic.state_dict(), target_critic=target_critic.state_dict(),
+                actor_optimizer=actor_optimizer.state_dict(), critic_optimizer=critic_optimizer.state_dict())
+
+
+def train(iterations, n_envs=N_ENVS, window=WINDOW, gamma=GAMMA, seed=0, shaping=True, eval_every=100, eval_envs=EVAL_ENVS, log=print, slope_at=SLOPE_AT_STEP, checkpoint=None, trace=None, initial=None, actor_lr=ACTOR_LR, train_critic=True, train_noise=True):
     """Run SHAC. Returns the actor, the critic, and the evaluation log.
 
     Episodes advance in lockstep: every environment starts together, runs
@@ -432,10 +439,20 @@ def train(iterations, n_envs=N_ENVS, window=WINDOW, gamma=GAMMA, seed=0, shaping
 
     `slope_at` is the episode phase where the critic's slope is read; see
     `slope_calibration`. `checkpoint`, if given, is called at every
-    evaluation with (iteration, actor, critic, target_critic, history) --
-    enough to save a run that might not finish, without deciding here where
-    files go. The target critic is included because it, not the critic, is
-    what the actor's bootstrap reads.
+    evaluation with (iteration, state, history), where `state` is what
+    `training_state` returns -- enough to save a run that might not finish,
+    or to restart one, without deciding here where files go.
+
+    `initial` restarts from such a state. The networks load from it, and so
+    do the optimizers if it carries them; iterations continue from its
+    `iteration`. A state without optimizers restarts Adam from scratch,
+    which changes its first steps, so compare a restart against a restart
+    rather than against the original run.
+
+    `actor_lr`, `train_critic` and `train_noise` exist to change one thing
+    at a time in a restart. `train_critic=False` stops fitting the critic
+    and moving the target critic, so the actor bootstraps from the same
+    network throughout. `train_noise=False` freezes the actor's `log_std`.
 
     `trace`, if given, is called every iteration with (iteration, window
     index within the episode, window objective, gradient norm). The window
@@ -453,11 +470,32 @@ def train(iterations, n_envs=N_ENVS, window=WINDOW, gamma=GAMMA, seed=0, shaping
     critic = policy.Critic(observation_size)
     target_critic = copy.deepcopy(critic)
 
-    actor_optimizer = torch.optim.Adam(actor.parameters(), lr=ACTOR_LR)
+    actor_optimizer = torch.optim.Adam(actor.parameters(), lr=actor_lr)
     critic_optimizer = torch.optim.Adam(critic.parameters(), lr=CRITIC_LR)
 
+    first = 1
+    if initial is not None:
+        actor.load_state_dict(initial["actor"])
+        critic.load_state_dict(initial["critic"])
+        target_critic.load_state_dict(initial["target_critic"])
+        if "actor_optimizer" in initial:
+            actor_optimizer.load_state_dict(initial["actor_optimizer"])
+            critic_optimizer.load_state_dict(initial["critic_optimizer"])
+
+            # Reapply the requested learning rate, since loading an
+            # optimizer's state also loads the rate it was saved with.
+            for group in actor_optimizer.param_groups:
+                group["lr"] = actor_lr
+        first = initial["iteration"] + 1
+
+    # Take `log_std` out of the gradient. `sweep.accumulate` skips
+    # parameters that do not require one, and Adam skips parameters whose
+    # gradient is None, so the noise stays where it is.
+    if not train_noise:
+        actor.log_std.requires_grad_(False)
+
     history, steps_done = [], 0
-    for iteration in range(1, iterations + 1):
+    for iteration in range(first, first + iterations):
         # Shorten rather than overrun, so an episode ends exactly at
         # EPISODE_STEPS. 400 is not a multiple of 32.
         steps = min(window, task.EPISODE_STEPS - steps_done)
@@ -477,8 +515,10 @@ def train(iterations, n_envs=N_ENVS, window=WINDOW, gamma=GAMMA, seed=0, shaping
         ascend(actor, actor_optimizer, n_envs)
 
         returns = window_returns(batch, rolled, target_critic, shaping, gamma=gamma, bootstrap=not ends_episode)
-        critic_loss = fit_critic(critic, critic_optimizer, rolled.observations, returns)
-        soft_update(target_critic, critic)
+        critic_loss = float("nan")
+        if train_critic:
+            critic_loss = fit_critic(critic, critic_optimizer, rolled.observations, returns)
+            soft_update(target_critic, critic)
 
         if trace is not None:
             # Report the window's objective, averaged over environments.
@@ -493,13 +533,13 @@ def train(iterations, n_envs=N_ENVS, window=WINDOW, gamma=GAMMA, seed=0, shaping
         else:
             batch = batch._replace(state=rolled.states[-1])
 
-        if eval_every and (iteration % eval_every == 0 or iteration == 1):
+        if eval_every and (iteration % eval_every == 0 or iteration == first):
             record = dict(iteration=iteration, critic_loss=critic_loss, gradient_norm=gradient_norm,
                           **evaluation(actor, critic, target_critic, gamma=gamma, slope_at=slope_at, n_envs=eval_envs))
             history.append(record)
             log_evaluation(record, log)
 
             if checkpoint is not None:
-                checkpoint(iteration, actor, critic, target_critic, history)
+                checkpoint(iteration, training_state(iteration, actor, critic, target_critic, actor_optimizer, critic_optimizer), history)
 
     return actor, critic, history
