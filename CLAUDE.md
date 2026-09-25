@@ -82,13 +82,12 @@ reward and walks the parked position further downhill of the target; that
 was measured on the box-only variant before it was removed, so there is no
 table of it here any more.
 
-**Both optimizers park downhill of the target**, and that is worth
-keeping. Trajopt lands at +0.76 / −0.09 / −0.32 cm across the sampled
-slopes, and SHAC at −3.14 cm uphill and −1.44 cm downhill. The reward
-prices penalty contact correctly: closing the last centimetres needs force
-above `break_free_force`, which costs more per step than the position
-error it saves, and inside that band nothing slides. The standing reminder
-has the full measurement.
+**Trajopt parks downhill of the target**, at +0.76 / −0.09 / −0.32 cm
+across the sampled slopes. Closing the last centimetres needs force above
+`break_free_force`, which costs more per step than the position error it
+saves. SHAC ending further downhill the longer it trains is a different
+thing — the optimization, not the reward — and the standing reminder has
+that measurement. Do not read the two as one finding.
 
 The eventual comparison is also loose by design — these numbers will sit
 next to other projects' numbers someday, informally. That is not a reason to
@@ -128,10 +127,10 @@ The repository is small and should stay legible.
 | `slope_control/observation.py` | what the policy sees, and its constant Jacobian |
 | `slope_control/batches.py` | `Batch` and its two builders — scenes, placement, settle window, targets |
 | `slope_control/shac.py` | the training loop — windowed rollout, actor step, critic fit, target update |
-| `slope_control/render.py` | draws a scene and animates an episode to a GIF; pure presentation, computes nothing |
+| `slope_control/render.py` | draws a scene and animates an episode to a GIF; pure presentation, computes nothing. Unused until the demo is rebuilt |
 | `experiments/drift.py` | artifact 1 — the drift measurement and its figure |
-| `experiments/train_shac.py` | the experiment that trains — three arms, file logging, two checkpoints per arm |
-| `experiments/demo.py` | the trained policy rendered — two GIFs, the creep figure, and the JSON the interactive page embeds |
+| `experiments/train_shac.py` | the experiment that trains — one run, file logging, the latest and the best checkpoint |
+| `experiments/diagnose_shac.py` | why training loses its best policy — every checkpoint rescored against the reported reward, SHAC's own objective, and fixed critics |
 | `figures/` | committed output, so results are visible without running anything |
 | `runs/` | training logs, evaluation histories and checkpoints, one directory per run |
 | `tests/check_task.py` | the checks the task rests on, chiefly the finite-difference of `dJ_dU` through GRIP |
@@ -159,8 +158,8 @@ it, which is what keeps those two exact inverses. The module names avoid
 
 Two things sit on the wrong side of that line and are left there on
 purpose, being small: `ascend` is a generic optimizer step but lives in
-`shac.py` because only `train` calls it and its default is a SHAC-tuned
-constant, and `evaluate` and `calibration` would serve any algorithm.
+`shac.py` because only `train` calls it, and `evaluate` and `calibration`
+would serve any algorithm.
 
 **`BOX_ONLY` is gone, and this is the record so it is not reintroduced.**
 It was a second variant of the task with one directly actuated box —
@@ -180,7 +179,7 @@ unactuated box. The fictional scene is a fixture there, not a task the
 package offers. Keeping it that way is what preserved the 119% figure
 exactly.
 
-The two **results**, both reproducible:
+The **results**, all reproducible:
 
 ```
 python experiments/drift.py
@@ -188,9 +187,9 @@ python experiments/drift.py
   closed form mg·sin α / (2·b_slip) exact to five figures up to 18°
   departs at 19°, 48% low at 26°
 
-python experiments/train_shac.py  then  python experiments/demo.py
-  74.92 cm to within a box side in 0.30 s, and exactly on target downhill
-  then creep takes it back off, which is the standing reminder's subject
+python experiments/train_shac.py  then  python experiments/diagnose_shac.py
+  best at iteration 400, mean signed final error -1.68 cm on 64 fresh environments
+  -6.78 cm by iteration 2000 -- why is the standing reminder's subject
 ```
 
 `tests/check_task.py` is not a result and produces no figure — it is what
@@ -223,16 +222,15 @@ so a session knows where it is.
 4. **Done.** Two pushers, box between them, box unactuated. Trajopt solves
    it to 0.76 / −0.09 / −0.32 cm, so the manipulation task is worth
    training on.
-5. **Substantially done, and the open problem turned out not to be one.**
-   SHAC on penalty — `slope_control/shac.py`, built on the per-step
-   adjoint sweep in `sweep.policy_gradient`, run by
-   `experiments/train_shac.py`. **The policy learns the task**: 74.92 cm
-   to within a box side in 0.30 s, and exactly on target when the target
-   is downhill. What no policy can do is *stay* there, because penalty
-   creep will not allow it. Clipping and the critic's slope were both
-   investigated and neither is the cause; see the standing reminder.
-   **What is left is presentation**, not more training —
-   `experiments/demo.py` is that, and the interactive page it feeds.
+5. **Trains, and does not keep its best policy.** SHAC on penalty —
+   `slope_control/shac.py`, built on the per-step adjoint sweep in
+   `sweep.policy_gradient`, run by `experiments/train_shac.py`. The policy
+   learns the approach, is at its best around iteration 400, and parks
+   further downhill as training continues. `experiments/diagnose_shac.py`
+   shows that is the optimization — not the objective, and not penalty
+   creep. **Holding the best policy is the open problem.** The demo was
+   removed because its framing assumed creep was the limit; it gets
+   rebuilt once training holds.
 6. Wait for GRIP 2.0, rerun the column, fill in the cross-eval table.
 
 Steps 2–5 need nothing from GRIP that does not already exist. **Do not build
@@ -507,12 +505,10 @@ check did not catch that and could not have — a correct gradient on an
 impossible objective is still correct. When something is checked and still
 doesn't work, suspect the task before the machinery.
 
-**Step 5, SHAC, trains and the policy learns the task.** For a long time
-the open problem was recorded as "no run has yet held its best result",
-read as a training pathology. That framing was wrong; the section below
-replaces it.
+**Step 5, SHAC, trains and learns the approach, but does not keep its
+best policy.** The section below is what is measured about that.
 
-The runs that produced it still stand as measurements. Two pushers, 8000
+Earlier, longer runs still stand as measurements. Two pushers, 8000
 iterations, 64 environments, seed 0, same budget in all three:
 
 ```
@@ -535,62 +531,64 @@ six hours in, while running six times slower per iteration than its
 predecessors. Never explained. `experiments/train_shac.py` logs to a file
 and checkpoints at every evaluation because of it.
 
-### WHAT THE LIMIT ACTUALLY IS: penalty creep, not training
+### WHAT IS MEASURED: training loses the hold
 
-The limit is penalty creep, and it bites in two opposite ways depending on
-which side of the box the target sits. Measured on the trained policy, one
-fixed episode per row:
+`experiments/diagnose_shac.py` reruns `train_shac.py`'s training — it
+reproduces the recorded run at every evaluation — saves all 21
+checkpoints, and rescores each on 64 environments from a seed nothing was
+selected on:
 
 ```
-   target              best cm   final cm   drift cm/s   hold N   break-free
-   50 cm uphill          -3.14      -3.14       +0.27     20.76      23.89
-   50 cm downhill        -0.00      -1.44       -0.49     15.13      23.89
+                                      iter 400    iter 2000
+  reported reward                      -142.19      -158.02
+    approach, 0-1 s                    -139.20      -141.74
+    hold, 1-4 s                          -2.99       -16.28
+    control term                         -3.79        -3.67
+  SHAC's objective, true return-to-go   -11.03       -14.42
+  mean signed final error              -1.68 cm     -6.78 cm
 ```
 
-**Uphill, creep is too slow to finish.** Closest approach equals final
-error, so the error never stops improving — the policy pushes at or just
-under break-free and creeps *toward* the target at 0.27–0.50 cm/s, and the
-episode ends first. Parking short is running out of time, not being
-dragged.
+**The loss is all in the hold, and all position.** The approach stays as
+good as it was and the effort barely changes. The box is parked further
+downhill as training continues, for uphill and downhill targets alike.
 
-**Downhill, it arrives and then loses it.** The box reaches −0.00 cm, dead
-on target, and slides to −1.44 cm while the policy holds at ~15 N, below
-break-free. Driving downhill is about nine times cheaper than uphill, so
-getting there is easy and staying there is what costs.
+**It is not an objective mismatch.** SHAC's own objective — shaped,
+gamma = 0.99, from every window start with the true return-to-go — peaks
+at iteration 400 as well. So do its noisy, unshaped and gamma = 1
+versions.
 
-Both are the same artifact with opposite signs, and **every episode ends
-downhill of the target** either way.
+**It is not penalty creep.** Physics is the same at iteration 400 and
+2000, and the iteration-400 policy did better under it. Creep sets a
+floor; it cannot make a later policy worse than an earlier one.
 
-**Do not average `|error|` across target directions.** An earlier pass
-here did, over eight sampled episodes, and produced an arrive-then-drift
-curve that describes neither case — the mean is dominated by the downhill
-minority. That error is what this section originally recorded.
+**The critic barely sees it.** Hold one target critic fixed and score
+every actor against it: actors 400 to 2000 differ by about 0.5, where the
+true objective falls by 3.4. No fixed critic prefers the late actor.
+Scored with each checkpoint's *own* critic the bootstrapped objective
+rises from −26.8 to −13.3 — that is the critic's calibration drifting,
+not the actor improving. Do not read it as progress.
 
-**This is why the ablations barely moved the endpoint.** Two runs with
-completely different critic arrangements ended at 6.69 and 6.72 cm on the
-sampled batch, because the number is set by physics against a fixed
-episode length, not by the optimizer.
+Approach windows carry about five times the hold windows' actor gradient
+norm throughout training.
 
-**Did it learn the task? Yes** — it reaches the target within a box side
-in 0.30 s, and hits it exactly when the target is downhill. What no policy
-can do under penalty contact is *stay* there.
+**Inference, not measured:** the critic does not carry the future cost of
+losing position. Inside a 32-step window, relaxing the holding force saves
+effort now and costs a millimetre or so of creep; the rest of the bill
+arrives after the window, where the critic's value hardly moves. Lengthening
+the window — 32, 128, 400 — tests it. At 400 there is no critic at all.
 
-Recorded as measurement, not interpretation. One inference is **not**
-measured: that the pusher's force goes mostly into holding itself, its mass
-being twice the box's and so creeping twice as fast. Checkable, not
-checked.
+Creep's part in this is that it makes holding a continuous cost, which is
+what the critic would have to carry.
 
-This is the thread already open above about trajopt parking downhill, and
-it turned out to be the dominant term in the 1.0 column rather than a
-footnote about the last millimetres. **Do not chase it under 1.0.** It has
-a closed form behind it and it is what the 2.0 column exists to sit next
-to. Do not write up what 2.0 will show either; measure it when there is a
-solver.
+**Do not average `|error|` across target directions.** The mean is
+dominated by whichever direction has more error and describes neither.
+Split by direction, as `diagnose_shac.py` does.
 
 #### Answered, so they are not re-run
 
 **Clipping does not hold the policy, and it is worse.** Two arms, two
-pushers, 2000 iterations, 64 environments, seed 0:
+pushers, 2000 iterations, 64 environments, seed 0, measured at `bf3c601`.
+Clipping has since been removed from `shac.py`:
 
 ```
                 best      at it.   end      gave up   clipped
@@ -601,24 +599,46 @@ pushers, 2000 iterations, 64 environments, seed 0:
 `clipped = 610` is the intended regime — neither inert nor binding every
 iteration — so the comparison is real. Worse peak, worse end.
 
-**The critic's slope is unreliable, and it is not the cause.** It was the
-one unexamined suspect and it is genuinely bad: `dV/dξ` swings between
-−184 and +129 and changes sign eight times across thirteen evaluations,
-while the true slope drifts smoothly 8 to 48 and V itself holds at 0.97
-correlation with bias near 1. But it is wrong at the policy's *best*
-iteration too, not only late, and an ablation with `actor_bootstrap=False`
-— the critic fitted and measured but never reaching the actor — still
-ended at 6.72 cm. So the decay does not need it.
+**The slope the actor receives is good until about iteration 1000, then
+it goes flat.** `shac.slope_calibration` measures the target critic, the
+network `sweep.policy_gradient` differentiates, 3 s into the evaluation
+episode. On the diagnosis run's checkpoints:
 
-What the slope does cost is reward without position: that arm's reward
-*improves* to the end, −186.92, where the bootstrapped arm's degrades to
-−191.07 at the same error. **`observe` carrying no clock is the candidate
-explanation** — the critic must fit return-to-go from an observation that
-cannot tell early from late, which can leave V accurate on average and its
-derivative incoherent. Not worth fixing under 1.0: it cannot move a
-creep-bound endpoint, and it would change the observation space every
-recorded number was measured against. Revisit when 2.0 removes creep and
-the horizon becomes the binding constraint.
+```
+   iter    target dV/dξ   corr   sign   true dV/dξ
+    400        23.41      0.96   1.00      7.83
+    700        45.75      0.98   1.00     25.71
+    900        15.70      0.97   1.00     23.60
+   1300        -2.05      0.56   0.38     30.80
+   2000         9.19      0.21   1.00     48.61
+```
+
+Through iteration 900 the sign is right in every environment and the
+correlation is 0.96–0.99. After it the true slope keeps rising — the
+further the box parks from the target, the more position is worth — and
+the critic's falls toward zero. The decline in the hold starts around
+iteration 500, before the slope goes bad, so the slope is not what starts
+it. It may be why nothing reverses it. Measured, not tested.
+
+**Slope numbers before this fix measured the wrong network.** Until pass
+2 of the `shac.py` cleanup, `slope_calibration` was handed `critic`, not
+`target_critic`. Its record — `dV/dξ` swinging between −184 and +129 and
+changing sign eight times across thirteen evaluations — describes a
+network the actor never read. V itself, measured on `critic`, holds at
+0.97 correlation with bias near 1; that one is the right network, since it
+measures the fit.
+
+An ablation with `actor_bootstrap=False` — the critic fitted but never
+reaching the actor, measured at `bf3c601` and since removed — ended at
+6.72 cm against 6.69. That was read as clearing the critic. It does not:
+a critic whose value barely moves with position gives about the gradient
+no critic gives, which is what the fixed-critic measurement above shows.
+
+**`observe` carrying no clock is a candidate explanation** for the
+incoherent slope — the critic must fit return-to-go from an observation
+that cannot tell early from late. Adding a clock changes the observation
+space every recorded number was measured against, so it is a decision,
+not a cleanup.
 
 **`slope_calibration`'s delta was wrong and is fixed.** It was sized at
 5 mm for physical plausibility — inside `POSITION_TOLERANCE`, above the

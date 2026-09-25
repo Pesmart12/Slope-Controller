@@ -37,8 +37,7 @@ force between the corners until the lightly loaded one saturates on its
 cone.
 
 That is the physics half, and it needed no policy to produce. The other
-half is what a learned controller runs into: the same creep is what stops
-a trained policy holding the box once it gets there. See Status.
+half is the build: a controller trained against this contact. See Status.
 
 Full task definition, scene numbers, reward and what gets measured:
 [`docs/ramp_manipulation_task.md`](docs/ramp_manipulation_task.md).
@@ -69,7 +68,7 @@ the end reports whatever the numbers turn out to say.
 | Ramp task, reward and gradient path | **done** — `slope_control/task.py`, `objective.py`, `observation.py`, `batches.py`, `tests/check_task.py` |
 | Trajectory optimization | **done** — `tests/check_trajopt.py`, within a centimetre at every sampled slope |
 | Two-pusher manipulation task | **done** — the box is unactuated, so every newton crossing it crosses a contact |
-| SHAC | **done** — `experiments/train_shac.py`, 1365 s for 2000 iterations at 64 environments |
+| SHAC | **trains, does not keep its best policy** — `experiments/train_shac.py`, 1365 s for 2000 iterations at 64 environments; `experiments/diagnose_shac.py` |
 | NCP half of every comparison | waiting on GRIP 2.0 |
 
 The first milestone needed no policy and no training, which is why it came
@@ -77,18 +76,19 @@ first: place a box on a tilted half-plane, roll out five seconds of zero
 controls, and measure. The other half of that plot is the same figure with
 a solve in place of a spring.
 
-**What the policy does, and what it cannot do.** It drives the box 74.92 cm
-to within a box width in 0.30 s, and lands exactly on target when the
-target is downhill. Then it loses it. Penalty creep pulls the box off the
-target for the rest of the episode, and arresting that needs force above
-break-free, which the reward prices as not worth the centimetres it buys.
-Every episode ends downhill of its target.
+**What the policy does.** It learns the approach and drives the box to
+its target. At its best, around iteration 400, it ends a mean 1.68 cm
+downhill of target on 64 environments it was never selected on. By
+iteration 2000 that is 6.78 cm.
 
-That is not a training failure — two runs with completely different critic
-arrangements ended within 0.03 cm of each other, because the number is set
-by the contact model against a fixed episode length. Under a rigid solve
-none of it happens: the box sticks, and holding after arrival is free.
-Which is what the 2.0 column is for.
+**What is open.** Training finds a good policy and then loses it. The
+approach stays as good as it was; what degrades is holding the box once it
+arrives, which gets parked further downhill as training goes on. That is
+the optimization, not the contact model: SHAC's own objective is best at
+iteration 400 too. [`experiments/diagnose_shac.py`](experiments/diagnose_shac.py)
+measures it. The demo gets rebuilt once training holds.
+
+![why training loses its best policy](figures/shac_diagnosis.png)
 
 ## Setup
 

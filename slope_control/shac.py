@@ -22,38 +22,17 @@ the actor is not optimizing 0.32 s in isolation.
 
 Discounted at gamma = 0.99, which is a training device and not a claim
 about what the task wants. Everything reported is the plain undiscounted
-reward -- `evaluate` sees no gamma at all.
-
-An earlier version ran undiscounted, on the reasoning that the episode is
-finite so nothing diverges and the whole 4 s should count. Two things are
-wrong with that:
+reward -- `evaluate` sees no gamma at all. The discount is there for two
+reasons:
 
     At gamma = 1 the Bellman operator is not a contraction, so the
-    bootstrap has no unique fixed point and no reason to converge. It
-    drifted to one: against episode returns near -180 the critic settled
-    at -53.87.
+    bootstrap has no unique fixed point to converge to. Undiscounted, the
+    critic settled at -53.87 against episode returns near -180.
 
-    The value of a state under gamma = 1 also depends on how many steps
-    remain, and `observe` carries no clock. So the critic was being asked
-    to fit "-180 early in the episode" and "-0.5 late in it" with one
-    number and no way to tell them apart. Discounting makes the far future
-    irrelevant, which is most of why it is standard for episodic tasks.
-
-Both of those stand on their own, which is why the discount stays. It is
-not a fix for anything else, and was never added as one.
-
-The actor's gradient is norm-clipped by default, at MAX_GRADIENT_NORM.
-Measured against an unclipped arm at the same seed it is WORSE on both
-counts -- a worse peak, 3.48 cm against 1.39, and a worse endpoint, 9.19
-against 6.69 -- with the ceiling binding on 610 of 2000 iterations, which
-is the regime where the comparison means something. Kept because it is
-cheap insurance against a genuine gradient spike, not because it helped.
-
-**The reported error rising after an early minimum is not a training
-failure.** It is penalty creep taking the box off the target, and it
-happens with the critic cut out of the actor's objective entirely.
-CLAUDE.md's standing reminder has the measurement and the two opposite
-ways it bites. Do not go looking for the optimizer bug; there isn't one.
+    Under gamma = 1 the value of a state depends on how many steps remain,
+    and `observe` carries no clock. The critic would have to fit "-180
+    early in the episode" and "-0.5 late in it" with no way to tell the
+    two apart.
 
 The critic is fitted in NORMALIZED units. Returns are still a badly scaled
 target for a network starting near zero, so `policy.Critic` keeps a
@@ -107,31 +86,42 @@ SLOPE_AT_STEP = 300
 # 2 mm, 23.4 at 5 mm. Past that it is reading the return's curvature over a
 # centimetre rather than its slope at a point.
 #
-# The first version of this used 5 mm, chosen for sitting inside
-# POSITION_TOLERANCE and above the millimetre the settle window drifts.
-# Both true, neither relevant, and the two criteria disagree by a factor of
-# 50. Penalty contact is stiff and Coulomb friction has no gentle regime,
-# so the return is only linear over a very short distance.
+# Do not size it for physical plausibility. A step inside POSITION_TOLERANCE
+# sounds reasonable and is 50 times too large: penalty contact is stiff and
+# Coulomb friction has no gentle regime, so the return is only linear over a
+# very short distance.
 SLOPE_DELTA = 1.0e-4
 
-# Ceiling on the actor's gradient norm. Applied after `ascend` divides by
-# the environment count, so one value holds however many environments run.
-#
-# Sized off a measured run. Over 2000 iterations at 64 environments the
-# post-division norm had a median near 1.2 and a tail at 4.4, 7.7, 13.9 and
-# 22.5. 2.0 sits above the bulk and cuts that tail.
-#
-# Adam does not absorb those on its own: a spike enters the numerator at
-# once and the second-moment denominator only over the following
-# iterations, so the outsized step lands before the correction does.
-MAX_GRADIENT_NORM = 2.0
+# The evaluation batch: a seed the training loop never draws from, and few
+# enough environments that scoring every 100 iterations stays cheap.
+EVAL_SEED = 1000
+EVAL_ENVS = 8
+
+
+def discounted_returns(rewards, gamma, terminal=0.0):
+    """The discounted return from every step to the end of `rewards`.
+
+    (steps, environments) -> (steps + 1, environments), numpy. The last row
+    is `terminal`, the value of whatever follows the final step: zero where
+    the episode really ends, a critic's estimate where it does not.
+    """
+    returns = np.zeros((len(rewards) + 1,) + np.shape(rewards)[1:])
+    returns[-1] = terminal
+
+    # Walk backwards: the value of being at step t is this step's reward plus
+    # the discounted value of where it lands. rewards[t] is the reward for
+    # the transition out of state t, which is why the indices line up.
+    for t in range(len(rewards) - 1, -1, -1):
+        returns[t] = rewards[t] + gamma * returns[t + 1]
+    return returns
 
 
 def window_returns(batch, window, target_critic, shaping, gamma=GAMMA, bootstrap=True):
     """The return from each state in the window: discounted reward to the end
     of the window, plus the target critic's estimate of everything after it.
 
-    Returns (steps + 1, environments), lined up with `window.states`.
+    Returns a (steps + 1, environments) tensor, lined up with
+    `window.states`.
 
     `bootstrap=False` for the window that ends an episode. There is no
     "after" there, so the correct terminal value is zero. Bootstrapping
@@ -143,31 +133,23 @@ def window_returns(batch, window, target_critic, shaping, gamma=GAMMA, bootstrap
     does.
     """
     rewards = objective.reward(window.states, window.wrenches, batch.angles, batch.targets, shaping=shaping)
-    steps, n_envs = rewards.shape
 
-    returns = torch.zeros((steps + 1, n_envs), dtype=torch.float64)
+    terminal = 0.0
     if bootstrap:
-        # Observe the window's final state, score it with the target critic,
-        # and write that into the last row. Under no_grad because this is a
-        # regression target, and a target has to be a constant -- otherwise
-        # fitting the critic would push gradients into the target network,
-        # which is the one thing it exists to avoid.
+        # Observe the window's final state and score it with the target
+        # critic. Under no_grad because this is a regression target, and a
+        # target has to be a constant -- otherwise fitting the critic would
+        # push gradients into the target network, which is the one thing it
+        # exists to avoid.
         with torch.no_grad():
-            terminal = policy.as_tensor(observation.observe(window.states[-1], batch.angles, batch.targets))
-            returns[-1] = target_critic(terminal)
+            observed = policy.as_tensor(observation.observe(window.states[-1], batch.angles, batch.targets))
+            terminal = target_critic(observed).numpy()
 
-    # Walk backwards: the value of being at step t is this step's reward plus
-    # the discounted value of where it lands. rewards[t] is the reward for
-    # the transition out of state t, which is why the indices line up.
-    rewards = policy.as_tensor(rewards)
-    for t in range(steps - 1, -1, -1):
-        returns[t] = rewards[t] + gamma * returns[t + 1]
-    return returns
+    return policy.as_tensor(discounted_returns(rewards, gamma, terminal))
 
 
 def fit_critic(critic, optimizer, observations, returns, epochs=CRITIC_EPOCHS):
-    """Regress the critic onto the window's returns. Returns the final loss,
-    or nan if `epochs` is zero.
+    """Regress the critic onto the window's returns. Returns the final loss.
 
     `observations` is a list of (environments, features), one per control
     step; `returns` is (steps + 1, environments). Both are flattened to one
@@ -219,15 +201,6 @@ def soft_update(target, source, tau=POLYAK):
     `old_net(obs) * new_std + new_mean` is not an estimate of anything.
     Blending both keeps them matched, so the target stays a coherent older
     version of the critic rather than a spliced one.
-
-    An earlier version copied the buffers outright and had exactly that
-    mismatch. It is self-correcting once `count` is large, since the
-    statistics stop moving, but it is worst in the first few hundred
-    iterations when they move fastest.
-
-    `count` gets blended too. It is meaningless on a target -- nothing
-    calls `update_statistics` on one -- so it is inert either way, and
-    special-casing it by name would cost more than it saves.
     """
     with torch.no_grad():
         for target_parameter, parameter in zip(target.parameters(), source.parameters()):
@@ -236,13 +209,8 @@ def soft_update(target, source, tau=POLYAK):
             target_buffer.mul_(1.0 - tau).add_(buffer, alpha=tau)
 
 
-def ascend(module, optimizer, n_envs, max_norm=MAX_GRADIENT_NORM):
-    """Take one Adam step UPHILL on the accumulated gradient, norm-clipped.
-
-    Returns the gradient norm measured before clipping, so a caller can
-    count how often the ceiling actually binds. Compare it against
-    `max_norm`, not against the norm `train` logs, which is measured before
-    the division below and so is larger by `n_envs`.
+def ascend(module, optimizer, n_envs):
+    """Take one Adam step UPHILL on the accumulated gradient.
 
     `policy_gradient` accumulates dJ/d(weights) where J is a reward to be
     maximized, and torch optimizers minimize, so every gradient is negated
@@ -250,41 +218,21 @@ def ascend(module, optimizer, n_envs, max_norm=MAX_GRADIENT_NORM):
     one place it has to be acted on.
 
     Also divides by the environment count, so the step size means the same
-    thing whether the batch holds 8 environments or 64. Clipping happens
-    after that division, which is why `MAX_GRADIENT_NORM` does not have to
-    be resized when the environment count is.
-
-    Pass `max_norm=None` to skip clipping entirely, which is what reproduces
-    the runs taken before it existed.
+    thing whether the batch holds 8 environments or 64.
     """
     for parameter in module.parameters():
         if parameter.grad is not None:
             parameter.grad.neg_().div_(n_envs)
-
-    # Measure the length of the flattened gradient, which is the length the
-    # step would have without a ceiling. Raises here if anything went NaN or
-    # infinite. Same quantity `train` logs as |grad|, differing only by the
-    # division above.
-    total = policy.gradient_norm(module)
-
-    if max_norm is not None:
-        # Multiply every gradient by the ratio max_norm / total, whenever
-        # total is the larger. The ratio is then below 1, so the flattened
-        # gradient comes out with length exactly max_norm and its direction
-        # unchanged.
-        torch.nn.utils.clip_grad_norm_(module.parameters(), max_norm)
-
     optimizer.step()
-    return total
 
 
-def rolled_episode(actor, batch=None, n_envs=8, seed=1000):
-    """Build a batch if one is not given, and roll one deterministic episode
-    on it. Returns (batch, window).
+def rolled_episode(actor, batch=None, n_envs=EVAL_ENVS, seed=EVAL_SEED):
+    """Roll one deterministic episode. Returns (batch, window), the
+    `episode` that `evaluate`, `calibration` and `slope_calibration` take.
 
-    `evaluate` and `calibration` both need exactly this, and at their shared
-    default seed they would each compute the same trajectory. Rolling it
-    once here and passing the pair to both is what stops that.
+    Builds the evaluation batch from `seed` unless a `batch` is given. The
+    two halves travel together because scoring a window against a
+    different batch's targets is not a thing that should be expressible.
     """
     if batch is None:
         batch = batches.sample_batch(np.random.default_rng(seed), n_envs)
@@ -297,37 +245,22 @@ def rolled_episode(actor, batch=None, n_envs=8, seed=1000):
         return batch, sweep.rollout(batch, actor, task.EPISODE_STEPS, deterministic=True)
 
 
-def evaluate(actor, batch=None, n_envs=8, seed=1000, shaping=False, episode=None):
-    """Run full episodes with the noise switched off and score them.
+def evaluate(episode):
+    """Score a deterministic episode. Returns the per-environment reward,
+    the same reward with the shaping term, and the final position error,
+    signed.
 
-    Returns the per-environment unshaped reward and the final position
-    error, signed.
-
-    Deterministic, and by default on a seed the training loop never saw,
-    so this measures the policy rather than the exploration it happened to
-    do. Pass a `batch` to score a specific configuration instead --
-    `check_trajopt`'s, for one, which is the only way its numbers and
-    these are answers to the same question.
-
-    `episode` takes an already-rolled (batch, window) pair from
-    `rolled_episode`, which is how `train` scores the policy and the critic
-    on one rollout rather than two. Both halves travel together because
-    scoring a window against a different batch's targets is not a thing
-    that should be expressible.
+    The unshaped reward is the one every reported number uses. The shaped
+    one is what training maximizes.
     """
-    batch, rolled = rolled_episode(actor, batch=batch, n_envs=n_envs, seed=seed) if episode is None else episode
-
-    reward = objective.reward(rolled.states, rolled.wrenches, batch.angles, batch.targets, shaping=shaping).sum(axis=0)
-
-    # Score the same rollout again with the shaping term switched on.
-    # Training maximizes this one; every reported number is the other.
+    batch, rolled = episode
+    reward = objective.reward(rolled.states, rolled.wrenches, batch.angles, batch.targets).sum(axis=0)
     shaped = objective.reward(rolled.states, rolled.wrenches, batch.angles, batch.targets, shaping=True).sum(axis=0)
-
     final = ramp.along_ramp(rolled.states[-1], batch.angles)[:, task.BOX] - batch.targets
-    return reward, final, shaped
+    return reward, shaped, final
 
 
-def calibration(actor, critic, n_envs=8, seed=1000, gamma=GAMMA, shaping=True, episode=None):
+def calibration(critic, episode, gamma=GAMMA, shaping=True):
     """Measure the critic against the discounted return it is meant to predict.
 
     Returns a dict: `bias` (mean V - mean true return), `rmse`, `correlation`,
@@ -346,21 +279,15 @@ def calibration(actor, critic, n_envs=8, seed=1000, gamma=GAMMA, shaping=True, e
     trained on. Passing shaping=False measures it against a return it was
     never asked to predict.
 
-    `episode` takes an already-rolled (batch, window) pair, so this and
-    `evaluate` can share one rollout; see `rolled_episode`.
     """
-    batch, rolled = rolled_episode(actor, n_envs=n_envs, seed=seed) if episode is None else episode
+    batch, rolled = episode
 
+    # The discounted return to go, with a terminal value of zero because the
+    # episode really ends here. This is what the training bootstrap stands
+    # in for.
     rewards = objective.reward(rolled.states, rolled.wrenches, batch.angles, batch.targets, shaping=shaping)
-    steps = len(rewards)
-
-    # Accumulate the discounted return to go, walking backwards from a
-    # terminal value of zero. Zero because the episode really ends here, so
-    # there is no "after" to estimate -- this is the quantity the training
-    # bootstrap stands in for.
-    true = np.zeros((steps + 1, n_envs))
-    for t in range(steps - 1, -1, -1):
-        true[t] = rewards[t] + gamma * true[t + 1]
+    true = discounted_returns(rewards, gamma)
+    steps, n_envs = rewards.shape
 
     observations = observation.observe(rolled.states, batch.angles, batch.targets)
     with torch.no_grad():
@@ -375,55 +302,32 @@ def calibration(actor, critic, n_envs=8, seed=1000, gamma=GAMMA, shaping=True, e
                 initial=float(predicted[0].mean()), initial_true=float(true[0].mean()))
 
 
-def slope_calibration(actor, critic, n_envs=8, seed=1000, gamma=GAMMA, shaping=True, delta=SLOPE_DELTA, start_step=0, episode=None):
+def slope_calibration(actor, critic, episode, gamma=GAMMA, shaping=True, delta=SLOPE_DELTA, start_step=0):
     """Measure the critic's SLOPE against the slope of the true return.
 
     Returns a dict: `critic` and `true`, the two mean slopes in reward per
     metre; `bias`, `rmse` and `correlation` between them; and `agreement`,
     the fraction of environments where the two carry the same sign.
 
-    `calibration` asks whether V is the right number. This asks whether it
-    points the right way, which is a different question and the one the
-    actor actually depends on. What enters the actor's objective is
-    dV/d(obs) and never V -- `sweep.policy_gradient` seeds the window's
-    final adjoint with it and with nothing else the critic produces. A
-    network can fit values to 0.97 correlation and still have noisy local
-    derivatives, and nothing here has ever checked.
+    Pass the target critic: it is the network `sweep.policy_gradient`
+    differentiates, so it is the slope the actor actually receives.
 
-    The perturbation moves the box along the ramp. That direction keeps its
-    height above the surface, so contact geometry is unchanged and the two
-    rollouts differ in position error and nothing else. `SLOPE_DELTA` sets
-    how far, and it has to be small enough that the return is still linear
-    across it -- see the constant, which records where the quotient
-    converges and what happens well above it.
+    The slope is read at step `start_step` of `episode`, a state the policy
+    actually reaches. The true slope is a central difference of the return
+    from there, under the same deterministic policy.
 
-    `start_step` rolls the policy forward that many steps before measuring,
-    so the slope can be read at a state the policy actually reaches rather
-    than only at the start. The degradation this exists to diagnose happens
-    during the hold, which is where `start_step` needs to land to see it.
+    `calibration` asks whether V is the right number; this asks whether it
+    points the right way, which is what the actor depends on. What enters
+    the actor's objective is dV/d(obs) and never V, and a network can fit
+    values to 0.97 correlation and still have noisy local derivatives.
 
-    The true slope is a central difference of the return under the SAME
-    deterministic policy, so it differentiates the quantity the critic is
-    fitted to predict rather than a nearby one.
-
-    `episode` takes an already-rolled (batch, window) pair, and `start_step`
-    then indexes into it rather than re-simulating those steps; see
-    `rolled_episode`.
+    The box is displaced along the ramp, which keeps its height above the
+    surface, so the two rollouts differ in position error and nothing else.
+    `SLOPE_DELTA` sets how far, and records why it is that small.
     """
-    if episode is None:
-        batch = batches.sample_batch(np.random.default_rng(seed), n_envs)
-
-        # Advance to the phase being measured, so the slope is read where
-        # the policy spends its time rather than only at the settled start.
-        if start_step:
-            with torch.no_grad():
-                batch = batch._replace(state=sweep.rollout(batch, actor, start_step, deterministic=True).states[-1])
-    else:
-        # Step `start_step` of the episode `evaluate` already scored. Same
-        # batch, same deterministic policy, so it is the same state the
-        # branch above would re-simulate to reach.
-        batch, rolled = episode
-        batch = batch._replace(state=rolled.states[start_step])
+    # Restart the episode's batch from its step `start_step`.
+    batch, rolled = episode
+    batch = batch._replace(state=rolled.states[start_step])
 
     remaining = task.EPISODE_STEPS - start_step
 
@@ -440,12 +344,10 @@ def slope_calibration(actor, critic, n_envs=8, seed=1000, gamma=GAMMA, shaping=T
         with torch.no_grad():
             rolled = sweep.rollout(shifted, actor, remaining, deterministic=True)
 
-        # `bootstrap=False` sets the terminal value to zero, which is the
-        # real one here -- the episode ends at the end of the roll. It also
-        # leaves the target critic unused, so None is safe to pass. Row 0
-        # is the return from the perturbed state, which is what the
-        # difference below needs.
-        returns.append(window_returns(shifted, rolled, None, shaping, gamma=gamma, bootstrap=False)[0].numpy())
+        # Keep row 0, the return from the perturbed state. The terminal value
+        # is zero because the roll ends where the episode does.
+        rewards = objective.reward(rolled.states, rolled.wrenches, shifted.angles, shifted.targets, shaping=shaping)
+        returns.append(discounted_returns(rewards, gamma)[0])
     true = (returns[0] - returns[1]) / (2.0 * delta)
 
     # The critic's own slope at the unperturbed state.
@@ -465,7 +367,49 @@ def slope_calibration(actor, critic, n_envs=8, seed=1000, gamma=GAMMA, shaping=T
                 agreement=float(np.mean(np.sign(predicted) == np.sign(true))))
 
 
-def train(iterations, n_envs=N_ENVS, window=WINDOW, gamma=GAMMA, max_norm=MAX_GRADIENT_NORM, seed=0, shaping=True, eval_every=100, eval_envs=8, log=print, slope_at=SLOPE_AT_STEP, checkpoint=None, actor_bootstrap=True):
+def evaluation(actor, critic, target_critic, gamma=GAMMA, slope_at=SLOPE_AT_STEP, n_envs=EVAL_ENVS):
+    """Score the policy and the critic on one deterministic episode.
+
+    The value is measured on `critic`, which is what the fit produces. The
+    slope is measured on `target_critic`, which is what the actor's
+    bootstrap reads.
+
+    Returns a flat dict of floats: the policy's reward, shaped reward, mean
+    and worst final error and exploration noise; `calibration`'s entries;
+    and `slope_calibration`'s entries prefixed `slope_`, since the two
+    share the names bias, rmse and correlation.
+    """
+    episode = rolled_episode(actor, n_envs=n_envs)
+    reward, shaped, error = evaluate(episode)
+    calibrated = calibration(critic, episode, gamma=gamma)
+    slope = slope_calibration(actor, target_critic, episode, gamma=gamma, start_step=slope_at)
+
+    return dict(reward=float(reward.mean()), shaped=float(shaped.mean()), error=float(np.abs(error).mean()),
+                worst=float(np.abs(error).max()), noise=float(torch.exp(actor.log_std.detach()).mean()),
+                **calibrated, **{f"slope_{name}": value for name, value in slope.items()})
+
+
+def log_evaluation(record, log):
+    """Print one evaluation as three lines: the policy, the critic's value,
+    and the critic's slope.
+
+    The value line compares V(s_0) against the return the episode actually
+    paid, which `critic_loss` cannot report. The slope line compares dV/dxi
+    against the true return's slope at the same state, both in reward per
+    metre.
+    """
+    log(f"  {record['iteration']:>6}  reward {record['reward']:>9.2f}  shaped {record['shaped']:>9.2f}"
+        f"  err {100 * record['error']:>7.2f} cm  worst {100 * record['worst']:>7.2f} cm"
+        f"  |grad| {record['gradient_norm']:>8.1f}  sigma {record['noise']:.3f}")
+    log(f"          critic loss {record['critic_loss']:>8.4f}  V(s0) {record['initial']:>9.2f}"
+        f"  true {record['initial_true']:>9.2f}  bias {record['bias']:>8.2f}"
+        f"  rmse {record['rmse']:>8.2f}  corr {record['correlation']:>6.3f}")
+    log(f"          dV/dxi {record['slope_critic']:>9.2f}  true {record['slope_true']:>9.2f}"
+        f"  bias {record['slope_bias']:>8.2f}  rmse {record['slope_rmse']:>8.2f}"
+        f"  corr {record['slope_correlation']:>6.3f}  sign {record['slope_agreement']:>5.2f}")
+
+
+def train(iterations, n_envs=N_ENVS, window=WINDOW, gamma=GAMMA, seed=0, shaping=True, eval_every=100, eval_envs=EVAL_ENVS, log=print, slope_at=SLOPE_AT_STEP, checkpoint=None, trace=None):
     """Run SHAC. Returns the actor, the critic, and the evaluation log.
 
     Episodes advance in lockstep: every environment starts together, runs
@@ -478,19 +422,6 @@ def train(iterations, n_envs=N_ENVS, window=WINDOW, gamma=GAMMA, max_norm=MAX_GR
     so it must estimate the same reward the actor is maximizing. Every
     number reported is the UNSHAPED task reward regardless.
 
-    `actor_bootstrap=False` keeps the critic's estimate out of the actor's
-    objective, so `dV/d(obs)` never reaches the actor's weights. The critic
-    is still fitted, still bootstraps its own targets, and is still
-    measured by `calibration` and `slope_calibration` -- it becomes a
-    spectator rather than leaving the loop.
-
-    That makes the actor myopic, optimizing one 32-step window with no
-    estimate of the 3.7 s after it, which is the critic's whole job. So a
-    worse policy is expected on those grounds alone and the two outcomes
-    are not symmetric: a run that still decays says the decay does not need
-    the critic's slope, while a run that holds cannot separate "a harmful
-    gradient was removed" from "a myopic objective is steadier".
-
     Progress is measured by running full deterministic episodes every
     `eval_every` iterations, NOT by the reward of the training window. A
     window's reward depends on where in the episode it happens to fall:
@@ -501,8 +432,16 @@ def train(iterations, n_envs=N_ENVS, window=WINDOW, gamma=GAMMA, max_norm=MAX_GR
 
     `slope_at` is the episode phase where the critic's slope is read; see
     `slope_calibration`. `checkpoint`, if given, is called at every
-    evaluation with (iteration, actor, critic, history) -- enough to save a
-    run that might not finish, without deciding here where files go.
+    evaluation with (iteration, actor, critic, target_critic, history) --
+    enough to save a run that might not finish, without deciding here where
+    files go. The target critic is included because it, not the critic, is
+    what the actor's bootstrap reads.
+
+    `trace`, if given, is called every iteration with (iteration, window
+    index within the episode, window objective, gradient norm). The window
+    objective is the mean over environments of J at the window's first
+    state: shaped, discounted, and bootstrapped from the target critic,
+    which is the quantity the actor step climbs.
     """
     rng = np.random.default_rng(seed)
     torch.manual_seed(seed)
@@ -518,7 +457,6 @@ def train(iterations, n_envs=N_ENVS, window=WINDOW, gamma=GAMMA, max_norm=MAX_GR
     critic_optimizer = torch.optim.Adam(critic.parameters(), lr=CRITIC_LR)
 
     history, steps_done = [], 0
-    clipped = 0
     for iteration in range(1, iterations + 1):
         # Shorten rather than overrun, so an episode ends exactly at
         # EPISODE_STEPS. 400 is not a multiple of 32.
@@ -532,23 +470,22 @@ def train(iterations, n_envs=N_ENVS, window=WINDOW, gamma=GAMMA, max_norm=MAX_GR
         policy.zero_gradients(actor)
         rolled = sweep.rollout(batch, actor, steps)
         # Withhold the critic on the last window of an episode, where there
-        # is no future to estimate, and on every window when
-        # `actor_bootstrap` is off.
-        sweep.policy_gradient(batch, rolled, actor, critic=None if ends_episode or not actor_bootstrap else target_critic,
-                               shaping=shaping, gamma=gamma)
+        # is no future to estimate.
+        sweep.policy_gradient(batch, rolled, actor, critic=None if ends_episode else target_critic, shaping=shaping, gamma=gamma)
         gradient_norm = policy.gradient_norm(actor)
 
-        # Step the actor, and count the iterations where the ceiling bound.
-        # A count of zero means the clip is inert and a comparison run says
-        # nothing; a count near every iteration means it is a learning-rate
-        # change wearing a disguise.
-        stepped = ascend(actor, actor_optimizer, n_envs, max_norm=max_norm)
-        if max_norm is not None and stepped > max_norm:
-            clipped += 1
+        ascend(actor, actor_optimizer, n_envs)
 
         returns = window_returns(batch, rolled, target_critic, shaping, gamma=gamma, bootstrap=not ends_episode)
         critic_loss = fit_critic(critic, critic_optimizer, rolled.observations, returns)
         soft_update(target_critic, critic)
+
+        if trace is not None:
+            # Report the window's objective, averaged over environments.
+            # returns[0] was computed on the same rollout the actor's
+            # gradient came from, and before the soft update, so it is the
+            # objective the actor step just climbed.
+            trace(iteration, steps_done // window, float(returns[0].mean()), gradient_norm)
 
         steps_done += steps
         if steps_done >= task.EPISODE_STEPS:
@@ -557,45 +494,12 @@ def train(iterations, n_envs=N_ENVS, window=WINDOW, gamma=GAMMA, max_norm=MAX_GR
             batch = batch._replace(state=rolled.states[-1])
 
         if eval_every and (iteration % eval_every == 0 or iteration == 1):
-            # Roll the scoring episode once and score it twice -- the
-            # policy's error and the critic's calibration are two readings
-            # of the same trajectory.
-            episode = rolled_episode(actor, n_envs=eval_envs)
-            reward, error, shaped = evaluate(actor, episode=episode)
-            calibrated = calibration(actor, critic, gamma=gamma, episode=episode)
-
-            # Prefixed, because `slope_calibration` reports its own bias,
-            # rmse and correlation and those names are already taken by the
-            # value calibration above.
-            slope = slope_calibration(actor, critic, gamma=gamma, start_step=slope_at, episode=episode)
-
-            record = dict(iteration=iteration, reward=float(reward.mean()), shaped=float(shaped.mean()),
-                          error=float(np.abs(error).mean()), worst=float(np.abs(error).max()),
-                          critic_loss=critic_loss, gradient_norm=gradient_norm,
-                          noise=float(torch.exp(actor.log_std.detach()).mean()), clipped=clipped, **calibrated,
-                          **{f"slope_{name}": value for name, value in slope.items()})
+            record = dict(iteration=iteration, critic_loss=critic_loss, gradient_norm=gradient_norm,
+                          **evaluation(actor, critic, target_critic, gamma=gamma, slope_at=slope_at, n_envs=eval_envs))
             history.append(record)
-
-            # Print two lines per evaluation: the policy, then the critic.
-            # The critic line compares V(s_0) against the return the episode
-            # actually paid, which is what `critic_loss` cannot report.
-            log(f"  {iteration:>6}  reward {record['reward']:>9.2f}  shaped {record['shaped']:>9.2f}"
-                f"  err {100 * record['error']:>7.2f} cm  worst {100 * record['worst']:>7.2f} cm"
-                f"  |grad| {gradient_norm:>8.1f}  sigma {record['noise']:.3f}")
-            log(f"          critic loss {critic_loss:>8.4f}  V(s0) {record['initial']:>9.2f}"
-                f"  true {record['initial_true']:>9.2f}  bias {record['bias']:>8.2f}"
-                f"  rmse {record['rmse']:>8.2f}  corr {record['correlation']:>6.3f}"
-                f"  clipped {record['clipped']:>4}")
-
-            # The critic's slope, which is what the actor's objective
-            # actually reads. `dV/dxi` against the true return's slope at
-            # the same state, both in reward per metre.
-            log(f"          dV/dxi {record['slope_critic']:>9.2f}  true {record['slope_true']:>9.2f}"
-                f"  bias {record['slope_bias']:>8.2f}  rmse {record['slope_rmse']:>8.2f}"
-                f"  corr {record['slope_correlation']:>6.3f}  sign {record['slope_agreement']:>5.2f}")
-            clipped = 0
+            log_evaluation(record, log)
 
             if checkpoint is not None:
-                checkpoint(iteration, actor, critic, history)
+                checkpoint(iteration, actor, critic, target_critic, history)
 
     return actor, critic, history
