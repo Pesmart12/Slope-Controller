@@ -336,13 +336,14 @@ def main():
     parser.add_argument("--iterations", type=int, default=ITERATIONS)
     parser.add_argument("--envs", type=int, default=N_ENVS)
     parser.add_argument("--eval-every", type=int, default=EVAL_EVERY)
+    parser.add_argument("--seed", type=int, default=SEED)
     parser.add_argument("--skip-train", action="store_true", help="rescore the checkpoints already in --runs")
     parser.add_argument("--runs", type=pathlib.Path, default=ROOT / "runs" / "shac_diagnosis")
     parser.add_argument("--out", type=pathlib.Path, default=ROOT / "figures" / "shac_diagnosis.png")
     args = parser.parse_args()
 
     if not args.skip_train:
-        train_run(args.runs, args.iterations, args.envs, SEED, args.eval_every)
+        train_run(args.runs, args.iterations, args.envs, args.seed, args.eval_every)
 
     results = rescore(args.runs)
     trace = json.loads((args.runs / "trace.json").read_text())

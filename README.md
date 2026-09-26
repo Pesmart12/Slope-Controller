@@ -68,7 +68,7 @@ the end reports whatever the numbers turn out to say.
 | Ramp task, reward and gradient path | **done** — `slope_control/task.py`, `objective.py`, `observation.py`, `batches.py`, `tests/check_task.py` |
 | Trajectory optimization | **done** — `tests/check_trajopt.py`, within a centimetre at every sampled slope |
 | Two-pusher manipulation task | **done** — the box is unactuated, so every newton crossing it crosses a contact |
-| SHAC | **trains, does not keep its best policy** — `experiments/train_shac.py`, 1365 s for 2000 iterations at 64 environments; `experiments/diagnose_shac.py` |
+| SHAC | **done** — trains and holds across two seeds, reference SHAC configuration, `experiments/train_shac.py`, 1353 s for 2000 iterations at 64 environments; `experiments/diagnose_shac.py` |
 | NCP half of every comparison | waiting on GRIP 2.0 |
 
 The first milestone needed no policy and no training, which is why it came
@@ -76,19 +76,26 @@ first: place a box on a tilted half-plane, roll out five seconds of zero
 controls, and measure. The other half of that plot is the same figure with
 a solve in place of a spring.
 
-**What the policy does.** It learns the approach and drives the box to
-its target. At its best, around iteration 400, it ends a mean 1.68 cm
-downhill of target on 64 environments it was never selected on. By
-iteration 2000 that is 6.78 cm.
+**What the policy does.** It drives the box to its target and holds it
+there. After 2000 iterations it parks 1.8–2.1 cm downhill of uphill
+targets and 2.4–3.4 cm downhill of downhill ones, across two seeds, on 64
+environments it was never selected on. In both seeds the last checkpoint
+is the best one. Doubling the training to 4000 iterations does not move
+where it parks.
 
-**What is open.** Training finds a good policy and then loses it. The
-approach stays as good as it was; what degrades is holding the box once it
-arrives, which gets parked further downhill as training goes on. That is
-the optimization, not the contact model: SHAC's own objective is best at
-iteration 400 too. [`experiments/diagnose_shac.py`](experiments/diagnose_shac.py)
-measures it. The demo gets rebuilt once training holds.
+**How it got there.** SHAC first ran on a configuration of its own, which
+found a good policy by iteration 400 and then lost it: the box was parked
+further downhill every few hundred iterations. The cause was the critic,
+which stopped tracking the policy. Moving to the configuration of the
+reference SHAC implementation, NVlabs/DiffRL, fixed it.
+[`experiments/diagnose_shac.py`](experiments/diagnose_shac.py) measures
+both.
 
-![why training loses its best policy](figures/shac_diagnosis.png)
+**What is open.** Training is unstable early — the hold collapses and
+recovers a few times before settling — but it ends in the same place
+whichever seed runs. The demo gets rebuilt next.
+
+![SHAC on the reference configuration, every checkpoint rescored](figures/shac_diagnosis.png)
 
 ## Setup
 

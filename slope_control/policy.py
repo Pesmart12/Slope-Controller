@@ -11,7 +11,9 @@ Nothing here knows about ramps, rewards or contact; those are in `task.py`.
 import numpy as np
 import torch
 
-HIDDEN = (64, 64)
+# Hidden layer widths, from reference SHAC's Ant and Cheetah configs.
+ACTOR_HIDDEN = (128, 64, 32)
+CRITIC_HIDDEN = (64, 64)
 
 # Pre-squash noise. The action is limit*tanh(x + sigma*eps), so sigma is
 # in the units of the pre-tanh activation rather than newtons; 0.37 puts
@@ -20,13 +22,14 @@ HIDDEN = (64, 64)
 INITIAL_LOG_STD = -1.0
 
 
-def mlp(inputs, outputs, hidden=HIDDEN, output_gain=1.0):
-    """Build a small fully connected network: Linear, ELU, Linear, ELU, Linear.
+def mlp(inputs, outputs, hidden, orthogonal=False):
+    """Build a fully connected network: Linear, ELU and LayerNorm for each
+    hidden layer, then a final Linear. The same layout reference SHAC uses.
 
-    `output_gain` bounds the last layer's initial weights, and its bias
-    starts at zero, so an untrained network outputs close to nothing. That
-    keeps the first few updates from being dominated by the random
-    initialization.
+    `orthogonal=True` initializes every Linear layer with orthogonal weights
+    at gain sqrt(2) and zero biases, which is how the reference initializes
+    its critic. Otherwise torch's default initialization applies, as it does
+    for the reference actor.
 
     ELU rather than ReLU because ReLU has a kink, so its derivative jumps.
     The critic's gradient feeds into the actor's update here, meaning these
@@ -35,12 +38,16 @@ def mlp(inputs, outputs, hidden=HIDDEN, output_gain=1.0):
     """
     layers, width = [], inputs
     for size in hidden:
-        layers += [torch.nn.Linear(width, size), torch.nn.ELU()]
+        layers += [torch.nn.Linear(width, size), torch.nn.ELU(), torch.nn.LayerNorm(size)]
         width = size
-    final = torch.nn.Linear(width, outputs)
-    torch.nn.init.uniform_(final.weight, -output_gain, output_gain)
-    torch.nn.init.zeros_(final.bias)
-    return torch.nn.Sequential(*layers, final)
+    layers.append(torch.nn.Linear(width, outputs))
+
+    if orthogonal:
+        for layer in layers:
+            if isinstance(layer, torch.nn.Linear):
+                torch.nn.init.orthogonal_(layer.weight, gain=np.sqrt(2.0))
+                torch.nn.init.zeros_(layer.bias)
+    return torch.nn.Sequential(*layers)
 
 
 class Actor(torch.nn.Module):
@@ -63,11 +70,11 @@ class Actor(torch.nn.Module):
     gradient statistically the way PPO does.
     """
 
-    def __init__(self, observation_size, actuated, limit, hidden=HIDDEN):
+    def __init__(self, observation_size, actuated, limit, hidden=ACTOR_HIDDEN):
         super().__init__()
         self.actuated = actuated
         self.register_buffer("limit", torch.as_tensor(np.asarray(limit), dtype=torch.float64))
-        self.net = mlp(observation_size, 2 * actuated, hidden, output_gain=1e-3).double()
+        self.net = mlp(observation_size, 2 * actuated, hidden).double()
         self.log_std = torch.nn.Parameter(torch.full((actuated, 2), INITIAL_LOG_STD, dtype=torch.float64))
 
     def forward(self, observation, deterministic=False):
@@ -88,58 +95,19 @@ class Critic(torch.nn.Module):
     SHAC optimizes short windows -- 32 control steps, 0.32 s -- out of a
     4 s episode. This estimate stands in for everything after the window
     ends. Without it the policy would optimize a third of a second and
-    know nothing about the 3.7 s hold that follows, which is exactly where
-    penalty contact and a rigid solve differ.
+    know nothing about the 3.7 s hold that follows.
 
-    Predicts in NORMALIZED units and reports real reward. Undiscounted
-    returns on this task run from about -1200 to -70, which is a badly
-    scaled regression target for a network whose output starts near zero.
-    The running mean and standard deviation come from the returns actually
-    seen, and live in buffers, so they travel with the model and the
-    optimizer never touches them.
-
-        forward       real reward units, what `policy_gradient` reads
-        normalized    the raw output, what the critic's own loss uses
+    Predicts raw returns, in reward units, as the reference does: no running
+    normalization of the targets. The LayerNorm after each hidden layer is
+    what keeps the fit well conditioned.
     """
 
-    def __init__(self, observation_size, hidden=HIDDEN):
+    def __init__(self, observation_size, hidden=CRITIC_HIDDEN):
         super().__init__()
-        self.net = mlp(observation_size, 1, hidden, output_gain=1e-2).double()
-        self.register_buffer("mean", torch.zeros((), dtype=torch.float64))
-        self.register_buffer("std", torch.ones((), dtype=torch.float64))
-        self.register_buffer("count", torch.zeros((), dtype=torch.float64))
+        self.net = mlp(observation_size, 1, hidden, orthogonal=True).double()
 
     def forward(self, observation):
-        return self.normalized(observation) * self.std + self.mean
-
-    def normalized(self, observation):
         return self.net(observation).squeeze(-1)
-
-    def normalize(self, values):
-        """Put returns into the units `normalized` predicts in."""
-        return (values - self.mean) / self.std
-
-    def update_statistics(self, returns):
-        """Fold a batch of returns into the running mean and standard deviation.
-
-        Chan's parallel formula, so a whole window folds in at once and the
-        result does not depend on how the samples were grouped.
-        """
-        returns = returns.reshape(-1)
-        batch_count = float(returns.numel())
-        batch_mean, batch_var = returns.mean(), returns.var(unbiased=False)
-
-        total = self.count + batch_count
-        delta = batch_mean - self.mean
-
-        # Each part's variance, weighted, plus the spread between the two
-        # means. That last term is what a naive weighted average would miss.
-        combined = (self.std ** 2 * self.count + batch_var * batch_count
-                    + delta ** 2 * self.count * batch_count / total) / total
-
-        self.mean = self.mean + delta * batch_count / total
-        self.std = torch.sqrt(torch.clamp(combined, min=1e-8))
-        self.count = total
 
 
 def as_tensor(array, grad=False):

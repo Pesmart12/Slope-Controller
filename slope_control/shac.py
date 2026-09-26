@@ -34,10 +34,15 @@ reasons:
     early in the episode" and "-0.5 late in it" with no way to tell the
     two apart.
 
-The critic is fitted in NORMALIZED units. Returns are still a badly scaled
-target for a network starting near zero, so `policy.Critic` keeps a
-running mean and standard deviation, fits in those units, and converts
-back on the way out. Callers and the actor's gradient see real reward.
+The configuration is reference SHAC's, from NVlabs/DiffRL's Ant and
+Cheetah configs: TD(lambda) critic targets, 16 critic passes over 4
+minibatches, a target critic that moves 80% of the way each iteration,
+learning rates decaying linearly, Adam betas (0.7, 0.95), and gradient
+clipping on both networks. Two things differ on purpose. The observation
+is a fixed affine map rather than a running normalization, because
+`sweep.policy_gradient` relies on its Jacobian being constant. Episodes
+have a fixed length and no early termination, so the only episode end is
+the last window, which never bootstraps.
 
 The reward is MAXIMIZED, following the sign convention `task.py`
 documents. Adam minimizes, so the gradient is negated before every step.
@@ -59,18 +64,32 @@ N_ENVS = 64
 # longer horizon is ever wanted; it still contracts.
 GAMMA = 0.99
 
-ACTOR_LR = 1e-3
-CRITIC_LR = 1e-3
+# The weight TD(lambda) puts on longer returns. 0 fits each state to one
+# reward plus the next state's value; 1 fits it to the window's discounted
+# reward plus the value where the window ends.
+LAMBDA = 0.95
 
-# How far the target critic moves toward the critic each iteration. Small,
-# because its whole job is to be a slower-moving thing for the critic to
-# aim at. 0.005 is the usual starting point.
-POLYAK = 0.005
+# Both learning rates decay linearly from these to FINAL_LR over the run,
+# so a run's length is part of its schedule.
+ACTOR_LR = 2e-3
+CRITIC_LR = 2e-3
+FINAL_LR = 1e-5
 
-# Gradient passes over the window's data per iteration. More than one
-# because a single pass barely moves the critic; many would overfit a
-# window of 32 steps.
-CRITIC_EPOCHS = 4
+BETAS = (0.7, 0.95)
+
+# The fraction of its old weights the target critic keeps each iteration.
+# 0.2 means it moves 80% of the way to the critic, so the actor bootstraps
+# from a critic at most an iteration or so old.
+TARGET_ALPHA = 0.2
+
+# The critic is fitted in CRITIC_ITERATIONS passes over the window, each
+# pass split into CRITIC_MINIBATCHES minibatches taken in order.
+CRITIC_ITERATIONS = 16
+CRITIC_MINIBATCHES = 4
+
+# Ceiling on the gradient norm of both networks, applied after the actor's
+# gradient is averaged over steps and environments.
+MAX_GRADIENT_NORM = 1.0
 
 # Where along the episode the critic's slope is read. 3 s in, inside the
 # hold window, which is where the policy spends most of an episode and
@@ -116,52 +135,60 @@ def discounted_returns(rewards, gamma, terminal=0.0):
     return returns
 
 
-def window_returns(batch, window, target_critic, shaping, gamma=GAMMA, bootstrap=True):
-    """The return from each state in the window: discounted reward to the end
-    of the window, plus the target critic's estimate of everything after it.
+def next_values(batch, window, target_critic, bootstrap=True):
+    """The target critic's value of the state each step lands in.
 
-    Returns a (steps + 1, environments) tensor, lined up with
-    `window.states`.
+    Returns (steps, environments), numpy: row t is V(state t + 1).
 
-    `bootstrap=False` for the window that ends an episode. There is no
-    "after" there, so the correct terminal value is zero. Bootstrapping
-    anyway teaches the critic that reward keeps arriving past step 400,
-    which is a bias with nothing to correct it.
-
-    The bootstrap comes from the TARGET critic rather than the critic being
-    trained, so the regression target does not move every time the critic
-    does.
+    `bootstrap=False` for the window that ends an episode. Its last row is
+    then zero, because the episode really ends there. Every other row keeps
+    the critic's value.
     """
-    rewards = objective.reward(window.states, window.wrenches, batch.angles, batch.targets, shaping=shaping)
+    # Observe every state after the first and score them all in one pass:
+    #   (steps, environments, features) -> (steps * environments, features)
+    observed = observation.observe(window.states[1:], batch.angles, batch.targets)
+    with torch.no_grad():
+        flat = policy.as_tensor(observed.reshape(-1, observed.shape[-1]))
+        values = target_critic(flat).numpy().reshape(observed.shape[:2])
 
-    terminal = 0.0
-    if bootstrap:
-        # Observe the window's final state and score it with the target
-        # critic. Under no_grad because this is a regression target, and a
-        # target has to be a constant -- otherwise fitting the critic would
-        # push gradients into the target network, which is the one thing it
-        # exists to avoid.
-        with torch.no_grad():
-            observed = policy.as_tensor(observation.observe(window.states[-1], batch.angles, batch.targets))
-            terminal = target_critic(observed).numpy()
-
-    return policy.as_tensor(discounted_returns(rewards, gamma, terminal))
+    if not bootstrap:
+        values[-1] = 0.0
+    return values
 
 
-def fit_critic(critic, optimizer, observations, returns, epochs=CRITIC_EPOCHS):
-    """Regress the critic onto the window's returns. Returns the final loss.
+def lambda_returns(rewards, values, gamma, lam=LAMBDA):
+    """TD(lambda) returns, one per step. The critic's regression targets.
+
+    `rewards` and `values` are (steps, environments), with values[t] the
+    value of the state step t lands in. Returns (steps, environments).
+
+        G[t] = rewards[t] + gamma * ((1 - lam) * values[t] + lam * G[t + 1])
+
+    with G past the last step taken as the last value. At lam = 0 that is
+    one reward plus the next value at every step. At lam = 1 it is the
+    discounted reward to the window's end plus the value there, which is
+    what the actor's objective uses.
+    """
+    returns = np.zeros(np.shape(rewards))
+    following = values[-1]
+
+    # Walk backwards, blending each next state's value with the return
+    # already computed from it.
+    for t in range(len(rewards) - 1, -1, -1):
+        returns[t] = rewards[t] + gamma * ((1.0 - lam) * values[t] + lam * following)
+        following = returns[t]
+    return returns
+
+
+def fit_critic(critic, optimizer, observations, targets, iterations=CRITIC_ITERATIONS, minibatches=CRITIC_MINIBATCHES, max_norm=MAX_GRADIENT_NORM):
+    """Regress the critic onto the window's TD(lambda) targets. Returns the
+    mean loss of the last pass.
 
     `observations` is a list of (environments, features), one per control
-    step; `returns` is (steps + 1, environments). Both are flattened to one
-    row per (step, environment) pair and fitted as independent samples --
-    the critic reads an observation and nothing else, so the order the rows
-    were produced in carries no information.
-
-    Fitted in normalized units. `update_statistics` runs first so the
-    predictions and the targets are on the same scale.
+    step; `targets` is (steps, environments). Both are flattened to one row
+    per (step, environment) and split into `minibatches` consecutive runs of
+    rows, in order, as the reference does.
     """
-    critic.update_statistics(returns)
-
     # Concatenate the per-step observations into one array of rows, cutting
     # each off the actor's autograd graph on the way:
     #   steps x (environments, features) -> (steps * environments, features)
@@ -169,61 +196,55 @@ def fit_critic(critic, optimizer, observations, returns, epochs=CRITIC_EPOCHS):
     # and into the actor.
     features = torch.cat([observation.detach() for observation in observations], dim=0)
 
-    # Drop the last return, flatten to one value per row of `features`, and
-    # convert to the units the network predicts in:
-    #   (steps + 1, environments) -> (steps * environments,)
-    # The dropped row holds the bootstrap, which has no observation to pair
-    # with.
-    targets = critic.normalize(returns[:-1].reshape(-1)).detach()
+    # Flatten the targets in the same step-major order:
+    #   (steps, environments) -> (steps * environments,)
+    values = policy.as_tensor(targets).reshape(-1)
 
-    final_loss = float("nan")
-    for _ in range(epochs):
-        # Clear the gradients the previous epoch left on the parameters.
-        optimizer.zero_grad()
-
-        # Mean squared error between the network's raw output and the
-        # normalized returns. `normalized` rather than `forward`, which
-        # would un-normalize and put the two sides on different scales.
-        loss = torch.nn.functional.mse_loss(critic.normalized(features), targets)
-        loss.backward()
-        optimizer.step()
-        final_loss = loss.item()
-    return final_loss
+    size = -(-len(values) // minibatches)
+    for _ in range(iterations):
+        losses = []
+        for start in range(0, len(values), size):
+            # Clear the previous minibatch's gradients, then fit this one.
+            optimizer.zero_grad()
+            loss = torch.nn.functional.mse_loss(critic(features[start:start + size]), values[start:start + size])
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(critic.parameters(), max_norm)
+            optimizer.step()
+            losses.append(loss.item())
+    return float(np.mean(losses))
 
 
-def soft_update(target, source, tau=POLYAK):
-    """Move the target critic a fraction `tau` of the way toward the critic.
-
-    Weights AND buffers move on the same schedule, which is the point. The
-    buffers hold the normalization statistics, and `normalized` predicts in
-    whatever units the statistics defined when it was fitted. A lagged
-    network un-normalized with current statistics would mix vintages:
-    `old_net(obs) * new_std + new_mean` is not an estimate of anything.
-    Blending both keeps them matched, so the target stays a coherent older
-    version of the critic rather than a spliced one.
-    """
+def soft_update(target, source, alpha=TARGET_ALPHA):
+    """Move the target critic toward the critic, keeping a fraction `alpha`
+    of its old weights."""
     with torch.no_grad():
         for target_parameter, parameter in zip(target.parameters(), source.parameters()):
-            target_parameter.mul_(1.0 - tau).add_(parameter, alpha=tau)
-        for target_buffer, buffer in zip(target.buffers(), source.buffers()):
-            target_buffer.mul_(1.0 - tau).add_(buffer, alpha=tau)
+            target_parameter.mul_(alpha).add_(parameter, alpha=1.0 - alpha)
 
 
-def ascend(module, optimizer, n_envs):
-    """Take one Adam step UPHILL on the accumulated gradient.
+def ascend(module, optimizer, rows, max_norm=MAX_GRADIENT_NORM):
+    """Take one Adam step UPHILL on the accumulated gradient, norm-clipped.
 
     `policy_gradient` accumulates dJ/d(weights) where J is a reward to be
     maximized, and torch optimizers minimize, so every gradient is negated
     first. This is the sign convention `task.py` documents, and this is the
     one place it has to be acted on.
 
-    Also divides by the environment count, so the step size means the same
-    thing whether the batch holds 8 environments or 64.
+    Also divides by `rows`, the window's steps times its environments, so
+    the objective is a mean per step and environment as in the reference.
+    The clipping ceiling is sized for that mean.
     """
     for parameter in module.parameters():
         if parameter.grad is not None:
-            parameter.grad.neg_().div_(n_envs)
+            parameter.grad.neg_().div_(rows)
+    torch.nn.utils.clip_grad_norm_(module.parameters(), max_norm)
     optimizer.step()
+
+
+def learning_rate(start, iteration, iterations):
+    """The linearly decayed learning rate at `iteration`, counted from 1,
+    of a run `iterations` long."""
+    return start + (FINAL_LR - start) * (iteration - 1) / iterations
 
 
 def rolled_episode(actor, batch=None, n_envs=EVAL_ENVS, seed=EVAL_SEED):
@@ -267,13 +288,11 @@ def calibration(critic, episode, gamma=GAMMA, shaping=True):
     and `initial` / `initial_true`, the two numbers for the episode's first
     state.
 
-    The critic's own training loss cannot answer this. With a 32-step window
-    at gamma = 0.99 the regression target is 32 real rewards plus
-    gamma^32 = 0.725 times the target critic's output, so roughly 72% of what
-    the critic is fitted to is a lagged copy of itself. A loss near 1e-4 says
-    those two agree, not that either is right. This runs whole episodes to
-    termination instead, where the discounted return is a fact and needs no
-    bootstrap.
+    The critic's own training loss cannot answer this. Its targets are built
+    from the target critic's values, so a small loss says the critic agrees
+    with its own recent estimates, not that either is right. This runs
+    whole episodes to termination instead, where the discounted return is a
+    fact and needs no bootstrap.
 
     Scored on SHAPED reward by default, because that is what the critic was
     trained on. Passing shaping=False measures it against a return it was
@@ -465,8 +484,8 @@ def train(iterations, n_envs=N_ENVS, window=WINDOW, gamma=GAMMA, seed=0, shaping
     critic = policy.Critic(observation_size)
     target_critic = copy.deepcopy(critic)
 
-    actor_optimizer = torch.optim.Adam(actor.parameters(), lr=ACTOR_LR)
-    critic_optimizer = torch.optim.Adam(critic.parameters(), lr=CRITIC_LR)
+    actor_optimizer = torch.optim.Adam(actor.parameters(), lr=ACTOR_LR, betas=BETAS)
+    critic_optimizer = torch.optim.Adam(critic.parameters(), lr=CRITIC_LR, betas=BETAS)
 
     first = 1
     if initial is not None:
@@ -478,8 +497,18 @@ def train(iterations, n_envs=N_ENVS, window=WINDOW, gamma=GAMMA, seed=0, shaping
             critic_optimizer.load_state_dict(initial["critic_optimizer"])
         first = initial["iteration"] + 1
 
+    # The schedule spans the whole run, restarted part included, so a
+    # restart picks the decay up where the original run left it.
+    last = first + iterations - 1
+
     history, steps_done = [], 0
-    for iteration in range(first, first + iterations):
+    for iteration in range(first, last + 1):
+        # Set both learning rates for this iteration.
+        for group in actor_optimizer.param_groups:
+            group["lr"] = learning_rate(ACTOR_LR, iteration, last)
+        for group in critic_optimizer.param_groups:
+            group["lr"] = learning_rate(CRITIC_LR, iteration, last)
+
         # Shorten rather than overrun, so an episode ends exactly at
         # EPISODE_STEPS. 400 is not a multiple of 32.
         steps = min(window, task.EPISODE_STEPS - steps_done)
@@ -496,18 +525,20 @@ def train(iterations, n_envs=N_ENVS, window=WINDOW, gamma=GAMMA, seed=0, shaping
         sweep.policy_gradient(batch, rolled, actor, critic=None if ends_episode else target_critic, shaping=shaping, gamma=gamma)
         gradient_norm = policy.gradient_norm(actor)
 
-        ascend(actor, actor_optimizer, n_envs)
+        ascend(actor, actor_optimizer, steps * n_envs)
 
-        returns = window_returns(batch, rolled, target_critic, shaping, gamma=gamma, bootstrap=not ends_episode)
-        critic_loss = fit_critic(critic, critic_optimizer, rolled.observations, returns)
+        # Fit the critic to TD(lambda) targets built from the same rollout,
+        # bootstrapped from the target critic, then move the target.
+        rewards = objective.reward(rolled.states, rolled.wrenches, batch.angles, batch.targets, shaping=shaping)
+        values = next_values(batch, rolled, target_critic, bootstrap=not ends_episode)
+        critic_loss = fit_critic(critic, critic_optimizer, rolled.observations, lambda_returns(rewards, values, gamma))
         soft_update(target_critic, critic)
 
         if trace is not None:
-            # Report the window's objective, averaged over environments.
-            # returns[0] was computed on the same rollout the actor's
-            # gradient came from, and before the soft update, so it is the
-            # objective the actor step just climbed.
-            trace(iteration, steps_done // window, float(returns[0].mean()), gradient_norm)
+            # Report the window's objective, averaged over environments: the
+            # lam = 1 return from the window's first state, which is what
+            # the actor step just climbed.
+            trace(iteration, steps_done // window, float(lambda_returns(rewards, values, gamma, lam=1.0)[0].mean()), gradient_norm)
 
         steps_done += steps
         if steps_done >= task.EPISODE_STEPS:
