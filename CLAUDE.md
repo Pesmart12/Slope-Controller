@@ -77,7 +77,9 @@ the reward is solvable and its gradients navigable, and 800 iterations
 answers that. **Its numbers are not converged**, and the check's own
 "ended at its best: yes" line means *still improving* — the opposite of
 the reassurance it reads as. So do not read −82.37 as the optimum, and do
-not gate anything on beating it. Running it longer keeps improving the
+not gate anything on beating it. Its recorded numbers were measured at the
+2 cm position tolerance, before it moved to 1 cm; `3094234` reproduces
+them. Running it longer keeps improving the
 reward and walks the parked position further downhill of the target; that
 was measured on the box-only variant before it was removed, so there is no
 table of it here any more.
@@ -85,8 +87,9 @@ table of it here any more.
 **Trajopt parks downhill of the target**, at +0.76 / −0.09 / −0.32 cm
 across the sampled slopes. Closing the last centimetres needs force above
 `break_free_force`, which costs more per step than the position error it
-saves. SHAC on the reference configuration also parks about 2 cm
-downhill and holds there. SHAC on the old configuration drifting further
+saves. SHAC on the reference configuration also parks downhill and holds
+there — about 1 cm at the current 1 cm tolerance, 2–3.5 cm at the old
+2 cm one. SHAC on the old configuration drifting further
 downhill the longer it trained was a different thing — the optimization,
 not the reward. The standing reminder has both. Do not read them as one
 finding.
@@ -191,9 +194,9 @@ python experiments/drift.py
   departs at 19°, 48% low at 26°
 
 python experiments/diagnose_shac.py  [--seed 1]
-  reference SHAC, 2000 iterations: in both seeds the last checkpoint is the best
-  seed 0: reported -137.12, hold -0.97 over 1-4 s, parked -1.76 / -2.42 cm (uphill / downhill targets)
-  seed 1: reported -137.51, hold -1.43 over 1-4 s, parked -2.08 / -3.44 cm
+  reference SHAC, 2000 iterations, 1 cm position tolerance
+  seed 0: reported -135.04, hold -0.46 over 1-4 s, parked -1.19 / -1.24 cm (uphill / downhill targets)
+  seed 1: reported -134.90, hold -0.46 over 1-4 s, parked -0.93 / -1.10 cm
   on 64 environments nothing was selected on
 ```
 
@@ -230,14 +233,14 @@ so a session knows where it is.
 5. **Done.** SHAC on penalty — `slope_control/shac.py`, built on the
    per-step adjoint sweep in `sweep.policy_gradient`, run by
    `experiments/train_shac.py`, configured as NVlabs/DiffRL's Ant and
-   Cheetah runs, **2000 iterations**. It learns the approach and holds,
-   repeatably across two seeds, parking about 2 cm downhill of uphill
-   targets and 2.5–3.5 cm of downhill ones. The old configuration lost its
-   best policy after iteration 400; the critic was the cause, and moving
-   to the reference configuration fixed it. Doubling to 4000 iterations
-   bought about 0.35 reward and no change in where the box parks. The
-   demo was removed because its framing assumed creep was the limit; it
-   gets rebuilt next.
+   Cheetah runs, **2000 iterations**, **1 cm position tolerance**. It
+   learns the approach and holds, repeatably across two seeds, parking
+   about 1 cm downhill of its target. The old configuration lost its best
+   policy after iteration 400; the critic was the cause, and moving to the
+   reference configuration fixed it. Doubling to 4000 iterations did not
+   move where the box parks; halving the tolerance from 2 cm roughly
+   halved the offset. The demo was removed because its framing assumed
+   creep was the limit; it gets rebuilt next.
 6. Wait for GRIP 2.0, rerun the column, fill in the cross-eval table.
 
 Steps 2–5 need nothing from GRIP that does not already exist. **Do not build
@@ -513,12 +516,43 @@ impossible objective is still correct. When something is checked and still
 doesn't work, suspect the task before the machinery.
 
 **Step 5, SHAC, is done: it trains and holds on the reference
-configuration.** The first section below is what those runs measure. The sections after it are
-the old configuration's history: how it lost its best policy, what drove
-that, and why the configuration changed.
+configuration.** The first section below is the current setting, a 1 cm
+position tolerance. The one after it is the same configuration at the
+old 2 cm tolerance. The sections after those are the old configuration's
+history: how it lost its best policy, what drove that, and why the
+configuration changed.
 
-### THE REFERENCE CONFIGURATION HOLDS
+### THE CURRENT SETTING: 1 cm tolerance
 
+`objective.POSITION_TOLERANCE` went from 2 cm to 1 cm, which makes
+position four times dearer relative to holding force. Two seeds, 2000
+iterations, the same 64 diagnosis environments. The control term is
+shown at the 2 cm weight so the rows compare; reported and hold rewards
+do not compare across tolerances, since the control weight changed:
+
+```
+                  parked, up / down targets   holding force   position term
+  2 cm, seed 0       -1.76 / -2.42 cm              2.35          -134.77
+  2 cm, seed 1       -2.08 / -3.44 cm              1.98          -135.54
+  1 cm, seed 0       -1.19 / -1.24 cm              3.38          -134.19
+  1 cm, seed 1       -0.93 / -1.10 cm              3.53          -134.01
+```
+
+**Halving the tolerance roughly halved the offset**, at about 50% more
+holding force. The gap between uphill and downhill targets mostly
+closed, from 0.7–1.4 cm to under 0.2 cm. That is measured evidence that
+the offset is set by the reward, not by training — two seeds and one
+change, not a proof. The training curve has the same shape as at 2 cm:
+the error wanders early and settles from about iteration 1700. Seed 0's
+last checkpoint is its best; seed 1's best is iteration 1700,
+indistinguishable from its last.
+
+`tests/check_closed_loop.py` pins its own fixture at 2 cm, so its 119%
+does not move with the task's tolerance.
+
+### THE REFERENCE CONFIGURATION HOLDS — at the old 2 cm tolerance
+
+Measured at `3094234`, before the tolerance moved to 1 cm.
 `experiments/diagnose_shac.py` on the reference configuration, seed 0,
 2000 iterations, every checkpoint scored on the same 64 environments as
 the old run:
@@ -554,7 +588,7 @@ not visible.
 throughout, so this is a steady offset, not drift. The control weight is
 set so that holding costs as much as sitting 2 cm off
 (`POSITION_TOLERANCE`), so 2 cm is roughly where the reward balances
-the two. Inferred, not measured.
+the two. The 1 cm runs above back this up.
 
 **A second seed lands in the same place.** Seed 1, same setup:
 

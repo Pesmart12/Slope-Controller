@@ -302,7 +302,8 @@ enough to reach any target and brake.
 ### What the solved trajectory looks like
 
 `tests/check_trajopt.py` optimizes the raw 400-step control sequence with
-Adam, from a **zero** initialization and a 5 cm approach gap:
+Adam, from a **zero** initialization and a 5 cm approach gap. Measured at
+the 2 cm tolerance, reproducible at `3094234`:
 
 ```
    final error, 15 / 20 / 22 deg        unshaped reward
@@ -335,9 +336,7 @@ and a number there would be invented rather than derived.
 
 **That endgame is penalty contact only.** Below the friction bound a rigid
 body does not move at all, so under an NCP solve the creep regime does not
-exist and the last millimetre has to be closed some other way. It turned up
-here before any policy was trained, and the trained policy later ran into
-the same wall.
+exist and the last millimetre has to be closed some other way.
 
 **A correction, recorded rather than quietly fixed.** An earlier run
 described the optimizer as using creep as a fine-positioning mechanism,
@@ -356,6 +355,12 @@ the target.
 ```
 r_t = −w_pos·(ξ_box − ξ*)²  −  w_ctrl·‖u_t‖²
 ```
+
+`w_pos = 1` and `w_ctrl` is derived from a position tolerance, currently
+**1 cm**: the weight at which holding the box costs as much per step as
+sitting 1 cm off target. `objective.control_weight` does the arithmetic.
+At 2 cm, the earlier setting, the trained policy parked 2–3.5 cm downhill
+of its target; at 1 cm it parks about 1 cm downhill.
 
 Both terms matter. The control cost is **not** boilerplate: without it,
 "keep pressing forever" costs nothing and is a perfectly good strategy under
@@ -582,11 +587,11 @@ training configuration.**
    Displacement against time: penalty drifts 4.7 cm in 5 s, NCP sits at
    zero, and Coulomb's law says zero. **Done** — `experiments/drift.py`.
 2. **SHAC.** The penalty half is **done** — `experiments/train_shac.py`
-   trains it and `experiments/demo.py` renders it. The NCP half waits on
-   2.0.
+   trains it and `experiments/diagnose_shac.py` measures it. The NCP half
+   waits on 2.0.
 3. **The cross-eval table.** Waits on 2.0; there is nothing to cross yet.
-4. **A demo.** **Done for penalty** — two GIFs, the creep figure, and an
-   interactive page that plays the hold window back in slow motion.
+4. **A demo.** To be rebuilt around the current policy. The first one was
+   removed because its framing assumed penalty creep limited training.
 
 (1) is a measurement against a closed form and stands on its own whatever
 the rest do. The rest are the build, and they are allowed to be modest.

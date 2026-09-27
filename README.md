@@ -77,11 +77,14 @@ controls, and measure. The other half of that plot is the same figure with
 a solve in place of a spring.
 
 **What the policy does.** It drives the box to its target and holds it
-there. After 2000 iterations it parks 1.8–2.1 cm downhill of uphill
-targets and 2.4–3.4 cm downhill of downhill ones, across two seeds, on 64
-environments it was never selected on. In both seeds the last checkpoint
-is the best one. Doubling the training to 4000 iterations does not move
-where it parks.
+there. After 2000 iterations it parks about 1 cm downhill of its target —
+0.9 to 1.2 cm across two seeds and both target directions — on 64
+environments it was never selected on.
+
+**What sets that 1 cm.** The reward trades position against holding
+force, and a tolerance says where the two balance. At a 2 cm tolerance
+the box parked 2–3.5 cm off; at 1 cm it parks about 1 cm off, using about
+50% more force. Doubling the training to 4000 iterations moved neither.
 
 **How it got there.** SHAC first ran on a configuration of its own, which
 found a good policy by iteration 400 and then lost it: the box was parked
@@ -95,7 +98,7 @@ both.
 recovers a few times before settling — but it ends in the same place
 whichever seed runs. The demo gets rebuilt next.
 
-![SHAC on the reference configuration, every checkpoint rescored](figures/shac_diagnosis.png)
+![SHAC on the reference configuration at a 1 cm tolerance, every checkpoint rescored](figures/shac_diagnosis.png)
 
 ## Setup
 

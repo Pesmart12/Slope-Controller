@@ -48,7 +48,11 @@ TARGET_OFFSET = 0.3
 BODIES = [ramp.BOX]
 SCALE = 12.0
 LIMIT = 12.0
-WEIGHTS = dict(position=1.0, control=objective.control_weight(SCALE, [ramp.hold_force(ramp.DEFAULT_RAMP_ANGLE)]))
+
+# Pinned at the 2 cm tolerance the recorded percentages were measured
+# against. The task's own tolerance can change without moving this fixture.
+TOLERANCE = 0.02
+WEIGHTS = dict(position=1.0, control=objective.control_weight(SCALE, [ramp.hold_force(ramp.DEFAULT_RAMP_ANGLE)], tolerance=TOLERANCE))
 
 
 def fixture(angles, offset=TARGET_OFFSET):

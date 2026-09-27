@@ -47,10 +47,11 @@ import numpy as np
 from . import ramp, task
 
 # How far off target the policy may sit before it is worth spending the
-# steady holding force to close the gap. Rather under the 4.75 cm that
-# drift.py measures for doing nothing at all, so the controller is being
-# asked for something a released box does not already achieve.
-POSITION_TOLERANCE = 0.02
+# steady holding force to close the gap. Well under the 4.75 cm that
+# drift.py measures for doing nothing at all. At 2 cm, SHAC parked the box
+# 2 to 3.5 cm downhill of its target; 1 cm makes position four times
+# dearer relative to force.
+POSITION_TOLERANCE = 0.01
 
 
 def control_weight(scale, hold_forces, tolerance=POSITION_TOLERANCE):
