@@ -9,96 +9,74 @@ repository that poses tasks and solves them.
 
 ## What it is for
 
-Build an RL control stack on GRIP 1.0's penalty contact and measure what
-it does. Then rebuild it on 2.0's NCP solve and measure again. Put the two
-sets of numbers side by side and describe what changed.
+Build a reinforcement-learning controller on GRIP 1.0's penalty contact
+and measure what it does. Then rebuild it on 2.0's NCP solve, measure
+again, and put the two sets of numbers side by side.
 
-The task is a box pushed up a ramp and held there, on a slope below the
-friction angle — where rigid physics says a released box never moves.
+The task: two pushers move an unactuated box up or down a ramp to a
+target and hold it there, on a slope below the friction angle. The full
+definition — scene numbers, reward, episode structure — is in
+[`docs/ramp_manipulation_task.md`](docs/ramp_manipulation_task.md).
+
+## The physics: penalty contact creeps
 
 GRIP 1.0 models contact as a penalty force — a stiff spring-damper with a
-Coulomb friction cone. That formulation keeps the force constraint exact
-and softens the kinematic one, so a box resting on a slope must be
-*slipping* in order to generate the friction that holds it up. It creeps,
-forever, at `mg·sinα / (2·b_slip)` — **4.7 cm in five seconds** on a 20°
-ramp, about a sixth of a box width, on a slope where rigid physics says
-it must not move at all.
-
-GRIP 2.0 will replace that with a velocity-level NCP solve, where the
-same box sticks exactly.
+Coulomb friction cone. That keeps the force constraint exact and softens
+the kinematic one, so a box resting on a slope must be *slipping* to
+generate the friction that holds it up. It creeps, forever, at
+`mg·sin α / (2·b_slip)` — **4.75 cm in five seconds** on a 20° ramp, where
+rigid physics says it must not move at all. GRIP 2.0 replaces this with a
+velocity-level NCP solve, where the same box sticks.
 
 ![measured drift on slopes below the friction angle](figures/drift.png)
 
-Measured, in [`experiments/drift.py`](experiments/drift.py). The right
-panel is a second finding that fell out of checking the first: the closed
-form is exact to five figures below about 19°, and a lower bound above it,
-because friction's moment arm tilts the box enough to redistribute normal
-force between the corners until the lightly loaded one saturates on its
-cone.
+Measured in [`experiments/drift.py`](experiments/drift.py), with no
+policy involved. The closed form is exact to five figures below about 19°
+and a lower bound above it: friction's moment arm tilts the box enough to
+shift normal force between its corners until the lighter one saturates
+its cone.
 
-That is the physics half, and it needed no policy to produce. The other
-half is the build: a controller trained against this contact. See Status.
+## The controller: SHAC
 
-Full task definition, scene numbers, reward and what gets measured:
-[`docs/ramp_manipulation_task.md`](docs/ramp_manipulation_task.md).
+SHAC trains the policy with GRIP's analytic gradients, differentiating
+short windows of simulation through the contact via `adjoint_batch`. It
+runs the reference implementation's configuration, NVlabs/DiffRL's, with
+two recorded exceptions. PPO is skipped: it never uses the simulator's
+gradients, which are the thing GRIP provides, and the sample budget at
+`dt = 5e-4` is brutal.
 
-## Approach
+**What the policy does.** It drives the box to its target and holds it
+there, about 1 cm downhill of the target — 0.9 to 1.2 cm across two seeds
+and both target directions — on 64 environments it was never selected
+on. Training takes 2000 iterations, about 23 minutes on a CPU.
 
-| | |
-|---|---|
-| Task | push a box up a ramp to a target and hold it |
-| Check | Trajectory optimization — Adam on the raw control sequence. Confirms the task is solvable and the gradients navigable, with no policy in the way. Not a baseline: it produces no number that means anything without an NCP column to set it against. |
-| First-order | SHAC, consuming GRIP's analytic gradients through `adjoint_batch` |
-| Scoring | NCP, whichever simulator a policy trained in — the more accurate of the two. |
+**What sets that 1 cm.** The reward trades position against holding
+force, and a tolerance says where the two balance. At a 2 cm tolerance
+the box parked 2–3.5 cm off; at 1 cm it parks about 1 cm off, using about
+50% more force. Doubling the training to 4000 iterations did not move it.
 
-PPO is skipped: it never touches the simulator's gradients, which are the
-thing GRIP uniquely provides, and the sample budget at `dt = 5e-4` is
-brutal.
+**How it got there.** SHAC first ran on a configuration of its own, which
+found a good policy by iteration 400 and then lost it. The cause was the
+critic, which stopped tracking the policy. Moving to the reference
+configuration fixed it.
+[`experiments/diagnose_shac.py`](experiments/diagnose_shac.py) measures
+both.
 
-The drift measurement stands on its own — a box on a slope below the
-friction angle must not move, and that is Coulomb's law rather than a
-modelling opinion. Everything after it is a build, and the comparison at
-the end reports whatever the numbers turn out to say.
+![SHAC at a 1 cm tolerance, every checkpoint rescored](figures/shac_diagnosis.png)
 
 ## Status
 
 | | |
 |---|---|
-| Drift measurement | **done** — `experiments/drift.py`, the plot above |
-| Ramp task, reward and gradient path | **done** — `slope_control/task.py`, `objective.py`, `observation.py`, `batches.py`, `tests/check_task.py` |
-| Trajectory optimization | **done** — `tests/check_trajopt.py`, within a centimetre at every sampled slope |
-| Two-pusher manipulation task | **done** — the box is unactuated, so every newton crossing it crosses a contact |
-| SHAC | **done** — trains and holds across two seeds, reference SHAC configuration, `experiments/train_shac.py`, 1353 s for 2000 iterations at 64 environments; `experiments/diagnose_shac.py` |
-| NCP half of every comparison | waiting on GRIP 2.0 |
+| Drift measurement | **done** — `experiments/drift.py` |
+| Task, reward and gradient path | **done** — `tests/check_task.py`, `tests/check_policy_gradient.py` |
+| Trajectory optimization check | **done** — `tests/check_trajopt.py`: the reward is solvable and its gradients navigable |
+| SHAC | **done** — `experiments/train_shac.py`, `experiments/diagnose_shac.py` |
+| Demo | **next** — the trained policy, rendered |
+| NCP half | waits on GRIP 2.0 |
 
-The first milestone needed no policy and no training, which is why it came
-first: place a box on a tilted half-plane, roll out five seconds of zero
-controls, and measure. The other half of that plot is the same figure with
-a solve in place of a spring.
-
-**What the policy does.** It drives the box to its target and holds it
-there. After 2000 iterations it parks about 1 cm downhill of its target —
-0.9 to 1.2 cm across two seeds and both target directions — on 64
-environments it was never selected on.
-
-**What sets that 1 cm.** The reward trades position against holding
-force, and a tolerance says where the two balance. At a 2 cm tolerance
-the box parked 2–3.5 cm off; at 1 cm it parks about 1 cm off, using about
-50% more force. Doubling the training to 4000 iterations moved neither.
-
-**How it got there.** SHAC first ran on a configuration of its own, which
-found a good policy by iteration 400 and then lost it: the box was parked
-further downhill every few hundred iterations. The cause was the critic,
-which stopped tracking the policy. Moving to the configuration of the
-reference SHAC implementation, NVlabs/DiffRL, fixed it.
-[`experiments/diagnose_shac.py`](experiments/diagnose_shac.py) measures
-both.
-
-**What is open.** Training is unstable early — the hold collapses and
-recovers a few times before settling — but it ends in the same place
-whichever seed runs. The demo gets rebuilt next.
-
-![SHAC on the reference configuration at a 1 cm tolerance, every checkpoint rescored](figures/shac_diagnosis.png)
+Training is unstable early — the hold collapses and recovers a few times
+before settling — but it ends in the same place whichever seed runs.
 
 ## Setup
 
@@ -181,13 +159,13 @@ Verify against numbers that are already recorded, rather than against
 "it imported":
 
 ```
-python tests/check_task.py        # 11/11
-python experiments/drift.py       # 4.75 cm at 20 degrees
-python tests/check_trajopt.py     # reward -82.37, within a centimetre
+python tests/check_task.py              # 11/11
+python tests/check_critic_targets.py    # 3/3
+python experiments/drift.py             # 4.75 cm at 20 degrees
 ```
 
-If those three disagree with what is written here, the environment is
-wrong and nothing measured in it is worth reading.
+If those disagree with what is written here, the environment is wrong
+and nothing measured in it is worth reading.
 
 ## Layout
 

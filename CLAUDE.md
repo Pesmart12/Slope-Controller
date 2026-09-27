@@ -87,12 +87,8 @@ table of it here any more.
 **Trajopt parks downhill of the target**, at +0.76 / −0.09 / −0.32 cm
 across the sampled slopes. Closing the last centimetres needs force above
 `break_free_force`, which costs more per step than the position error it
-saves. SHAC on the reference configuration also parks downhill and holds
-there — about 1 cm at the current 1 cm tolerance, 2–3.5 cm at the old
-2 cm one. SHAC on the old configuration drifting further
-downhill the longer it trained was a different thing — the optimization,
-not the reward. The standing reminder has both. Do not read them as one
-finding.
+saves. SHAC parks downhill too, and by the same trade: about 1 cm at the
+current 1 cm tolerance. The standing reminder has the numbers.
 
 The eventual comparison is also loose by design — these numbers will sit
 next to other projects' numbers someday, informally. That is not a reason to
@@ -135,7 +131,7 @@ The repository is small and should stay legible.
 | `slope_control/render.py` | draws a scene and animates an episode to a GIF; pure presentation, computes nothing. Unused until the demo is rebuilt |
 | `experiments/drift.py` | artifact 1 — the drift measurement and its figure |
 | `experiments/train_shac.py` | the experiment that trains — one run, file logging, the latest and the best checkpoint |
-| `experiments/diagnose_shac.py` | why training loses its best policy — every checkpoint rescored against the reported reward, SHAC's own objective, and fixed critics |
+| `experiments/diagnose_shac.py` | trains, then rescores every checkpoint on fresh environments — reported reward by phase, SHAC's own objective, fixed critics, parking by target direction |
 | `figures/` | committed output, so results are visible without running anything |
 | `runs/` | training logs, evaluation histories and checkpoints, one directory per run |
 | `tests/check_task.py` | the checks the task rests on, chiefly the finite-difference of `dJ_dU` through GRIP |
@@ -515,20 +511,49 @@ check did not catch that and could not have — a correct gradient on an
 impossible objective is still correct. When something is checked and still
 doesn't work, suspect the task before the machinery.
 
-**Step 5, SHAC, is done: it trains and holds on the reference
-configuration.** The first section below is the current setting, a 1 cm
-position tolerance. The one after it is the same configuration at the
-old 2 cm tolerance. The sections after those are the old configuration's
-history: how it lost its best policy, what drove that, and why the
-configuration changed.
+**Step 5, SHAC, is done.** It learns the approach and holds the box about
+1 cm downhill of its target, repeatably across two seeds.
 
-### THE CURRENT SETTING: 1 cm tolerance
+### SHAC as it stands
 
-`objective.POSITION_TOLERANCE` went from 2 cm to 1 cm, which makes
-position four times dearer relative to holding force. Two seeds, 2000
-iterations, the same 64 diagnosis environments. The control term is
-shown at the 2 cm weight so the rows compare; reported and hold rewards
-do not compare across tolerances, since the control weight changed:
+**Configuration: reference SHAC**, from NVlabs/DiffRL's Ant and Cheetah
+configs, adopted together because the settings are co-adapted — alpha
+0.2 only works because the critic gets 64 gradient steps per iteration on
+smooth TD(λ) targets:
+
+```
+   target critic alpha      0.2
+   critic targets           TD(lambda = 0.95), target critic at every step
+   critic fitting           16 iterations x 4 minibatches, in order
+   actor and critic lr      2e-3, linear decay to 1e-5 over the run
+   Adam betas               (0.7, 0.95)
+   gradient clipping        norm 1.0, actor and critic
+   return normalization     off
+   networks                 actor 128-64-32, critic 64-64, LayerNorm after
+                            every hidden ELU, critic orthogonal init at sqrt(2)
+   gamma, window, envs      0.99, 32, 64
+   iterations               2000
+```
+
+Kept in float64, since GRIP works in double. **Two deliberate
+exceptions:**
+
+- **Observation normalization stays fixed.** The reference uses a running
+  mean and standard deviation. Ours is a hand-designed affine map whose
+  Jacobian `sweep.policy_gradient` relies on being constant — `Batch`
+  carries it precomputed and the gradient checks validate it.
+- **Episodes are fixed-length and the last window bootstraps zero.** The
+  reference bootstraps at a time-limit cutoff because its tasks are
+  open-ended locomotion; ours is a genuinely finite 4-second task.
+
+**The learning-rate schedule ties a run to its length.** A longer run is
+a different schedule, not more of the same one. 4000 iterations bought
+about 0.35 reward, did not move where the box parks, and was less stable
+in the middle, so 2000 is the setting.
+
+**Results**, `experiments/diagnose_shac.py`, 64 environments nothing was
+selected on. The control term is shown at the 2 cm weight so the rows
+compare; reported rewards do not compare across tolerances:
 
 ```
                   parked, up / down targets   holding force   position term
@@ -538,322 +563,53 @@ do not compare across tolerances, since the control weight changed:
   1 cm, seed 1       -0.93 / -1.10 cm              3.53          -134.01
 ```
 
-**Halving the tolerance roughly halved the offset**, at about 50% more
-holding force. The gap between uphill and downhill targets mostly
-closed, from 0.7–1.4 cm to under 0.2 cm. That is measured evidence that
-the offset is set by the reward, not by training — two seeds and one
-change, not a proof. The training curve has the same shape as at 2 cm:
-the error wanders early and settles from about iteration 1700. Seed 0's
-last checkpoint is its best; seed 1's best is iteration 1700,
-indistinguishable from its last.
-
-`tests/check_closed_loop.py` pins its own fixture at 2 cm, so its 119%
-does not move with the task's tolerance.
-
-### THE REFERENCE CONFIGURATION HOLDS — at the old 2 cm tolerance
-
-Measured at `3094234`, before the tolerance moved to 1 cm.
-`experiments/diagnose_shac.py` on the reference configuration, seed 0,
-2000 iterations, every checkpoint scored on the same 64 environments as
-the old run:
-
-```
-                              old config    old config    reference
-                              best (400)    end (2000)    end (2000)
-  reported reward               -142.19       -158.02       -137.12
-    approach, 0-1 s             -139.20       -141.74       -136.15
-    hold, 1-4 s                   -2.99        -16.28         -0.97
-    control term                  -3.79         -3.67         -2.35
-  signed final error, up/down  -2.5/-0.9 cm  -7.2/-6.4 cm  -1.8/-2.4 cm
-```
-
-**No late decline.** From iteration 1300 on, every evaluation is as good
-as the one before or better, and iteration 2000 is the best checkpoint of
-the run. Its hold is a third of the old configuration's best, at less
-force.
-
-**The critic tracks.** Scored against any fixed critic, the actors'
-objective now moves with the true one: at iteration 2000 the bootstrapped
-objective is −10.29 against a true −10.29. The target critic's slope has
-the right sign in nearly every environment, but is too steep, 41 against
-a true 9 at iteration 2000.
-
-**It is unstable early.** The hold collapses at iterations 300, 600 and
-900 — −36, −21, −14 — and recovers within 100 iterations each time. The
-collapses shrink as the learning rate decays and none appear after
-about 1300. Evaluations are 100 iterations apart, so their true shape is
-not visible.
-
-**It parks about 2 cm downhill, and stays.** The hold reward is small
-throughout, so this is a steady offset, not drift. The control weight is
-set so that holding costs as much as sitting 2 cm off
-(`POSITION_TOLERANCE`), so 2 cm is roughly where the reward balances
-the two. The 1 cm runs above back this up.
-
-**A second seed lands in the same place.** Seed 1, same setup:
-
-```
-                              seed 0        seed 1
-  reported reward             -137.12       -137.51
-  hold, 1-4 s                   -0.97         -1.43
-  parked, up/down targets    -1.8/-2.4 cm  -2.1/-3.4 cm
-  last checkpoint is best       yes           yes
-```
-
-Seed 1 had no big collapses — its worst was −17 at iteration 300 — but
-it learned more slowly, and the two runs meet around iteration 1000. The
-early instability varies with the seed; the endpoint does not. Both seeds
-park further from downhill targets than uphill ones; why is not known.
-
-**More iterations do not close the offset.** 4000 iterations on both
-seeds, a different schedule since the learning rate decays over the
-whole run:
-
-```
-                              2000 iterations      4000 iterations
-  seed 0 reported / hold      -137.12 / -0.97      -136.79 / -0.65
-  seed 0 parked, up/down      -1.76 / -2.42 cm     -2.05 / -2.38 cm
-  seed 1 reported / hold      -137.51 / -1.43      -137.10 / -1.07
-  seed 1 parked, up/down      -2.08 / -3.44 cm     -1.83 / -3.11 cm
-```
-
-About 0.35 better reward, and the box parks where it did. The longer
-high-learning-rate phase is also less stable: seed 1 collapses and
-recovers repeatedly until about iteration 3000. **2000 iterations is the
-setting.** The 4000-iteration runs are reproducible with
-`diagnose_shac.py --iterations 4000 --seed N`.
-
-Earlier, longer runs still stand as measurements. Two pushers, 8000
-iterations, 64 environments, seed 0, same budget in all three:
-
-```
-                                        best      at it.   end of run
-undiscounted, buffers copied            2.48 cm     500      8.95 cm
-undiscounted, buffers blended           5.29 cm     500     11.26 cm
-gamma = 0.99, no terminal bootstrap     2.37 cm     500     13.12 cm at it. 3500
-```
-
-Two things from that era are worth carrying forward. **The discount is not
-a remedy and was never added as one** — it earned its place because at
-gamma = 1 the Bellman operator is not a contraction, and the critic did
-settle at −53.87 against episode returns near −180. And **the exploration
-noise decays on its own**, sigma 0.368 to 0.116 by iteration 3500, so late
-training is nearly deterministic and the reported error is not a noise
-floor.
-
-One run **crashed at iteration 3500 with exit code 4 and no traceback**,
-six hours in, while running six times slower per iteration than its
-predecessors. Never explained. `experiments/train_shac.py` logs to a file
-and checkpoints at every evaluation because of it.
-
-### HISTORY, old configuration: training loses the hold
-
-Everything from here to "Answered" was measured on the configuration
-before the reference one, which `7a7e6ac` still reproduces.
-`experiments/diagnose_shac.py` reran `train_shac.py`'s training — it
-reproduces the recorded run at every evaluation — saves all 21
-checkpoints, and rescores each on 64 environments from a seed nothing was
-selected on:
-
-```
-                                      iter 400    iter 2000
-  reported reward                      -142.19      -158.02
-    approach, 0-1 s                    -139.20      -141.74
-    hold, 1-4 s                          -2.99       -16.28
-    control term                         -3.79        -3.67
-  SHAC's objective, true return-to-go   -11.03       -14.42
-  mean signed final error              -1.68 cm     -6.78 cm
-```
-
-**The loss is all in the hold, and all position.** The approach stays as
-good as it was and the effort barely changes. The box is parked further
-downhill as training continues, for uphill and downhill targets alike.
-
-**It is not an objective mismatch.** SHAC's own objective — shaped,
-gamma = 0.99, from every window start with the true return-to-go — peaks
-at iteration 400 as well. So do its noisy, unshaped and gamma = 1
-versions.
-
-**It is not penalty creep.** Physics is the same at iteration 400 and
-2000, and the iteration-400 policy did better under it. Creep sets a
-floor; it cannot make a later policy worse than an earlier one.
-
-**The critic barely sees it.** Hold one target critic fixed and score
-every actor against it: actors 400 to 2000 differ by about 0.5, where the
-true objective falls by 3.4. No fixed critic prefers the late actor.
-Scored with each checkpoint's *own* critic the bootstrapped objective
-rises from −26.8 to −13.3 — that is the critic's calibration drifting,
-not the actor improving. Do not read it as progress.
-
-Approach windows carry about five times the hold windows' actor gradient
-norm throughout training.
-
-**Inference, not measured:** the critic does not carry the future cost of
-losing position. Inside a 32-step window, relaxing the holding force saves
-effort now and costs a millimetre or so of creep; the rest of the bill
-arrives after the window, where the critic's value hardly moves. Lengthening
-the window — 32, 128, 400 — tests it. At 400 there is no critic at all.
-
-Creep's part in this is that it makes holding a continuous cost, which is
-what the critic would have to carry.
+- **The tolerance sets the offset.** `objective.POSITION_TOLERANCE` is
+  where holding force costs as much as sitting off target. Halving it
+  from 2 cm to 1 cm roughly halved the offset, at about 50% more force.
+  The 2 cm runs are reproducible at `3094234`.
+- **The last checkpoint is the best, or indistinguishable from it**, in
+  every run. Training no longer loses its best policy.
+- **The critic tracks the true objective.** Scored against any fixed
+  critic, the actors' objective moves with the real one.
+- **Training is unstable early.** The hold collapses and recovers a few
+  times before about iteration 1300, differently for each seed. The
+  endpoint does not depend on it.
+- **`tests/check_closed_loop.py` pins its fixture at 2 cm**, so its 119%
+  does not move with the task's tolerance.
 
 **Do not average `|error|` across target directions.** The mean is
 dominated by whichever direction has more error and describes neither.
 Split by direction, as `diagnose_shac.py` does.
 
-### HISTORY, old configuration: what drove it — the critic
+### How it got here, briefly
 
-Everything fixed about the task was fixed at iteration 400 too, so the
-cause has to be something that changes during training. A restart
-experiment, measured at `f65892f` and since removed along with the
-`train` options it needed, restarted from the iteration-400 checkpoint
-and ran 400 more iterations in four arms, each changing one thing, all on
-the same seed. `shac.train(initial=...)` still restarts from any saved
-state. Hold reward, 1–4 s, on the diagnosis environments;
-iteration 400 is −2.99:
+SHAC first ran on a configuration of its own: DDPG-style target critic
+(alpha 0.995), one-step targets, 4 critic epochs, constant learning
+rate, default Adam. It found a good policy by iteration 400 and then
+lost it, parking the box further downhill every few hundred iterations.
+That was recorded for weeks as penalty creep, and it was not — physics
+is the same at every iteration, and the iteration-400 policy did better
+under it. **A constant cannot explain a trend across training
+iterations; check that first when blaming the environment.** Restarting
+from iteration 400 with one change per arm (`f65892f`) showed that
+freezing the critic stopped the decline while noise and step size did
+not, so the critic's failure to track the policy was the cause. Moving
+to the reference configuration fixed it. `7a7e6ac` reproduces the old
+configuration.
 
-```
-   arm                      500      600      700      800
-   original run           -4.35    -6.43   -12.29    -9.54
-   control (restart)      -4.77    -5.95   -10.30    -9.06
-   frozen noise           -3.44    -6.95   -11.09    -8.83
-   actor lr x0.1          -5.50    -6.75    -8.29    -8.65
-   frozen critic          -3.88    -4.63    -4.67    -3.96
-```
+Two instrument lessons from that work. `slope_calibration` must measure
+the **target** critic, the network the actor's bootstrap reads; it was
+once handed the critic, and its numbers described a network the actor
+never saw. And `SLOPE_DELTA` is sized by where the difference quotient
+converges, not by what looks physically sensible; the two disagreed by
+50×.
 
-**The restart is valid:** the control arm reproduces the decline, although
-every arm restarts Adam from scratch, since the iteration-400 checkpoint
-carries no optimizer state. **Noise decay is not the cause.** **Step size
-is not the cause:** ten times smaller actor steps decline more slowly but
-nearly as far, so the actor's gradient points consistently toward
-relaxing the hold. **The critic's evolution is the cause:** with the
-actor reading iteration 400's target critic throughout, the hold stays
-near −4. Every arm, the frozen critic included, loses about 1.5 cm between
-400 and 500, most likely the fresh-Adam kick.
+One run of the old configuration **crashed at iteration 3500 with exit
+code 4 and no traceback**, six hours in. Never explained.
+`experiments/train_shac.py` logs to a file and checkpoints at every
+evaluation because of it.
 
-Consistent with it, not tested by it: at iteration 400 the target critic's
-slope is 3.0× the true slope, at 700 1.8×, at 900 0.7×. The critic's pull
-toward the target starts out overstated and falls behind the truth, and
-the actor relaxes as it does. Freezing the critic is a diagnostic, not a
-fix — it works because iteration 400's critic happened to overstate the
-pull. The fix is a critic that tracks the policy.
-
-### DONE: the reference SHAC configuration
-
-Decided with Pedro: stop differing from the paper. Our SHAC was a mix of
-settings, most never chosen for this task — the target update came from a
-DDPG habit, Adam's betas were torch's defaults, the critic's 4 epochs were
-a guess. Reference SHAC's settings are co-adapted. Alpha 0.2 works
-because the critic gets 64 gradient steps per iteration on smooth TD(λ)
-targets, so they were adopted together, never piecemeal. Values follow
-NVlabs/DiffRL's Ant and Cheetah configs:
-
-```
-   target critic alpha      0.2          (ours was 0.995, Humanoid's value)
-   critic targets           TD(lambda = 0.95), target critic at every step
-   critic fitting           16 iterations x 4 minibatches
-   actor and critic lr      2e-3, linear decay to 1e-5 over the run
-   Adam betas               (0.7, 0.95)
-   gradient clipping        norm 1.0, actor and critic
-   return normalization     off
-```
-
-The networks were adopted too: actor 128-64-32, critic 64-64, a
-LayerNorm after every hidden ELU, orthogonal initialization at gain √2
-for the critic and torch's default for the actor.
-
-Already the same: gamma 0.99, window 32, 64 environments, `log_std`
-learned from −1.0. Kept in float64, since GRIP works in double.
-
-**Two deliberate exceptions, kept on purpose:**
-
-- **Observation normalization stays fixed.** The reference normalizes with
-  a running mean and standard deviation. Ours is a hand-designed affine
-  map whose Jacobian `sweep.policy_gradient` relies on being constant —
-  `batches.Batch` carries it precomputed and the gradient checks validate
-  it. A running normalizer would change it every iteration and touch the
-  checked gradient path. The observation is already well scaled.
-- **Episode handling stays as it is.** Fixed-length episodes with no early
-  termination, so the reference's done-mask logic reduces to "no bootstrap
-  on the last window", which `train` already does. The reference does
-  bootstrap at a time-limit cutoff, because its tasks are open-ended
-  locomotion; ours is a genuinely finite 4-second task, so the last
-  window bootstraps zero.
-
-**Clipping comes back as part of the package.** It measured worse here,
-but in a setup that differed from the paper in six other ways, so that
-measurement does not transfer.
-
-**The learning-rate schedule ties a run to its length.** It decays to
-1e-5 at the last iteration. A longer run is a different schedule, not
-more iterations of the same one — lengthen it deliberately if a run
-needs it.
-
-Every SHAC number in the old-configuration sections is history. The
-commits they came from still reproduce them.
-
-#### Answered, so they are not re-run
-
-**Clipping does not hold the policy, and it is worse.** Two arms, two
-pushers, 2000 iterations, 64 environments, seed 0, measured at `bf3c601`.
-Clipping has since been removed from `shac.py`:
-
-```
-                best      at it.   end      gave up   clipped
-  unclipped     1.39 cm     400    6.69 cm   5.30 cm    0/2000
-  clipped       3.48 cm     300    9.19 cm   5.71 cm  610/2000
-```
-
-`clipped = 610` is the intended regime — neither inert nor binding every
-iteration — so the comparison is real. Worse peak, worse end.
-
-**The slope the actor receives is good until about iteration 1000, then
-it goes flat.** `shac.slope_calibration` measures the target critic, the
-network `sweep.policy_gradient` differentiates, 3 s into the evaluation
-episode. On the diagnosis run's checkpoints:
-
-```
-   iter    target dV/dξ   corr   sign   true dV/dξ
-    400        23.41      0.96   1.00      7.83
-    700        45.75      0.98   1.00     25.71
-    900        15.70      0.97   1.00     23.60
-   1300        -2.05      0.56   0.38     30.80
-   2000         9.19      0.21   1.00     48.61
-```
-
-Through iteration 900 the sign is right in every environment and the
-correlation is 0.96–0.99. After it the true slope keeps rising — the
-further the box parks from the target, the more position is worth — and
-the critic's falls toward zero. The decline in the hold starts around
-iteration 500, before the slope goes bad, so the slope is not what starts
-it. It may be why nothing reverses it. Measured, not tested.
-
-**Slope numbers before this fix measured the wrong network.** Until pass
-2 of the `shac.py` cleanup, `slope_calibration` was handed `critic`, not
-`target_critic`. Its record — `dV/dξ` swinging between −184 and +129 and
-changing sign eight times across thirteen evaluations — describes a
-network the actor never read. V itself, measured on `critic`, holds at
-0.97 correlation with bias near 1; that one is the right network, since it
-measures the fit.
-
-An ablation with `actor_bootstrap=False` — the critic fitted but never
-reaching the actor, measured at `bf3c601` and since removed — ended at
-6.72 cm against 6.69. That was read as clearing the critic. It does not:
-a critic whose value barely moves with position gives about the gradient
-no critic gives, which is what the fixed-critic measurement above shows.
-
-**`observe` carrying no clock is a candidate explanation** for the
-incoherent slope — the critic must fit return-to-go from an observation
-that cannot tell early from late. Adding a clock changes the observation
-space every recorded number was measured against, so it is a decision,
-not a cleanup.
-
-**`slope_calibration`'s delta was wrong and is fixed.** It was sized at
-5 mm for physical plausibility — inside `POSITION_TOLERANCE`, above the
-settle drift — when the binding criterion is where the difference quotient
-converges. That is below about 0.1 mm here, and the two criteria disagreed
-by 50×. Every slope number taken before the fix is void. `SLOPE_DELTA`
-records the convergence table.
+### Other things settled
 
 One finding from step 4, now fixed rather than merely flagged:
 **gradients cannot discover a contact that does not exist.** With the task

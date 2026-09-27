@@ -47,7 +47,7 @@ With GRIP's demo constants (`m = 1`, `b_slip = 200`) at a 20° ramp the
 closed form gives 0.84 cm/s and simulation measures **0.95 cm/s**:
 
 ```
-5 s of hold  →  4.7 cm of drift, about a sixth of a box width
+5 s of hold  →  4.75 cm of drift, about a sixth of a box width
 ```
 
 Not an artifact you have to zoom in to see — the whole picture slides.
@@ -536,12 +536,14 @@ contingency, not a milestone.
 ### SHAC — the one that uses the gradients
 
 Short-horizon actor-critic with a learned value function, consuming analytic
-gradients through the dynamics.
+gradients through the dynamics. It runs the reference implementation's
+configuration, NVlabs/DiffRL's Ant and Cheetah settings, with two recorded
+exceptions; `slope_control/shac.py` and CLAUDE.md list both.
 
-**It does not map onto one `adjoint_batch` call.** An earlier draft here
-prescribed exactly that — roll out `W = 32` steps, seed `dl_dZ[t]` at every
-step and the terminal entry from the critic, read back `dJ_dU[t]`, step the
-policy — and that recipe is **wrong for a policy**, measured:
+**It does not map onto one `adjoint_batch` call.** The obvious recipe —
+roll out `W = 32` steps, seed `dl_dZ[t]` at every step and the terminal
+entry from the critic, read back `dJ_dU[t]`, step the policy — is **wrong
+for a policy**, measured:
 
 ```
 one-parameter feedback a_t = -K(xi - xi*), 200 steps, dJ/dK
@@ -584,7 +586,7 @@ training configuration.**
 ## What this produces
 
 1. **The drift plot.** Box released on the ramp, no policy, no RL.
-   Displacement against time: penalty drifts 4.7 cm in 5 s, NCP sits at
+   Displacement against time: penalty drifts 4.75 cm in 5 s, NCP sits at
    zero, and Coulomb's law says zero. **Done** — `experiments/drift.py`.
 2. **SHAC.** The penalty half is **done** — `experiments/train_shac.py`
    trains it and `experiments/diagnose_shac.py` measures it. The NCP half
@@ -664,7 +666,7 @@ rectangle formula.
 ## Build order
 
 1. **Done.** Place a box on a 20° tilted `HalfPlane`, roll out five seconds
-   of zero controls, plot `ξ` against time. It drifts 4.7 cm —
+   of zero controls, plot `ξ` against time. It drifts 4.75 cm —
    `experiments/drift.py`.
 2. **Done.** The task — `slope_control/task.py`, `objective.py`, `observation.py`, `batches.py`, `tests/check_task.py`.
    De-risked the reward and the gradient path. Built first against a
@@ -676,9 +678,9 @@ rectangle formula.
    path, and it starts looking like manipulation rather than a physics
    test. **Two** pushers, not one — see below.
 5. **Done.** SHAC on penalty, completing the 1.0 column. The policy
-   learns the task; what it cannot do is hold, and that is penalty creep
-   rather than a training failure. CLAUDE.md's standing reminder has the
-   measurement.
+   learns the approach and holds the box about 1 cm downhill of its
+   target, across two seeds, at a 1 cm position tolerance.
+   `experiments/diagnose_shac.py` measures it.
 6. Wait for GRIP 2.0, rerun the whole column, fill in the cross-eval matrix.
 
 Steps 1–5 need nothing from GRIP that does not already exist.
