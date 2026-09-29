@@ -72,7 +72,7 @@ both.
 | Task, reward and gradient path | **done** — `tests/check_task.py`, `tests/check_policy_gradient.py` |
 | Trajectory optimization check | **done** — `tests/check_trajopt.py`: the reward is solvable and its gradients navigable |
 | SHAC | **done** — `experiments/train_shac.py`, `experiments/diagnose_shac.py` |
-| Demo | **next** — the trained policy, rendered |
+| Demo | **done** — `demo/index.html`, an interactive replay of the trained policy; `python experiments/demo.py` builds its data |
 | NCP half | waits on GRIP 2.0 |
 
 Training is unstable early — the hold collapses and recovers a few times
@@ -176,6 +176,7 @@ figures/         their output, committed so the results are visible here
 runs/            training logs, evaluation histories and checkpoints
 tests/           the checks the build order rests on
 docs/            task definition and experiment design
+demo/            the interactive demo page; its data is built by experiments/demo.py
 ```
 
 None of it goes into GRIP — that repository holds physics and derivatives,

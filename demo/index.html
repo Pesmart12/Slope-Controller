@@ -1,0 +1,400 @@
+<title>Slope Controller</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans+Condensed:wght@500;600&display=swap">
+<style>
+  :root {
+    color-scheme: dark;
+    --ground: #10151b;
+    --earth: #1a222c;
+    --ramp: #6b7d90;
+    --box: #e6a948;
+    --pusher: #8a9bad;
+    --arrow: #cfd9e3;
+    --strip: #151c24;
+    --line: #26313d;
+    --ink: #dfe7ef;
+    --ink-soft: #8394a6;
+    --label: "IBM Plex Sans Condensed", "Arial Narrow", system-ui, sans-serif;
+    --mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--label);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  #stage { flex: 1 1 auto; min-height: 0; position: relative; }
+  #scene { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+
+  .strip {
+    flex: 0 0 auto;
+    background: var(--strip);
+    border-top: 1px solid var(--line);
+    padding-inline: 16px;
+    padding-block: 12px calc(12px + env(safe-area-inset-bottom, 0px));
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 14px 26px;
+  }
+  .group { display: flex; align-items: center; gap: 10px; }
+  .group.time { flex: 1 1 320px; min-width: 0; }
+  .field { display: flex; align-items: center; gap: 9px; }
+  label, .tag {
+    font-size: 11.5px;
+    font-weight: 600;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--ink-soft);
+  }
+  output {
+    font-family: var(--mono);
+    font-size: 13px;
+    font-variant-numeric: tabular-nums;
+    color: var(--ink);
+    min-width: 5.2ch;
+  }
+  input[type="range"] { accent-color: var(--box); width: 130px; max-width: 100%; }
+  #time { flex: 1 1 auto; width: auto; min-width: 80px; }
+
+  button {
+    font: 600 12px var(--label);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--ink-soft);
+    background: transparent;
+    border: 1px solid var(--line);
+    border-radius: 3px;
+    padding: 6px 10px;
+    cursor: pointer;
+  }
+  button:hover { color: var(--ink); border-color: var(--ramp); }
+  button[aria-pressed="true"] { color: var(--box); border-color: var(--box); }
+  #play { color: var(--ground); background: var(--box); border-color: var(--box); min-width: 64px; }
+  .speeds { display: flex; gap: 4px; }
+  *:focus-visible { outline: 2px solid var(--box); outline-offset: 2px; }
+  #right-field[hidden] { display: none !important; }
+</style>
+
+<div id="stage"><canvas id="scene" aria-label="Two pushers moving a box along a ramp toward a target"></canvas></div>
+
+<div class="strip">
+  <div class="group time">
+    <button id="play" type="button">Pause</button>
+    <input id="time" type="range" min="0" max="400" step="0.01" value="0" aria-label="Time">
+    <output id="time-out">0.00 s</output>
+    <div class="speeds" role="group" aria-label="Speed">
+      <button type="button" data-speed="0.1">0.1×</button>
+      <button type="button" data-speed="0.25">0.25×</button>
+      <button type="button" data-speed="1" aria-pressed="true">1×</button>
+    </div>
+  </div>
+  <div class="group">
+    <div class="field"><label for="slope">Slope</label><input id="slope" type="range" min="0" max="7" step="1"><output id="slope-out"></output></div>
+    <div class="field"><label for="target">Target</label><input id="target" type="range" min="0" max="9" step="1"><output id="target-out"></output></div>
+  </div>
+  <div class="group">
+    <div class="field"><label for="left" id="left-label">Training</label><input id="left" type="range" min="0" max="7" step="1"><output id="left-out"></output></div>
+    <div class="field" id="right-field" hidden><label for="right">Right</label><input id="right" type="range" min="0" max="7" step="1"><output id="right-out"></output></div>
+    <button id="compare" type="button" aria-pressed="false">Compare</button>
+  </div>
+</div>
+
+<script>
+(function () {
+  const canvas = document.getElementById("scene");
+  const ctx = canvas.getContext("2d");
+  const $ = (id) => document.getElementById(id);
+  const css = getComputedStyle(document.documentElement);
+  const color = (name) => css.getPropertyValue(name).trim();
+  const C = { ground: color("--ground"), earth: color("--earth"), ramp: color("--ramp"), box: color("--box"), pusher: color("--pusher"), arrow: color("--arrow"), soft: color("--ink-soft") };
+  const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  let meta = null, poses = null, forces = null;
+  const state = { slope: 5, target: 7, left: 7, right: 7, compare: false, playing: true, speed: 1, t: 0, dwell: 0 };
+  let camera = null, cameraFrom = null, cameraBlend = 1;
+
+  // Size the canvas backing store to the element and the device pixel ratio.
+  function resize() {
+    const dpr = window.devicePixelRatio || 1;
+    const rect = canvas.getBoundingClientRect();
+    canvas.width = Math.max(1, Math.round(rect.width * dpr));
+    canvas.height = Math.max(1, Math.round(rect.height * dpr));
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+
+  const env = () => state.slope * meta.offsets.length + state.target;
+  const steps = () => meta.steps;
+
+  // Read one body's pose at a fractional step, interpolating between frames.
+  function pose(checkpoint, e, t, body) {
+    const [, E, S, B] = meta.poseShape;
+    const k0 = Math.min(Math.floor(t), S - 1), k1 = Math.min(k0 + 1, S - 1), f = t - k0;
+    const base = (((checkpoint * E + e) * S) * B + body) * 3;
+    const a = base + k0 * B * 3, b = base + k1 * B * 3;
+    const s = meta.poseScale;
+    return [0, 1, 2].map((i) => (poses[a + i] * (1 - f) + poses[b + i] * f) * s[i]);
+  }
+
+  // One pusher's ramp-frame force at an integer step, (uphill, outward).
+  function force(checkpoint, e, k, slot) {
+    const [, E, S, P] = meta.forceShape;
+    const i = ((((checkpoint * E + e) * S + Math.min(k, S - 1)) * P) + slot) * 2;
+    return [forces[i] * meta.forceScale, forces[i + 1] * meta.forceScale];
+  }
+
+  function targetCamera() {
+    const [x0, y0, x1, y1] = meta.cameras[env()];
+    return { cx: (x0 + x1) / 2, cy: (y0 + y1) / 2, w: x1 - x0, h: y1 - y0 };
+  }
+
+  // Ease the camera toward the current scenario's window.
+  function updateCamera(dt) {
+    const goal = targetCamera();
+    if (!camera) { camera = goal; return; }
+    if (cameraBlend < 1) {
+      cameraBlend = reduced ? 1 : Math.min(1, cameraBlend + dt / 0.45);
+      const e = 1 - Math.pow(1 - cameraBlend, 3);
+      for (const key of ["cx", "cy", "w", "h"]) camera[key] = cameraFrom[key] + (goal[key] - cameraFrom[key]) * e;
+    } else camera = goal;
+  }
+
+  function retarget() { cameraFrom = camera ? { ...camera } : null; cameraBlend = camera ? 0 : 1; }
+
+  // Draw one scene into the viewport (vx, vy, vw, vh) in CSS pixels.
+  function drawScene(checkpoint, vx, vy, vw, vh) {
+    const e = env();
+    const angle = meta.slopesDeg[state.slope] * Math.PI / 180;
+    const up = [Math.cos(angle), Math.sin(angle)], out = [-Math.sin(angle), Math.cos(angle)];
+    const scale = Math.min(vw / camera.w, vh / camera.h);
+    const X = (x) => vx + vw / 2 + (x - camera.cx) * scale;
+    const Y = (y) => vy + vh / 2 - (y - camera.cy) * scale;
+
+    ctx.save();
+    ctx.beginPath(); ctx.rect(vx, vy, vw, vh); ctx.clip();
+
+    // Fill the ground under the ramp surface, then draw its edge.
+    const reach = 20;
+    ctx.fillStyle = C.earth;
+    ctx.beginPath();
+    ctx.moveTo(X(-reach * up[0]), Y(-reach * up[1]));
+    ctx.lineTo(X(reach * up[0]), Y(reach * up[1]));
+    ctx.lineTo(X(reach * up[0] - reach * out[0]), Y(reach * up[1] - reach * out[1]));
+    ctx.lineTo(X(-reach * up[0] - reach * out[0]), Y(-reach * up[1] - reach * out[1]));
+    ctx.closePath(); ctx.fill();
+    ctx.strokeStyle = C.ramp; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(X(-reach * up[0]), Y(-reach * up[1])); ctx.lineTo(X(reach * up[0]), Y(reach * up[1])); ctx.stroke();
+
+    // Draw the target: a dashed ghost of the box resting on the ramp there,
+    // and a bracket on the surface spanning the 1 cm tolerance each side.
+    const xi = meta.targets[e], half = meta.boxSide / 2;
+    const gx = xi * up[0] + half * out[0], gy = xi * up[1] + half * out[1];
+    ctx.setLineDash([7, 6]); ctx.strokeStyle = C.box; ctx.globalAlpha = 0.55; ctx.lineWidth = 1.5;
+    polygon(meta.bodies[meta.boxIndex].vertices, gx, gy, angle, X, Y); ctx.stroke();
+    ctx.setLineDash([]); ctx.globalAlpha = 0.9; ctx.lineWidth = 3;
+    const tol = meta.tolerance;
+    ctx.beginPath();
+    ctx.moveTo(X((xi - tol) * up[0]), Y((xi - tol) * up[1])); ctx.lineTo(X((xi + tol) * up[0]), Y((xi + tol) * up[1]));
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+
+    // Draw the box's trail over the last 1.5 s, fading toward the past.
+    const t = state.t, box = meta.boxIndex;
+    const first = Math.max(0, Math.floor(t) - 150);
+    ctx.lineWidth = 2; ctx.lineCap = "round";
+    let prev = pose(checkpoint, e, first, box);
+    for (let k = first + 1; k <= t; k++) {
+      const p = pose(checkpoint, e, Math.min(k, t), box);
+      ctx.strokeStyle = C.box; ctx.globalAlpha = 0.5 * (1 - (t - k) / 150);
+      ctx.beginPath(); ctx.moveTo(X(prev[0]), Y(prev[1])); ctx.lineTo(X(p[0]), Y(p[1])); ctx.stroke();
+      prev = p;
+    }
+    ctx.globalAlpha = 1;
+
+    // Draw every body at the current instant.
+    meta.bodies.forEach((body, b) => {
+      const [x, y, th] = pose(checkpoint, e, t, b);
+      polygon(body.vertices, x, y, th, X, Y);
+      ctx.fillStyle = b === box ? C.box : C.pusher;
+      ctx.fill();
+    });
+
+    // Draw each pusher's commanded force as an arrow from its centre,
+    // 0.3 m of arrow for the 30 N limit.
+    const k = Math.min(Math.round(t), steps() - 1);
+    meta.pushers.forEach((body, slot) => {
+      const [x, y] = pose(checkpoint, e, t, body);
+      const [ft, fn] = force(checkpoint, e, k, slot);
+      const fx = (ft * up[0] + fn * out[0]) * 0.01, fy = (ft * up[1] + fn * out[1]) * 0.01;
+      arrow(X(x), Y(y), X(x + fx), Y(y + fy));
+    });
+    ctx.restore();
+  }
+
+  function polygon(vertices, x, y, th, X, Y) {
+    const c = Math.cos(th), s = Math.sin(th);
+    ctx.beginPath();
+    vertices.forEach(([vx, vy], i) => {
+      const wx = x + vx * c - vy * s, wy = y + vx * s + vy * c;
+      i ? ctx.lineTo(X(wx), Y(wy)) : ctx.moveTo(X(wx), Y(wy));
+    });
+    ctx.closePath();
+  }
+
+  function arrow(x0, y0, x1, y1) {
+    const length = Math.hypot(x1 - x0, y1 - y0);
+    if (length < 3) return;
+    const head = Math.min(11, length * 0.45), a = Math.atan2(y1 - y0, x1 - x0);
+    ctx.strokeStyle = C.arrow; ctx.fillStyle = C.arrow; ctx.lineWidth = 2.5; ctx.lineCap = "round";
+    ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1 - head * 0.6 * Math.cos(a), y1 - head * 0.6 * Math.sin(a)); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(x1, y1);
+    ctx.lineTo(x1 - head * Math.cos(a - 0.45), y1 - head * Math.sin(a - 0.45));
+    ctx.lineTo(x1 - head * Math.cos(a + 0.45), y1 - head * Math.sin(a + 0.45));
+    ctx.closePath(); ctx.fill();
+  }
+
+  function draw() {
+    const w = canvas.clientWidth, h = canvas.clientHeight;
+    ctx.fillStyle = C.ground; ctx.fillRect(0, 0, w, h);
+    if (!meta) return;
+    if (!camera) camera = targetCamera();
+    if (state.compare) {
+      const gap = 2;
+      drawScene(state.left, 0, 0, (w - gap) / 2, h);
+      drawScene(state.right, (w + gap) / 2, 0, (w - gap) / 2, h);
+      ctx.fillStyle = color("--line"); ctx.fillRect((w - gap) / 2, 0, gap, h);
+    } else drawScene(state.left, 0, 0, w, h);
+  }
+
+  // Advance time: 100 control steps per second at 1x, a short rest at the
+  // end, then loop.
+  let last = performance.now();
+  function frame(now) {
+    const dt = Math.min(0.1, (now - last) / 1000); last = now;
+    if (meta) {
+      updateCamera(dt);
+      if (state.playing) {
+        if (state.t >= steps()) {
+          state.dwell += dt;
+          if (state.dwell > 1.2) { state.t = 0; state.dwell = 0; }
+        } else state.t = Math.min(steps(), state.t + dt * meta.controlHz * state.speed);
+        syncTime();
+      }
+      draw();
+    }
+    requestAnimationFrame(frame);
+  }
+
+  function syncTime() {
+    $("time").value = state.t;
+    $("time-out").textContent = (state.t / meta.controlHz).toFixed(2) + " s";
+  }
+
+  function syncLabels() {
+    $("slope-out").textContent = meta.slopesDeg[state.slope] + "°";
+    const o = meta.offsets[state.target];
+    $("target-out").textContent = (o > 0 ? "+" : "−") + Math.abs(o).toFixed(2) + " m";
+    $("left-out").textContent = meta.checkpoints[state.left];
+    $("right-out").textContent = meta.checkpoints[state.right];
+    $("left-label").textContent = state.compare ? "Left" : "Training";
+    $("right-field").hidden = !state.compare;
+    $("compare").setAttribute("aria-pressed", String(state.compare));
+    $("play").textContent = state.playing ? "Pause" : "Play";
+  }
+
+  function bind(id, key, onChange) {
+    const input = $(id);
+    input.value = state[key];
+    input.addEventListener("input", () => { state[key] = Number(input.value); if (onChange) onChange(); syncLabels(); });
+  }
+
+  function setup() {
+    $("time").max = steps();
+    bind("slope", "slope", retarget);
+    bind("target", "target", retarget);
+    bind("left", "left");
+    bind("right", "right");
+    $("time").addEventListener("input", () => { state.t = Number($("time").value); state.dwell = 0; syncTime(); });
+    $("play").addEventListener("click", togglePlay);
+    $("compare").addEventListener("click", () => {
+      state.compare = !state.compare;
+      if (state.compare) { state.left = 0; state.right = meta.checkpoints.length - 1; }
+      $("left").value = state.left; $("right").value = state.right;
+      syncLabels();
+    });
+    document.querySelectorAll("[data-speed]").forEach((b) => b.addEventListener("click", () => {
+      state.speed = Number(b.dataset.speed);
+      document.querySelectorAll("[data-speed]").forEach((o) => o.setAttribute("aria-pressed", String(o === b)));
+    }));
+    document.addEventListener("keydown", (event) => {
+      // Leave keys to a focused control: sliders take arrows, buttons take space.
+      if (event.target.tagName === "BUTTON" && event.key === " ") return;
+      if (event.target.tagName === "INPUT" && event.key !== " ") return;
+      if (event.key === " ") { event.preventDefault(); togglePlay(); }
+      else if (event.key === "ArrowRight" || event.key === "ArrowLeft") {
+        const step = (event.shiftKey ? 10 : 1) * (event.key === "ArrowRight" ? 1 : -1);
+        state.playing = false; state.t = Math.max(0, Math.min(steps(), Math.round(state.t) + step));
+        syncTime(); syncLabels();
+      }
+    });
+    syncLabels(); syncTime();
+  }
+
+  function togglePlay() {
+    if (!state.playing && state.t >= steps()) state.t = 0;
+    state.playing = !state.playing; state.dwell = 0; syncLabels();
+  }
+
+  // Show a quiet loading bar while the episodes download.
+  function loading(fraction) {
+    const w = canvas.clientWidth, h = canvas.clientHeight;
+    ctx.fillStyle = C.ground; ctx.fillRect(0, 0, w, h);
+    ctx.fillStyle = C.earth; ctx.fillRect(w * 0.3, h / 2 - 2, w * 0.4, 4);
+    ctx.fillStyle = C.box; ctx.fillRect(w * 0.3, h / 2 - 2, w * 0.4 * fraction, 4);
+  }
+
+  async function fetchBytes(url) {
+    const response = await fetch(url);
+    if (!response.ok) throw new Error(url + ": " + response.status);
+    const total = Number(response.headers.get("content-length")) || 0;
+    if (!response.body || !total) return new Uint8Array(await response.arrayBuffer());
+    const reader = response.body.getReader(), bytes = new Uint8Array(total);
+    let received = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      bytes.set(value, received); received += value.length; loading(received / total);
+    }
+    return bytes;
+  }
+
+  async function load() {
+    resize(); loading(0);
+    meta = null;
+    const [info, text] = await Promise.all([fetch("meta.json").then((r) => r.json()), fetchBytes("episodes.txt")]);
+
+    // Decode the base64 text back into the int16 array it was written from.
+    const binary = atob(new TextDecoder().decode(text));
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    const all = new Int16Array(bytes.buffer, 0, bytes.length / 2);
+    const count = info.poseShape.reduce((a, b) => a * b, 1);
+    poses = all.subarray(0, count);
+    forces = all.subarray(count);
+    meta = info;
+    setup();
+  }
+
+  window.addEventListener("resize", () => { resize(); if (meta) draw(); });
+  load().then(() => requestAnimationFrame(frame)).catch((error) => {
+    resize();
+    ctx.fillStyle = C.soft; ctx.font = "14px " + getComputedStyle(document.body).fontFamily;
+    ctx.fillText("Could not load the episodes: " + error.message, 24, 40);
+  });
+})();
+</script>

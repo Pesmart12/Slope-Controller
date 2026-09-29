@@ -592,8 +592,9 @@ training configuration.**
    trains it and `experiments/diagnose_shac.py` measures it. The NCP half
    waits on 2.0.
 3. **The cross-eval table.** Waits on 2.0; there is nothing to cross yet.
-4. **A demo.** To be rebuilt around the current policy. The first one was
-   removed because its framing assumed penalty creep limited training.
+4. **A demo.** **Done for penalty** — `demo/index.html` replays the trained
+   policy across slopes, targets and training checkpoints, with
+   `experiments/demo.py` building its data.
 
 (1) is a measurement against a closed form and stands on its own whatever
 the rest do. The rest are the build, and they are allowed to be modest.

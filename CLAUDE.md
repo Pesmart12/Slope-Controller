@@ -128,9 +128,11 @@ The repository is small and should stay legible.
 | `slope_control/observation.py` | what the policy sees, and its constant Jacobian |
 | `slope_control/batches.py` | `Batch` and its two builders — scenes, placement, settle window, targets |
 | `slope_control/shac.py` | the training loop — windowed rollout, actor step, critic fit, target update |
-| `slope_control/render.py` | draws a scene and animates an episode to a GIF; pure presentation, computes nothing. Unused until the demo is rebuilt |
+| `slope_control/render.py` | draws a scene and animates an episode to a GIF; pure presentation, computes nothing. Currently unused — the demo draws in the browser |
 | `experiments/drift.py` | artifact 1 — the drift measurement and its figure |
 | `experiments/train_shac.py` | the experiment that trains — one run, file logging, the latest and the best checkpoint |
+| `experiments/demo.py` | builds the demo's data — 640 deterministic episodes over 8 slopes × 10 targets × 8 training checkpoints, int16 as base64 text |
+| `demo/index.html` | the interactive demo page: slope, target and training sliders, playback, compare. Published as an artifact with the data `demo.py` writes beside it, which is git-ignored |
 | `experiments/diagnose_shac.py` | trains, then rescores every checkpoint on fresh environments — reported reward by phase, SHAC's own objective, fixed critics, parking by target direction |
 | `figures/` | committed output, so results are visible without running anything |
 | `runs/` | training logs, evaluation histories and checkpoints, one directory per run |
@@ -235,8 +237,8 @@ so a session knows where it is.
    policy after iteration 400; the critic was the cause, and moving to the
    reference configuration fixed it. Doubling to 4000 iterations did not
    move where the box parks; halving the tolerance from 2 cm roughly
-   halved the offset. The demo was removed because its framing assumed
-   creep was the limit; it gets rebuilt next.
+   halved the offset. **The demo is done:** `experiments/demo.py` builds
+   its data and `demo/index.html` replays it, visuals only.
 6. Wait for GRIP 2.0, rerun the column, fill in the cross-eval table.
 
 Steps 2–5 need nothing from GRIP that does not already exist. **Do not build
