@@ -252,7 +252,7 @@ against `hold_force = mg·sin α = 3.7 N` alone, never against the force
 needed to *move* anything, and 5 N is below the break-free threshold at
 every sampled slope. **The task was literally unsolvable**, and stayed that
 way through a passing gradient check, because a correct gradient on an
-impossible objective is still correct. `tests/check_trajopt.py` is what
+impossible objective is still correct. Trajectory optimization is what
 caught it.
 
 Tipping is **not** a constraint, though the same draft claimed it was. A
@@ -293,17 +293,19 @@ ramp-frame one means the same thing everywhere, and a positive tangential
 component always pushes toward increasing `ξ`. The torque row stays zero,
 mirroring the pusher, which is shaped so it needs no orientation control.
 
-**The action saturates componentwise at `(12, 6)` N**, per the force-limit
-section above. `tests/check_task.py` asserts both inequalities and their
-physical counterparts: a full second of maximum outward push leaves the box
-still in contact, and a full episode of maximum uphill push moves it far
-enough to reach any target and brake.
+**On the box-only task the action saturated componentwise at `(12, 6)` N**,
+per the force-limit section above. The two-pusher task uses **`(30, 12)` N
+per pusher**, sized in "The force budget, measured" below.
+`tests/check_task.py` asserts that limit's two inequalities and their
+physical counterparts: the driving pusher can break itself and the box
+free, and a full second of maximum outward push leaves the pushers still
+in contact.
 
-### What the solved trajectory looks like
+### What the solved trajectory looked like
 
-`tests/check_trajopt.py` optimizes the raw 400-step control sequence with
-Adam, from a **zero** initialization and a 5 cm approach gap. Measured at
-the 2 cm tolerance, reproducible at `3094234`:
+Trajectory optimization, since removed, optimized the raw 400-step control
+sequence with Adam, from a **zero** initialization and a 5 cm approach gap.
+Measured at the 2 cm tolerance, reproducible at `3094234`:
 
 ```
    final error, 15 / 20 / 22 deg        unshaped reward
@@ -506,7 +508,12 @@ GRIP uniquely provides, and the sample budget is brutal — at `dt = 5e-4`,
 one simulated second is 2000 integration steps. Not a judgement about PPO;
 it is just not what this project is for.
 
-### Trajectory optimization — the check
+### Trajectory optimization — the check, since removed
+
+It did its job before SHAC existed, and a working SHAC controller made it
+redundant. It was removed once its solution-shape assertion stopped
+matching the 1 cm tolerance; `3094234` reproduces it. What it established
+still stands.
 
 **MPPI is dropped.** It was here to remove an ambiguity — if SHAC
 struggles, is it the gradients or the task? — but being zeroth order it
@@ -518,7 +525,8 @@ training loop.
 
 It establishes two things MPPI could not:
 
-- **The reward is solvable.** 1.4 cm to target at every sampled slope.
+- **The reward is solvable.** Within a centimetre of target at every
+  sampled slope, at the 2 cm tolerance.
 - **The gradients are navigable**, not merely correct. A finite-difference
   check proves correctness at a point; this crosses 8000 integration steps
   of stiff contact and ends at its best iterate. SHAC's 32-step windows are
@@ -542,28 +550,28 @@ exceptions; `slope_control/shac.py` and CLAUDE.md list both.
 
 **It does not map onto one `adjoint_batch` call.** The obvious recipe —
 roll out `W = 32` steps, seed `dl_dZ[t]` at every step and the terminal
-entry from the critic, read back `dJ_dU[t]`, step the policy — is **wrong
+entry from the critic, read back `dobjective_dU[t]`, step the policy — is **wrong
 for a policy**, measured:
 
 ```
-one-parameter feedback a_t = -K(xi - xi*), 200 steps, dJ/dK
+one-parameter feedback a_t = -K(xi - xi*), 200 steps, d(objective)/dK
   K = 25    truth  5.129    one call   5.706   ( 11.3% off)
   K = 30    truth 28.790    one call  63.187   (119.5% off)
 ```
 
-`adjoint_batch` returns `∂J/∂U_t` holding the other controls fixed. For a
-control *sequence* that is exactly the gradient, which is why
-`tests/check_trajopt.py` optimizes cleanly. For a *policy* it is not:
+`adjoint_batch` returns `∂(objective)/∂U_t` holding the other controls fixed. For a
+control *sequence* that is exactly the gradient, which is why trajectory
+optimization worked with one call per episode. For a *policy* it is not:
 `U_t = π(Z_t)`, and `Z_t` depends on every earlier control, so perturbing a
 parameter moves `U_0`, which moves `Z_1`, which moves `a_1` again through
-the policy. Contracting `dJ_dU` with the direct `∂π/∂θ` picks up only the
+the policy. Contracting `dobjective_dU` with the direct `∂π/∂θ` picks up only the
 first path.
 
 Note the error is not a constant factor — 11% at one gain, 119% at another.
 It cannot be absorbed into a learning rate.
 
 **What works** is a per-step backward sweep. Each step's adjoint call
-returns both pieces: `dJ_dU_t` to contract against `∂π/∂θ`, and `dJ_dZ0` to
+returns both pieces: `dobjective_dU_t` to contract against `∂π/∂θ`, and `dobjective_dZ0` to
 carry the adjoint back one step. Between calls, add the path a single call
 cannot see, `Z_t → a_t → Z_{t+1}`. Exact to 2e-6 relative, in
 `tests/check_closed_loop.py`.
@@ -599,10 +607,8 @@ training configuration.**
 (1) is a measurement against a closed form and stands on its own whatever
 the rest do. The rest are the build, and they are allowed to be modest.
 
-Trajectory optimization is deliberately **not** on this list. It is a
-check — it produces no number that means anything without an NCP column to
-set it against, and unlike the drift plot it has no closed form standing
-behind it. It lives in `tests/`, not `experiments/`.
+Trajectory optimization was deliberately never on this list. It was a
+check, not a result, and it has since been removed.
 
 ---
 
@@ -614,7 +620,7 @@ sketch of one. State is `(environments, bodies, 6)`, controls are
 
 ```python
 trajectory = grip.rollout_batch(scenes, initial, controls, substeps)
-dJ_dZ0, dJ_dU = grip.adjoint_batch(scenes, trajectory, controls, substeps, dl_dZ, dl_dU)
+dobjective_dZ0, dobjective_dU = grip.adjoint_batch(scenes, trajectory, controls, substeps, dl_dZ, dl_dU)
 ```
 
 GRIP never sees the reward. This repository computes `∂r/∂Z` and `∂r/∂U`,
@@ -672,9 +678,10 @@ rectangle formula.
 2. **Done.** The task — `slope_control/task.py`, `objective.py`, `observation.py`, `batches.py`, `tests/check_task.py`.
    De-risked the reward and the gradient path. Built first against a
    single directly actuated box, since removed.
-3. **Done.** Trajectory optimization — `tests/check_trajopt.py`. Confirms
-   the reward is solvable and its gradients navigable, and it is what
-   caught the unsolvable force limit. Replaces the MPPI step.
+3. **Done, and since removed.** Trajectory optimization confirmed the
+   reward was solvable and its gradients navigable, and caught the
+   unsolvable force limit. It replaced the MPPI step. `3094234`
+   reproduces it.
 4. **Done.** The pushers. Body-body contact and friction join the critical
    path, and it starts looking like manipulation rather than a physics
    test. **Two** pushers, not one — see below.

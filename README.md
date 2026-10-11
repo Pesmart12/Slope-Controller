@@ -70,7 +70,6 @@ both.
 |---|---|
 | Drift measurement | **done** — `experiments/drift.py` |
 | Task, reward and gradient path | **done** — `tests/check_task.py`, `tests/check_policy_gradient.py` |
-| Trajectory optimization check | **done** — `tests/check_trajopt.py`: the reward is solvable and its gradients navigable |
 | SHAC | **done** — `experiments/train_shac.py`, `experiments/diagnose_shac.py` |
 | Demo | **done** — `demo/index.html`, an interactive replay of the trained policy; `python experiments/demo.py` builds its data |
 | NCP half | waits on GRIP 2.0 |

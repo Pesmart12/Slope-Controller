@@ -5,10 +5,10 @@ differentiated by hand. This makes it for the thing SHAC actually trains:
 a network, with the derivative crossing between GRIP and torch twice per
 step.
 
-    GRIP gives dJ/d(wrench)
-      -> rotate to dJ/d(action)
-      -> back-propagate to dJ/d(weights) and dJ/d(observation)
-      -> multiply by the observation Jacobian to get dJ/d(state)
+    GRIP gives d(objective)/d(wrench)
+      -> rotate to d(objective)/d(action)
+      -> back-propagate to d(objective)/d(weights) and d(objective)/d(observation)
+      -> multiply by the observation Jacobian to get d(objective)/d(state)
       -> hand back to GRIP as the next seed
 
 Every one of those hops can hide a sign or a transpose, and none of them

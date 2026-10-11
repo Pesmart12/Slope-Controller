@@ -1,8 +1,8 @@
 """Why a policy needs one adjoint call per step.  Run: python tests/check_closed_loop.py
 
-`adjoint_batch` computes dJ/d(control) holding the other controls fixed.
-For a fixed control sequence that IS the gradient, which is why
-`check_trajopt.py` optimizes cleanly with one call per episode.
+`adjoint_batch` computes d(objective)/d(control) holding the other controls fixed.
+For a fixed control sequence that IS the gradient, which is why a
+trajectory optimizer can use one call per episode.
 
 A policy is different. Its action is computed from the state, and the
 state depends on every earlier action, so nudging the weights moves the
@@ -75,9 +75,9 @@ def to_wrench(force, angles):
     return wrench
 
 
-def to_action_gradient(dJ_dU, angles):
-    """dJ/d(wrench) -> dJ/d(tangential force), the dot with uphill."""
-    return np.einsum("...ni,ni->...n", dJ_dU[..., 0, 0:2], ramp.uphill(angles))
+def to_action_gradient(dobjective_dU, angles):
+    """d(objective)/d(wrench) -> d(objective)/d(tangential force), the dot with uphill."""
+    return np.einsum("...ni,ni->...n", dobjective_dU[..., 0, 0:2], ramp.uphill(angles))
 
 
 def reward(states, controls, angles, targets):
@@ -124,8 +124,8 @@ def rollout_closed_loop(batch, gain, steps=STEPS):
 
 def one_call_gradient(batch, trajectory, controls, dl_dZ, dl_dU, dpi_dgain):
     """The task doc's recipe: one sweep, contracted with the direct dpi/dK."""
-    _, dJ_dU = grip.adjoint_batch(batch.scenes, trajectory, controls, batch.substeps, dl_dZ, dl_dU)
-    return (to_action_gradient(dJ_dU, batch.angles) * dpi_dgain).sum()
+    _, dobjective_dU = grip.adjoint_batch(batch.scenes, trajectory, controls, batch.substeps, dl_dZ, dl_dU)
+    return (to_action_gradient(dobjective_dU, batch.angles) * dpi_dgain).sum()
 
 
 def per_step_gradient(batch, trajectory, controls, dl_dZ, dl_dU, dpi_dgain, gain):
@@ -135,9 +135,9 @@ def per_step_gradient(batch, trajectory, controls, dl_dZ, dl_dU, dpi_dgain, gain
     for t in range(len(controls) - 1, -1, -1):
         seed = np.zeros((2,) + trajectory.shape[1:])
         seed[1] = adjoint
-        dJ_dZ0, dJ_dU = grip.adjoint_batch(batch.scenes, trajectory[t:t + 2], controls[t:t + 1], batch.substeps, seed, dl_dU[t:t + 1])
+        dobjective_dZ0, dobjective_dU = grip.adjoint_batch(batch.scenes, trajectory[t:t + 2], controls[t:t + 1], batch.substeps, seed, dl_dU[t:t + 1])
 
-        action_gradient = to_action_gradient(dJ_dU, batch.angles)[0]
+        action_gradient = to_action_gradient(dobjective_dU, batch.angles)[0]
         total += (action_gradient * dpi_dgain[t]).sum()
 
         # Build the term a single call cannot see, where the state feeds the
@@ -145,7 +145,7 @@ def per_step_gradient(batch, trajectory, controls, dl_dZ, dl_dU, dpi_dgain, gain
         # written onto the position columns of body 0.
         through_policy = np.zeros_like(adjoint)
         through_policy[:, 0, 0:2] = (-gain * action_gradient)[:, None] * ramp.uphill(batch.angles)
-        adjoint = dJ_dZ0 + through_policy + dl_dZ[t]
+        adjoint = dobjective_dZ0 + through_policy + dl_dZ[t]
 
     return total
 

@@ -8,20 +8,21 @@ included in a reported number.
 
 Notation
 --------
-Two symbols, taken from GRIP's `docs/derivations/notation.md`, which is
+Two names, taken from GRIP's `docs/derivations/notation.md`, which is
 canonical for anything the two repositories share:
 
-    l       one step's reward. GRIP calls this slot the stage cost.
-            Written `ell` there, ASCII `l` here.
-    J       the whole objective being differentiated: the sum of `l` over
-            a window, plus the critic's estimate of what follows it.
+    l          one step's reward. GRIP calls this slot the stage cost.
+               Written `ell` there, ASCII `l` here.
+    objective  the whole quantity being differentiated: the sum of `l`
+               over a window, plus the critic's estimate of what follows
+               it. Spelled out, not `J` -- `J` is GRIP's contact Jacobian.
 
 The distinction is partial against total, and it is the reason both exist:
 
     dl_dZ, dl_dU     PARTIAL derivatives of one step's reward. These go
                      INTO `adjoint_batch` as seeds. `reward_seeds` makes
                      them.
-    dJ_dZ0, dJ_dU    TOTAL derivatives of the objective. These come OUT
+    dobjective_dZ0, dobjective_dU    TOTAL derivatives of the objective. These come OUT
                      of `adjoint_batch`. Converting the first into the
                      second is the entire job of the adjoint.
 
@@ -31,9 +32,8 @@ There is no separate `r`. If a comment needs the per-step quantity, it is
 **`l` holds a reward, not a cost, so everything here MAXIMIZES.** That is
 a deviation worth stating rather than leaving to be discovered. Optimal
 control conventionally calls `ell` a stage cost and minimizes it. This
-reward is negative-definite instead, and `check_trajopt` ascends it:
-
-    actions += learning_rate * ...
+reward is negative-definite instead, and training climbs it:
+`shac.ascend` negates the gradient before Adam's step.
 
 Consistent throughout, so no arithmetic is wrong. But anyone reading
 `dl_dZ` with the usual convention in mind will expect the opposite sign,
@@ -234,8 +234,8 @@ def reward_seeds(states, controls, ramp_angles, targets, shaping=False):
 
     These are PARTIAL derivatives of one step's reward. `adjoint_batch`
     takes them as seeds and returns total derivatives of the whole
-    objective. That partial-against-total split is what `l` and `J` mean
-    here; the module docstring has the table.
+    objective. That partial-against-total split is what `l` and the
+    objective mean here; the module docstring has the table.
 
     Kept next to `reward` on purpose. The two must agree term for term, and
     a seed that disagrees raises nothing -- it just trains for a different

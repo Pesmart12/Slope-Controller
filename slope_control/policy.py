@@ -114,7 +114,7 @@ def as_tensor(array, grad=False):
     """numpy -> torch, in float64.
 
     `grad=True` marks the tensor as something to differentiate with respect
-    to, which is how `accumulate` can return dJ/d(observation).
+    to, which is how `accumulate` can return d(objective)/d(observation).
 
     float64 rather than the usual float32 because the finite-difference
     checks compare against a 1e-6 tolerance, and float32 rounding would

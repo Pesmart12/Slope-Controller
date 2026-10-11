@@ -104,8 +104,8 @@ def clip_action(actions):
     entries, because they are bounded by different physics.
 
     Callers apply this; `to_wrench` does not. An optimizer working on a raw
-    control sequence has to project its iterate back inside the limit every
-    iteration, and `check_trajopt` does. `policy.Actor` needs nothing: it
+    control sequence would have to project its iterate back inside the
+    limit every iteration. `policy.Actor` needs nothing: it
     emits `limit * tanh(...)`, so every action it produces is already
     feasible and this would be a no-op.
 
@@ -151,8 +151,8 @@ def to_wrench(actions, ramp_angles):
     return wrench
 
 
-def to_action_gradient(dJ_dU, ramp_angles):
-    """Convert dJ/d(wrench) from GRIP into dJ/d(action).
+def to_action_gradient(dobjective_dU, ramp_angles):
+    """Convert d(objective)/d(wrench) from GRIP into d(objective)/d(action).
 
     The inverse direction of `to_wrench`. That map is a rotation, so
     undoing it is just the transpose: take each actuated body's force
@@ -165,13 +165,13 @@ def to_action_gradient(dJ_dU, ramp_angles):
     """
     angles = ramp.as_angles(ramp_angles)
     up, out = ramp.uphill(angles), ramp.normal(angles)
-    dJ_dU = np.asarray(dJ_dU)
+    dobjective_dU = np.asarray(dobjective_dU)
 
     gradients = []
     for body in ACTUATED:
         # Gather this body's force gradient, dropping the torque column since
         # no action ever wrote it.
-        force = dJ_dU[..., body, 0:2]
+        force = dobjective_dU[..., body, 0:2]
 
         # "...ni,ni->...n" is a per-environment dot product: contract the
         # 2-vector axis i against that environment's basis vector, keeping any

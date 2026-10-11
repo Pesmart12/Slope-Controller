@@ -15,10 +15,11 @@ gradient is computed, not estimated: GRIP differentiates the contact and
 `sweep.policy_gradient` carries that through the network. No sampling, no
 score function, no advantage estimate.
 
-The window is short because differentiating a whole 400-step episode
-through stiff contact is badly conditioned. The critic is what makes a
-short window sound -- it estimates the reward after the window ends, so
-the actor is not optimizing 0.32 s in isolation.
+The window is short because, per the SHAC paper, gradients through long
+horizons of stiff contact are badly conditioned; this repository has not
+measured that itself. The critic is what makes a short window sound -- it
+estimates the reward after the window ends, so the actor is not
+optimizing 0.32 s in isolation.
 
 Discounted at gamma = 0.99, which is a training device and not a claim
 about what the task wants. Everything reported is the plain undiscounted
@@ -225,8 +226,8 @@ def soft_update(target, source, alpha=TARGET_ALPHA):
 def ascend(module, optimizer, rows, max_norm=MAX_GRADIENT_NORM):
     """Take one Adam step UPHILL on the accumulated gradient, norm-clipped.
 
-    `policy_gradient` accumulates dJ/d(weights) where J is a reward to be
-    maximized, and torch optimizers minimize, so every gradient is negated
+    `policy_gradient` accumulates d(objective)/d(weights) where the objective is a
+    reward to be maximized, and torch optimizers minimize, so every gradient is negated
     first. This is the sign convention `task.py` documents, and this is the
     one place it has to be acted on.
 
@@ -470,7 +471,7 @@ def train(iterations, n_envs=N_ENVS, window=WINDOW, gamma=GAMMA, seed=0, shaping
 
     `trace`, if given, is called every iteration with (iteration, window
     index within the episode, window objective, gradient norm). The window
-    objective is the mean over environments of J at the window's first
+    objective is the mean over environments of the objective at the window's first
     state: shaped, discounted, and bootstrapped from the target critic,
     which is the quantity the actor step climbs.
     """

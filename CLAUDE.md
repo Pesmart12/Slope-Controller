@@ -65,30 +65,23 @@ and it is a bad question for a task this simple.** The point is to build
 and train an RL stack on GRIP. What is worth reporting:
 
 - **Did it learn the task?**
-- **Was it efficient?** — trajectory optimization is informative here, and
-  only here.
+- **Was it efficient?** — 2000 iterations, about 23 minutes on a CPU.
 - **A demo.** Show the trained policy doing the thing.
 - **A loose comparison of behaviour under 1.0 and 2.0.** Loose is the
   design, not a shortfall. See the paragraph above about rigor nobody
   asked for.
 
-`tests/check_trajopt.py` is a **check**, not a baseline. Its job is to say
-the reward is solvable and its gradients navigable, and 800 iterations
-answers that. **Its numbers are not converged**, and the check's own
-"ended at its best: yes" line means *still improving* — the opposite of
-the reassurance it reads as. So do not read −82.37 as the optimum, and do
-not gate anything on beating it. Its recorded numbers were measured at the
-2 cm position tolerance, before it moved to 1 cm; `3094234` reproduces
-them. Running it longer keeps improving the
-reward and walks the parked position further downhill of the target; that
-was measured on the box-only variant before it was removed, so there is no
-table of it here any more.
+**Trajectory optimization was a check, and it is gone.** Adam on the raw
+control sequence said the reward was solvable before SHAC existed, and a
+working SHAC controller now says it better. It was removed once its
+solution-shape assertion stopped matching the 1 cm tolerance;
+`3094234` reproduces it and its numbers, all measured at 2 cm. Its two
+findings stand, and the standing reminder keeps them.
 
-**Trajopt parks downhill of the target**, at +0.76 / −0.09 / −0.32 cm
-across the sampled slopes. Closing the last centimetres needs force above
-`break_free_force`, which costs more per step than the position error it
-saves. SHAC parks downhill too, and by the same trade: about 1 cm at the
-current 1 cm tolerance. The standing reminder has the numbers.
+**SHAC parks downhill of the target**, about 1 cm at the current 1 cm
+tolerance. Closing the last centimetre needs more holding force than the
+position error it saves is worth to the reward. The standing reminder has
+the numbers.
 
 The eventual comparison is also loose by design — these numbers will sit
 next to other projects' numbers someday, informally. That is not a reason to
@@ -124,7 +117,7 @@ The repository is small and should stay legible.
 | `slope_control/policy.py` | the actor and critic, and the tensor plumbing they need |
 | `slope_control/sweep.py` | the closed-loop gradient — `rollout` forward, `accumulate` at the torch/GRIP seam, `policy_gradient` back |
 | `slope_control/task.py` | what the other three task modules share — body layout, action limit and frame, episode length |
-| `slope_control/objective.py` | the reward, its shaping term, and their gradient seeds; defines `ℓ` and `J` |
+| `slope_control/objective.py` | the reward, its shaping term, and their gradient seeds; defines `ℓ` and the objective |
 | `slope_control/observation.py` | what the policy sees, and its constant Jacobian |
 | `slope_control/batches.py` | `Batch` and its two builders — scenes, placement, settle window, targets |
 | `slope_control/shac.py` | the training loop — windowed rollout, actor step, critic fit, target update |
@@ -136,10 +129,9 @@ The repository is small and should stay legible.
 | `experiments/diagnose_shac.py` | trains, then rescores every checkpoint on fresh environments — reported reward by phase, SHAC's own objective, fixed critics, parking by target direction |
 | `figures/` | committed output, so results are visible without running anything |
 | `runs/` | training logs, evaluation histories and checkpoints, one directory per run |
-| `tests/check_task.py` | the checks the task rests on, chiefly the finite-difference of `dJ_dU` through GRIP |
-| `tests/check_trajopt.py` | Adam on the raw control sequence, which is what says the reward is solvable at all |
+| `tests/check_task.py` | the checks the task rests on, chiefly the finite-difference of `dobjective_dU` through GRIP |
 | `tests/check_closed_loop.py` | why SHAC needs a per-step adjoint sweep and not one call per window |
-| `tests/check_policy_gradient.py` | the same statement for a real network — `dJ/d(theta)` against central differences |
+| `tests/check_policy_gradient.py` | the same statement for a real network — `d(objective)/d(theta)` against central differences |
 | `tests/check_critic_targets.py` | the critic's TD(λ) targets — exact at λ = 0 and λ = 1, and equal to a port of the reference's own recursion at 0.95 |
 | `docs/ramp_manipulation_task.md` | the task definition; the authority on scene numbers, reward and episode structure |
 | `pyproject.toml` | the editable install, so nothing reaches the package by patching `sys.path` |
@@ -213,21 +205,17 @@ so a session knows where it is.
    plot `ξ` against time.
 2. **Substrate done.** The task — `task.py`, `objective.py`,
    `observation.py` and `batches.py`, plus `tests/check_task.py`. The reward and the gradient path are de-risked:
-   `dJ_dU` matches central differences to 1.9e-5 relative through GRIP,
+   `dobjective_dU` matches central differences to 1.9e-5 relative through GRIP,
    across a body-body contact. Built first against a single directly
    actuated box, which has since been removed.
-3. **Done.** Trajectory optimization — `tests/check_trajopt.py`. Adam on
-   the raw control sequence reaches the target to within a centimetre at
-   every sampled slope, so the reward is solvable and its gradients are
-   navigable across 8000 integration steps, not merely correct at a point.
-   **This replaces the MPPI step**, which was dropped: being zeroth order
-   it never calls the adjoint, so it could only ever answer half the
-   question it was there for. It keeps one job in reserve — if trajopt
-   ever fails, gradient-free is what separates "bad reward" from "correct
-   but unusable gradients."
-4. **Done.** Two pushers, box between them, box unactuated. Trajopt solves
-   it to 0.76 / −0.09 / −0.32 cm, so the manipulation task is worth
-   training on.
+3. **Done, and since removed.** Trajectory optimization — Adam on the raw
+   control sequence — showed the reward was solvable and its gradients
+   navigable across 8000 integration steps before SHAC was written. It
+   replaced an MPPI step, dropped because a zeroth-order method never
+   calls the adjoint. `3094234` reproduces it.
+4. **Done.** Two pushers, box between them, box unactuated. Trajectory
+   optimization solved it to within a centimetre at the 2 cm tolerance,
+   so the manipulation task was worth training on.
 5. **Done.** SHAC on penalty — `slope_control/shac.py`, built on the
    per-step adjoint sweep in `sweep.policy_gradient`, run by
    `experiments/train_shac.py`, configured as NVlabs/DiffRL's Ant and
@@ -256,7 +244,7 @@ grip.Scene(params=[...], shapes=[...], plane=..., penalty=..., dt=..., gravity=.
 grip.RigidBodyParams, grip.BodyShape, grip.HalfPlane, grip.PenaltyParams
 
 trajectory = grip.rollout_batch(scenes, initial, controls, substeps)
-dJ_dZ0, dJ_dU = grip.adjoint_batch(scenes, trajectory, controls, substeps, dl_dZ, dl_dU)
+dobjective_dZ0, dobjective_dU = grip.adjoint_batch(scenes, trajectory, controls, substeps, dl_dZ, dl_dU)
 grip.step_batch(...)
 ```
 
@@ -323,16 +311,16 @@ is the cheap check that the signs are right; keep it working.
 `docs/derivations/notation.md` in GRIP is the canonical symbol table for
 anything shared. Don't reuse one of its symbols for something else here.
 
-Two of its symbols are ours to fill in — it says so: **`ℓ` and `J` are the
+Two of its symbols are ours to fill in — it says so: **`ℓ` and `objective` are the
 consumer's, not GRIP's.** `slope_control/objective.py`'s module docstring is
 where they are defined, and the definitions are:
 
 - **`ℓ` is one step's reward** (`l` in ASCII code). GRIP calls that slot the
   stage cost.
-- **`J` is the whole objective**: `ℓ` summed over a window, plus the critic's
-  estimate of what follows.
+- **`objective` is the whole thing being differentiated**: `ℓ` summed over
+  a window, plus the critic's estimate of what follows.
 - **`dl_dZ` / `dl_dU` are partials** of one step and go *into* `adjoint_batch`.
-  **`dJ_dZ0` / `dJ_dU` are totals** and come *out* of it. Turning the first
+  **`dobjective_dZ0` / `dobjective_dU` are totals** and come *out* of it. Turning the first
   into the second is the entire job of the adjoint.
 - **There is no `r`.** An earlier draft used `r` in prose for the same
   quantity the code called `l`, which is how this got confusing enough to
@@ -342,11 +330,12 @@ where they are defined, and the definitions are:
   discovered. If anything ever becomes a genuine cost, flip it everywhere
   at once.
 
-One collision is **unresolved and belongs to GRIP**: its table uses `J` for
-the caller's objective *and* `Jᵢ`/`J_A` for contact Jacobians. Bare against
-subscripted is a thin separation, and it is the same class of thing
-`notation.md` already registers for `U` and `F` — but it is not registered.
-Raise it there; don't work around it here.
+**The objective is spelled out, never `J`.** GRIP's table used to give
+`J` to the caller's objective as well as to its contact Jacobians
+`Jᵢ`/`J_A`. That collision was raised and resolved in GRIP: the objective
+is now `objective` there, and its adjoint returns `dobjective_dZ0` /
+`dobjective_dU`. This repository follows, so `J` is GRIP's contact
+Jacobian and nothing else.
 
 ## Code style
 
@@ -457,9 +446,9 @@ Real, and each one will bite in a specific place:
   `pair_detection.md` flags: both bodies report identical penetration, so
   contact-normal ownership is a tie whose neighbourhood disagrees with it.
   Forward simulation is fine; **SHAC gradients taken near it are suspect.**
-  The decision already made is to **angle the pusher's contact face by 2–3°**
-  so it meets the box at a vertex. Do that when the pusher lands at step 3,
-  rather than discovering it during training.
+  **Handled:** the pusher's contact face is angled by 3°
+  (`ramp.PUSHER_FACE_TILT`), so it meets the box at a vertex. Keep the tilt
+  if the pusher shape ever changes.
 
 ## Experiments and figures
 
@@ -506,12 +495,12 @@ done too, and checked — but it is **machinery, not a result**, and it was
 deliberately landed without a figure. Don't go looking for the artifact it
 didn't produce.
 
-Trajectory optimization is done too, and it earned its place immediately: it caught a
-force limit that made the task **unsolvable**, sized against the force to
-*hold* the box and never against the force to *move* it. A passing gradient
-check did not catch that and could not have — a correct gradient on an
-impossible objective is still correct. When something is checked and still
-doesn't work, suspect the task before the machinery.
+Trajectory optimization, since removed, earned its place immediately: it
+caught a force limit that made the task **unsolvable**, sized against the
+force to *hold* the box and never against the force to *move* it. A
+passing gradient check did not catch that and could not have — a correct
+gradient on an impossible objective is still correct. When something is
+checked and still doesn't work, suspect the task before the machinery.
 
 **Step 5, SHAC, is done.** It learns the approach and holds the box about
 1 cm downhill of its target, repeatably across two seeds.
@@ -639,7 +628,7 @@ Three things left open on purpose, so they aren't mistaken for oversights:
   says any one of them earns its place, and no channel has been ablated.
   Its shape and its gradient are checked; its content is not.
 - `clip_action` is a hard clip with zero gradient once saturated, and the
-  converged trajopt solution sits on its limit **5.9%** of steps. The
+  trajectory-optimization solution sat on its limit **5.9%** of steps. The
   actor sidesteps it: it emits
   `limit * tanh(...)`, so every action is feasible by construction and the
   derivative survives everywhere. `clip_action` still runs downstream,

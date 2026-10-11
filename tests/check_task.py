@@ -213,7 +213,7 @@ def check_shaping_vanishes():
 
 
 def check_adjoint():
-    """dJ_dU from GRIP, finite-differenced through the real dynamics.
+    """dobjective_dU from GRIP, finite-differenced through the real dynamics.
 
     The seeds passing on their own does not mean the chain is right: the
     index offset between states and controls, and the direction of the
@@ -229,7 +229,7 @@ def check_adjoint():
 
 
 def probe_adjoint():
-    """Finite-difference a handful of dJ_dU entries."""
+    """Finite-difference a handful of dobjective_dU entries."""
     rng = np.random.default_rng(1)
     n_envs, steps, probes = 2, 12, 10
     angles = rng.uniform(*batches.RAMP_ANGLE_RANGE, size=n_envs)
@@ -241,7 +241,7 @@ def probe_adjoint():
 
     trajectory = np.array(grip.rollout_batch(batch.scenes, batch.state, wrenches, substeps=batch.substeps))
     dl_dZ, dl_dU = objective.reward_seeds(trajectory, wrenches, batch.angles, batch.targets)
-    _, dJ_dU = grip.adjoint_batch(batch.scenes, trajectory, wrenches, batch.substeps, dl_dZ, dl_dU)
+    _, dobjective_dU = grip.adjoint_batch(batch.scenes, trajectory, wrenches, batch.substeps, dl_dZ, dl_dU)
 
     def total(controls):
         rolled = grip.rollout_batch(batch.scenes, batch.state, controls, substeps=batch.substeps)
@@ -257,7 +257,7 @@ def probe_adjoint():
         minus = total(wrenches)
         wrenches[index] = saved
         finite = (plus - minus) / (2.0 * h)
-        worst = max(worst, abs(finite - dJ_dU[index]) / max(abs(finite), 1e-9))
+        worst = max(worst, abs(finite - dobjective_dU[index]) / max(abs(finite), 1e-9))
 
     return worst
 
@@ -298,7 +298,7 @@ def check_action_limit():
     Two bounds from different physics, which is why the limit is a box
     and not a magnitude. Sizing one alone is how an earlier 5 N limit came
     out below the force needed to move the box at all, leaving the task
-    unsolvable until `check_trajopt.py` reported it.
+    unsolvable until trajectory optimization reported it.
     """
     steep = batches.RAMP_ANGLE_RANGE[1]
     tangential, perpendicular = task.LIMIT

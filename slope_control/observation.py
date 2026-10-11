@@ -134,14 +134,14 @@ def observation_jacobian(ramp_angles):
     return jacobian
 
 
-def state_gradient(dJ_dobs, jacobian):
+def state_gradient(dobjective_dobs, jacobian):
     """Pull an adjoint on the observation back to an adjoint on the state.
 
-    The chain rule dJ/dZ = (dJ/d(obs)) . (d(obs)/dZ), contracted over the
+    The chain rule d(objective)/dZ = (d(objective)/d(obs)) . (d(obs)/dZ), contracted over the
     feature axis. Used twice in the backward sweep -- once for the critic's
     dV/dZ and once per step for the path through the policy.
     """
     # "...nf,nfbc->...nbc": sum over feature f, keeping environment n and
     # opening the state's (body, component) axes so the result is shaped like
-    # a state and can be added straight to GRIP's dJ_dZ0.
-    return np.einsum("...nf,nfbc->...nbc", np.asarray(dJ_dobs), jacobian)
+    # a state and can be added straight to GRIP's dobjective_dZ0.
+    return np.einsum("...nf,nfbc->...nbc", np.asarray(dobjective_dobs), jacobian)

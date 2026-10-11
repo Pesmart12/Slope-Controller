@@ -1,10 +1,11 @@
-"""Find out why SHAC loses its best policy as training continues.
+"""Train SHAC, then score every checkpoint on environments it never saw.
 
-The run `train_shac.py` makes peaks at iteration 400 and ends worse on both reward and
-error at iteration 2000. Physics is the same at every iteration, so the
-late policy is a worse policy. This script scores every checkpoint of that
-run against several objectives to see which of them training is actually
-improving:
+Built to find out why the old configuration lost its best policy: it
+peaked at iteration 400 and ended worse on both reward and error at 2000,
+with the same physics throughout. On the current reference configuration
+the last checkpoint is the best, and this script is how that is measured.
+It scores every checkpoint against several objectives, to see which of
+them training is actually improving:
 
     reported         unshaped, undiscounted, deterministic, 4 s
     surrogate        shaped, gamma = 0.99, from every window start, with the
@@ -22,15 +23,15 @@ Reading them:
     fixed-critic rises while surrogate falls   the critic misleads the actor
     everything falls                           the optimization is unstable
 
-The critic has to be held fixed. Scored with each checkpoint's own target
-critic, the bootstrapped surrogate rises from -26.8 to -13.3 over that
-run, but that is the critic's calibration catching up, not the
-actor improving: against any single critic the late actors score no
+The critic has to be held fixed. On the old configuration, scored with
+each checkpoint's own target critic, the bootstrapped surrogate rose from
+-26.8 to -13.3, but that was the critic's calibration catching up, not
+the actor improving: against any single critic the late actors scored no
 better than iteration 400.
 
 Two phases. The first reruns `train_shac.py`'s training with a
-checkpoint at every evaluation and a per-iteration trace; that run keeps
-only two checkpoints, and no target critic. The second rescores every
+checkpoint at every evaluation and a per-iteration trace, where
+`train_shac.py` keeps only the latest and the best. The second rescores every
 checkpoint on 64 environments drawn from a seed neither training nor
 `shac.evaluate` uses. The recorded best was chosen over 21 evaluations of
 the same 8 episodes, which flatters it.
@@ -254,14 +255,14 @@ def report(results, trace):
     # each. Approach is the windows that start inside APPROACH_STEPS.
     approach_windows = APPROACH_STEPS // shac.WINDOW + 1
     print(f"\n  trace, windows 0-{approach_windows - 1} as approach, the rest as hold")
-    print("   iters        |grad| approach   |grad| hold   J approach   J hold")
+    print("   iters        |grad| approach   |grad| hold  obj approach  obj hold")
     for low in range(0, trace[-1]["iteration"], 200):
         rows = [row for row in trace if low < row["iteration"] <= low + 200]
         early = [row for row in rows if row["phase"] < approach_windows]
         late = [row for row in rows if row["phase"] >= approach_windows]
         print(f"  {low + 1:>5}-{low + 200:<5}  {np.median([row['gradient_norm'] for row in early]):>14.1f}"
               f"  {np.median([row['gradient_norm'] for row in late]):>12.1f}"
-              f"  {np.mean([row['objective'] for row in early]):>11.2f}  {np.mean([row['objective'] for row in late]):>7.2f}")
+              f"  {np.mean([row['objective'] for row in early]):>12.2f}  {np.mean([row['objective'] for row in late]):>8.2f}")
 
 
 def plot(results, trace, path):
