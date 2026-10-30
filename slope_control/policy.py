@@ -15,10 +15,10 @@ import torch
 ACTOR_HIDDEN = (128, 64, 32)
 CRITIC_HIDDEN = (64, 64)
 
-# Pre-squash noise. The action is limit*tanh(x + sigma*eps), so sigma is
-# in the units of the pre-tanh activation rather than newtons; 0.37 puts
-# meaningful exploration across the whole range without pinning the sample
-# to either end of the squash.
+# Pre-squash noise, sigma = exp(-1) = 0.37, the reference SHAC actor's
+# `actor_logstd_init`. The action is limit*tanh(x + sigma*eps), so sigma is
+# in pre-tanh units rather than newtons: the same sigma moves the force a
+# lot mid-range and very little near the limit.
 INITIAL_LOG_STD = -1.0
 
 
@@ -58,10 +58,11 @@ class Actor(torch.nn.Module):
     Forces are in the ramp frame, (tangential, normal), in newtons.
 
     The tanh is what enforces the force limit. A hard clip would work too,
-    but its derivative is exactly zero once saturated, and the trajectory
-    optimization baseline sits at its limit 2-6% of the time. A policy
-    would then spend real time somewhere the gradient says nothing. tanh
-    keeps every action inside the limit and every derivative nonzero.
+    but its derivative is exactly zero once saturated, and trajectory
+    optimization, run as a check before SHAC, sat on the limit 5.9% of the
+    time. A policy would then spend real time somewhere the gradient says
+    nothing. tanh keeps every action inside the limit and every derivative
+    nonzero.
 
     The noise is added before the tanh, and it is drawn outside the
     network. That means the sampled action is still a differentiable
@@ -90,16 +91,17 @@ class Actor(torch.nn.Module):
 
 
 class Critic(torch.nn.Module):
-    """Estimate the total reward still to come from a given observation.
+    """Estimate the discounted reward still to come from a given observation.
 
-    SHAC optimizes short windows -- 32 control steps, 0.32 s -- out of a
-    4 s episode. This estimate stands in for everything after the window
-    ends. Without it the policy would optimize a third of a second and
-    know nothing about the 3.7 s hold that follows.
+    Discounted at `shac.GAMMA` = 0.99, so it mostly covers the next second
+    or so, not the whole episode. SHAC optimizes short windows -- 32
+    control steps, 0.32 s -- out of a 4 s episode, and this estimate stands
+    in for what comes after the window ends. Without it the policy would
+    optimize a third of a second in isolation.
 
     Predicts raw returns, in reward units, as the reference does: no running
-    normalization of the targets. The LayerNorm after each hidden layer is
-    what keeps the fit well conditioned.
+    normalization of the targets, and a LayerNorm after each hidden layer,
+    also the reference's choice.
     """
 
     def __init__(self, observation_size, hidden=CRITIC_HIDDEN):

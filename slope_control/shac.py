@@ -6,14 +6,16 @@ The loop, one iteration:
        window ended.
     2. Differentiate that window's reward back to the actor's weights,
        through the physics, and take an Adam step.
-    3. Fit the critic to the returns the window actually produced.
-    4. Nudge the target critic toward the critic.
+    3. Fit the critic to TD(lambda) targets built from the window's
+       rewards and the target critic's values.
+    4. Move the target critic 80% of the way toward the critic.
     5. Carry the state forward. Resample once an episode is used up.
 
-What makes this SHAC rather than a policy-gradient method is step 2. The
-gradient is computed, not estimated: GRIP differentiates the contact and
-`sweep.policy_gradient` carries that through the network. No sampling, no
-score function, no advantage estimate.
+SHAC is a policy-gradient method, and step 2 is what sets it apart from
+likelihood-ratio methods like PPO. The gradient is computed, not
+estimated: GRIP differentiates the contact and `sweep.policy_gradient`
+carries that through the network. The actor still samples exploration
+noise, but there is no score function and no advantage estimate.
 
 The window is short because, per the SHAC paper, gradients through long
 horizons of stiff contact are badly conditioned; this repository has not
@@ -27,8 +29,9 @@ reward -- `evaluate` sees no gamma at all. The discount is there for two
 reasons:
 
     At gamma = 1 the Bellman operator is not a contraction, so the
-    bootstrap has no unique fixed point to converge to. Undiscounted, the
-    critic settled at -53.87 against episode returns near -180.
+    bootstrap has no unique fixed point to converge to. On the old,
+    pre-reference configuration, run undiscounted, the critic settled at
+    -53.87 against episode returns near -180.
 
     Under gamma = 1 the value of a state depends on how many steps remain,
     and `observe` carries no clock. The critic would have to fit "-180
